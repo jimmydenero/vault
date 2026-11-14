@@ -15,7 +15,9 @@
 pub mod audit;
 pub mod backup;
 pub mod client;
+pub mod devtools;
 pub mod error;
+pub mod fill;
 pub mod install;
 pub mod keyprotect;
 pub mod mirror;
@@ -27,6 +29,7 @@ pub mod rules;
 pub mod scrub;
 pub mod secret;
 pub mod server;
+pub mod sites;
 pub mod store;
 pub mod totp;
 pub mod vault;

@@ -27,7 +27,8 @@ use crate::keyprotect;
 use crate::model::{Kind, MirrorState, SecretRef, VaultDoc};
 use crate::platform::{self, Peer};
 use crate::protocol::{
-    self, AddReply, BackupReply, ConfirmKitReply, Envelope, ErrorReply, Framed, ListReply, MirrorPlanReply, OkReply,
+    self, AddReply, BackupReply, ConfirmKitReply, Envelope, ErrorReply, FillReply, Framed, GenerateLoginReply, ListReply,
+    MirrorPlanReply, OkReply,
     ProxyReplyOut, ReadBackupReply, RenameReply, Request, ResetReply, RestoreReply, StatusReply, TotpReply,
     VerifyBackupReply,
 };
@@ -37,6 +38,12 @@ use crate::store::{self, OwnerPaths, Paths};
 use crate::vault::{self, NewSecret, Vault};
 
 const MAX_CONNECTIONS: usize = 16;
+
+/// `generate-login`'s password length: 20 characters by default (about 123 bits with symbols),
+/// 12 to 128 on request.
+const GENERATED_LENGTH: usize = 20;
+const GENERATED_MIN: usize = 12;
+const GENERATED_MAX: usize = 128;
 
 struct Server {
     paths: Paths,
@@ -395,6 +402,37 @@ impl Server {
                     Err(error) => self.finish::<OkReply>(stream, peer, "proxy", Some(&secret.label()), Err(error)),
                 }
             }
+            Request::Fill { secret, request } => {
+                let result = self.snapshot().and_then(|doc| self.fill(&doc, &secret, &request, peer));
+                match result {
+                    Ok(reply_value) => reply(stream, &peer.envelope, &reply_value),
+                    Err(error) => error_reply(stream, peer, &error),
+                }
+            }
+            Request::GenerateLogin { name, site, username, length, symbols } => {
+                let result = (|| {
+                    let length = length.unwrap_or(GENERATED_LENGTH);
+                    if !(GENERATED_MIN..=GENERATED_MAX).contains(&length) {
+                        return Err(VaultError::BadRequest(format!(
+                            "length is {GENERATED_MIN} to {GENERATED_MAX} characters"
+                        )));
+                    }
+                    let site = crate::sites::normalize_new_site(&site)?;
+                    let value = crate::secret::SecretValue::random_password(length, symbols)?;
+                    let detail = format!(
+                        "login for {site}; password made by the vault ({length} characters{})",
+                        if symbols { "" } else { ", no symbols" }
+                    );
+                    let new = NewSecret { name: name.clone(), kind: Kind::Login, site, rule: None, username: Some(username), value };
+                    self.with_vault(|vault| vault.add_generated(new, detail))
+                        .map_err(|error| match error {
+                            VaultError::NameTaken(name) => VaultError::Exists(name),
+                            other => other,
+                        })
+                        .map(|(secret, _backup)| GenerateLoginReply { ok: true, name: secret.name, id: secret.id, site: secret.site })
+                })();
+                self.finish(stream, peer, "generate-login", Some(&name), result)
+            }
             Request::Status => {
                 let guard = self.vault.lock().unwrap_or_else(|e| e.into_inner());
                 let opened = guard.as_ref().map(Vault::status);
@@ -659,4 +697,62 @@ impl Server {
             }
         }
     }
+
+    /// `fill` (see `fill`): the checks, the audit line before anything is typed (R28), the
+    /// typing, and an outcome line after. The reply names the fields filled, never a value (R4).
+    fn fill(
+        &self,
+        doc: &VaultDoc,
+        secret: &SecretRef,
+        request: &crate::fill::FillRequest,
+        peer: &Caller,
+    ) -> Result<FillReply, VaultError> {
+        let record = doc.find_ref(secret);
+        let mut event = AuditEvent::named("fill", &record.map_or_else(|| secret.label(), |r| r.name.clone()), "");
+        event.secret_id = record.map(|r| r.id.clone());
+        let target = match &request.frame_target_id {
+            Some(frame) => format!("port {}, tab {}, frame {}", request.port, request.target_id, frame),
+            None => format!("port {}, tab {}", request.port, request.target_id),
+        };
+        let mut event = with_peer(event, peer);
+        let fail = |error: VaultError, mut event: AuditEvent, detail: &str| {
+            event.outcome = format!("denied: {}", error.code());
+            event.detail = Some(match &error {
+                VaultError::SiteMismatch(why)
+                | VaultError::BrowserUnreachable(why)
+                | VaultError::FieldNotFound(why)
+                | VaultError::NotAPasswordField(why)
+                | VaultError::BadRequest(why) => format!("{detail}: {why}"),
+                _ => detail.to_string(),
+            });
+            self.audit(event);
+            error
+        };
+        let domain = match crate::fill::check_request(request, record, &secret.label()) {
+            Ok(domain) => domain,
+            Err(error) => return Err(fail(error, event, &target)),
+        };
+        let record = record.ok_or(VaultError::NoSuchLogin(secret.label()))?;
+        let mut started = None;
+        let outcome = crate::fill::fill(record, request, &domain, self.owner_uid, &mut |start| {
+            let mut attempt = event.clone();
+            attempt.outcome = "filling".into();
+            attempt.host = Some(start.page_host.to_string());
+            attempt.detail = Some(format!("{target}; fields {}; {}", start.fields.join(", "), start.browser));
+            self.record(attempt)?;
+            started = Some(start.page_host.to_string());
+            Ok(())
+        });
+        event.host = started;
+        match outcome {
+            Ok(filled) => {
+                event.outcome = "ok".into();
+                event.detail = Some(format!("{target}; filled {}", filled.filled.join(", ")));
+                self.audit(event);
+                Ok(FillReply { ok: true, filled: filled.filled })
+            }
+            Err(error) => Err(fail(error, event, &target)),
+        }
+    }
+
 }

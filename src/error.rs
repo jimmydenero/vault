@@ -52,6 +52,12 @@ pub enum VaultError {
     SealedKey(String),
     UnsupportedProtocol(u32),
     ReplyMismatch(String),
+    NoSuchLogin(String),
+    SiteMismatch(String),
+    BrowserUnreachable(String),
+    FieldNotFound(String),
+    NotAPasswordField(String),
+    Exists(String),
 }
 
 impl VaultError {
@@ -97,6 +103,12 @@ impl VaultError {
             SealedKey(_) => "sealed_key_error",
             UnsupportedProtocol(_) => "unsupported_protocol",
             ReplyMismatch(_) => "reply_mismatch",
+            NoSuchLogin(_) => "no_such_login",
+            SiteMismatch(_) => "site_mismatch",
+            BrowserUnreachable(_) => "browser_unreachable",
+            FieldNotFound(_) => "field_not_found",
+            NotAPasswordField(_) => "not_a_password_field",
+            Exists(_) => "exists",
         }
     }
 }
@@ -159,6 +171,12 @@ impl fmt::Display for VaultError {
                 crate::protocol::PROTOCOL_VERSION
             ),
             ReplyMismatch(why) => write!(f, "the daemon's reply doesn't belong to this request: {why}"),
+            NoSuchLogin(name) => write!(f, "no saved login {name:?}"),
+            SiteMismatch(why) => write!(f, "not the login's site, so nothing was typed: {why}"),
+            BrowserUnreachable(why) => write!(f, "can't reach the browser, so nothing was typed: {why}"),
+            FieldNotFound(why) => write!(f, "field not found: {why}"),
+            NotAPasswordField(why) => write!(f, "not a login field, so nothing was typed: {why}"),
+            Exists(name) => write!(f, "a secret named {name:?} already exists"),
         }
     }
 }

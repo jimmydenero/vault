@@ -334,6 +334,21 @@ impl Vault {
 
     /// Stores a new secret (R5, R7, R17, R27).
     pub fn add(&mut self, new: NewSecret) -> Result<(SecretSummary, BackupStatus), VaultError> {
+        self.add_recorded(new, "add", None)
+    }
+
+    /// Stores a login whose password the vault made itself (`generate-login`): the same checks
+    /// and backup as `add`, recorded as its own event.
+    pub fn add_generated(&mut self, new: NewSecret, detail: String) -> Result<(SecretSummary, BackupStatus), VaultError> {
+        self.add_recorded(new, "generate-login", Some(detail))
+    }
+
+    fn add_recorded(
+        &mut self,
+        new: NewSecret,
+        event_name: &str,
+        detail: Option<String>,
+    ) -> Result<(SecretSummary, BackupStatus), VaultError> {
         self.reload()?;
         self.ready_for_change()?;
         model::validate_name(&new.name)?;
@@ -380,12 +395,12 @@ impl Vault {
             value,
         };
         let summary = record.summary();
-        let mut event = AuditEvent::named("add", &record.name, "ok");
+        let mut event = AuditEvent::named(event_name, &record.name, "ok");
         event.secret_id = Some(record.id.clone());
-        event.detail = Some(match &record.rule {
+        event.detail = Some(detail.unwrap_or_else(|| match &record.rule {
             Some(rule) => format!("{}; rule {}", record.kind.label(), rule.describe()),
             None => format!("{} for {}", record.kind.label(), record.site),
-        });
+        }));
         // Every backup must stay small enough for `vault restore FILE` to take back. Measured
         // exactly, with the new record in place; 4 KiB covers what the next commit changes (the
         // audit head, the generation, the timestamp).

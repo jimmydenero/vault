@@ -111,3 +111,69 @@ fn program_path(pid: i32) -> Option<String> {
 pub fn systemd_booted() -> bool {
     std::fs::symlink_metadata("/run/systemd/system").is_ok_and(|meta| meta.is_dir())
 }
+
+/// The user IDs of the programs listening on TCP `port` (any local address), so `fill` types a
+/// password only into a DevTools port the owner's own program holds. `None` when the system
+/// couldn't be asked.
+///
+/// Linux: the `uid` column of `/proc/net/tcp` and `/proc/net/tcp6` for sockets in LISTEN state
+/// on that port; the kernel fills it in, and it lists every user's sockets.
+#[cfg(target_os = "linux")]
+pub fn tcp_listener_uids(port: u16) -> Option<Vec<u32>> {
+    let mut uids = Vec::new();
+    let mut read_any = false;
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else { continue };
+        read_any = true;
+        for line in text.lines().skip(1) {
+            let columns: Vec<&str> = line.split_whitespace().collect();
+            // sl, local_address, rem_address, st, tx_queue:rx_queue, tr:tm->when, retrnsmt, uid
+            if columns.len() < 8 || columns[3] != "0A" {
+                continue;
+            }
+            let Some((_, local_port)) = columns[1].rsplit_once(':') else { continue };
+            if u16::from_str_radix(local_port, 16).ok() != Some(port) {
+                continue;
+            }
+            if let Ok(uid) = columns[7].parse::<u32>() {
+                uids.push(uid);
+            }
+        }
+    }
+    read_any.then_some(uids)
+}
+
+/// macOS: `lsof` at its fixed path (R15), for TCP sockets in LISTEN state on that port. Run as
+/// the owner, it sees only the owner's own processes' sockets, so another user's listener shows
+/// as none, and `fill` refuses it just the same.
+#[cfg(target_os = "macos")]
+pub fn tcp_listener_uids(port: u16) -> Option<Vec<u32>> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let mut child = Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-w", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fu"])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut out = String::new();
+    use std::io::Read;
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    // `-F u` prints a `p<pid>` line, then `u<uid>`, for each process; lsof exits 1 when it finds
+    // nothing, which is an empty list, not a failure.
+    Some(out.lines().filter_map(|line| line.strip_prefix('u')?.parse::<u32>().ok()).collect())
+}
