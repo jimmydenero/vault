@@ -487,7 +487,7 @@ fn verify_backup(paths: &Paths, with_recovery_key: bool) -> Result<(), VaultErro
     println!("  decrypted with the vault's check key: OK, {} secrets", check.secrets);
     println!(
         "  matches the vault: {}",
-        if check.matches_vault { "yes, every name, rule and value" } else { "NO (the vault changed since)" }
+        if check.matches_vault { "yes, every id, name, rule and value" } else { "NO (the vault changed since)" }
     );
     if !with_recovery_key {
         println!("  recovery key: not checked (add --with-recovery-key)");
@@ -548,10 +548,12 @@ fn restore(paths: &Paths, file: Option<PathBuf>) -> Result<(), VaultError> {
         "Restored vault {} as copy {}, from copy {} generation {} (format {}).",
         reply.vault_identity, reply.vault_id, reply.from_vault_id, reply.from_generation, reply.from_format
     );
-    println!("  same identity and secret ids; new vault key and copy id; older backups stay as they are");
     if reply.from_format < 2 {
-        println!("  the backup was format {}: its secrets got their ids now", reply.from_format);
+        println!("  same identity; the backup was format {}, so its secrets got their ids now", reply.from_format);
+    } else {
+        println!("  same identity, secret ids and versions");
     }
+    println!("  new vault key and copy id; older backups stay as they are");
     for secret in &reply.secrets {
         println!("  {:<32}  {:<24} {:<8} {}", secret.id, secret.name, secret.kind.label(), secret.site);
     }

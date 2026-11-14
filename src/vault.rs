@@ -462,7 +462,7 @@ impl Vault {
         self.doc.generation
     }
 
-    /// Removes this Mac's vault so a backup can be restored into a fresh one (R20). Needs the
+    /// Removes this machine's vault so a backup can be restored into a fresh one (R20). Needs the
     /// recovery key, and only goes ahead when the newest backup opens with it and matches the
     /// vault, so nothing is lost. Keeps the backups and the audit log.
     /// After this the caller drops the vault.
@@ -621,12 +621,12 @@ struct RestorePointInfo {
     file: String,
 }
 
-/// Whether `vault reset` left a restore point on this Mac.
+/// Whether `vault reset` left a restore point on this machine.
 pub fn has_restore_point(paths: &Paths) -> bool {
     paths.restore_point.is_file()
 }
 
-/// Restores a backup into an empty vault on this Mac, with the recovery key (R20). The backup is
+/// Restores a backup into an empty vault on this machine, with the recovery key (R20). The backup is
 /// the file the person named, or the restore point `vault reset` kept. Makes a new vault key and
 /// a new vault id; the restored vault starts its own line of backups. Keeps what is stable: the
 /// recovery key (so the vault identity is the same) and every secret's id and version. A

@@ -136,7 +136,7 @@ pub fn remove(dir: &Path) -> Result<(), VaultError> {
 #[cfg(target_os = "linux")]
 mod sealed {
     use std::fs;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -172,24 +172,45 @@ mod sealed {
     /// Unseals the key to this process's memory, through a pipe (never an argument, the
     /// environment or a file, R2).
     fn decrypt(tool: &Path, sealed: &Path) -> Result<SecretValue, VaultError> {
-        let out = Command::new(tool)
+        let mut child = Command::new(tool)
             .args(["--user", "decrypt", &format!("--name={CREDENTIAL_NAME}")])
             .arg(sealed)
             .arg("-")
             .stdin(Stdio::null())
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| VaultError::SealedKey(format!("systemd-creds didn't run: {e}")))?;
-        let bytes = Zeroizing::new(out.stdout);
-        if !out.status.success() {
-            return Err(VaultError::SealedKey(format!(
-                "systemd-creds couldn't unseal it: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
+        // Into a fixed buffer, wiped on drop: a growing Vec would leave copies behind (R1).
+        let mut key = Zeroizing::new([0u8; 33]);
+        let mut len = 0;
+        if let Some(mut stdout) = child.stdout.take() {
+            while len < key.len() {
+                match stdout.read(&mut key[len..]) {
+                    Ok(0) => break,
+                    Ok(n) => len += n,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            // Drain anything past 33 bytes, so the child can finish; it can't be a 32-byte key.
+            let mut rest = Zeroizing::new([0u8; 256]);
+            while matches!(stdout.read(&mut rest[..]), Ok(n) if n > 0) {
+                len = key.len();
+            }
         }
-        if bytes.len() != 32 {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        let status = child.wait().map_err(|e| VaultError::SealedKey(format!("systemd-creds didn't finish: {e}")))?;
+        if !status.success() {
+            return Err(VaultError::SealedKey(format!("systemd-creds couldn't unseal it: {}", stderr.trim())));
+        }
+        if len != 32 {
             return Err(VaultError::SealedKey("the unsealed key isn't 32 bytes".into()));
         }
-        Ok(SecretValue::from_vec(bytes.to_vec()))
+        Ok(SecretValue::from_vec(key[..32].to_vec()))
     }
 
     pub fn unseal(dir: &Path) -> Result<SecretValue, VaultError> {

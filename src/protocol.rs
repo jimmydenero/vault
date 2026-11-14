@@ -54,12 +54,18 @@ pub const MAX_REQUEST_LINE: usize = 2 * 1024 * 1024;
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// What every request carries besides its operation: its protocol version and request id.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Envelope {
     /// 1 when the request didn't say.
     pub protocol: u32,
     /// Exactly as the caller sent it, to echo back.
     pub request_id: Option<serde_json::Value>,
+}
+
+impl Default for Envelope {
+    fn default() -> Self {
+        Envelope { protocol: 1, request_id: None }
+    }
 }
 
 impl Envelope {
@@ -74,7 +80,7 @@ impl Envelope {
 }
 
 /// Reads the envelope alone; every other field is skipped without being kept (R1). Returns the
-/// envelope even when it is unacceptable, so the refusal can still echo the request id.
+/// envelope even when it is unacceptable, so the refusal can still echo an acceptable request id.
 pub fn parse_envelope(line: &[u8]) -> (Envelope, Result<(), VaultError>) {
     #[derive(Deserialize)]
     struct Wire {
@@ -84,7 +90,7 @@ pub fn parse_envelope(line: &[u8]) -> (Envelope, Result<(), VaultError>) {
         request_id: Option<serde_json::Value>,
     }
     let Ok(wire) = serde_json::from_slice::<Wire>(line) else {
-        return (Envelope { protocol: 1, request_id: None }, Err(VaultError::BadRequest("not a JSON object".into())));
+        return (Envelope::default(), Err(VaultError::BadRequest("not a JSON object".into())));
     };
     let request_id = wire.request_id.filter(|value| !value.is_null());
     let id_ok = match &request_id {
@@ -95,28 +101,19 @@ pub fn parse_envelope(line: &[u8]) -> (Envelope, Result<(), VaultError>) {
         Some(serde_json::Value::Number(number)) => number.is_u64(),
         Some(_) => false,
     };
-    let (envelope, protocol) = match wire.protocol {
-        None => (Envelope { protocol: 1, request_id: None }, Ok(1)),
-        Some(value) => match value.as_u64().and_then(|v| u32::try_from(v).ok()) {
-            Some(version) if version >= 1 => (Envelope { protocol: version, request_id: None }, Ok(version)),
-            _ => (
-                Envelope { protocol: 1, request_id: None },
-                Err(VaultError::BadRequest("protocol is a whole number from 1".into())),
-            ),
-        },
+    // No `protocol` is protocol 1; anything but a whole number from 1 is malformed (`None`).
+    let protocol = match &wire.protocol {
+        None => Some(1),
+        Some(value) => value.as_u64().and_then(|v| u32::try_from(v).ok()).filter(|v| *v >= 1),
     };
-    // An unacceptable request id isn't echoed: it is refused, and the reply says why.
-    let envelope = Envelope { request_id: if id_ok { request_id } else { None }, ..envelope };
-    let result = if !id_ok {
-        Err(VaultError::BadRequest(
+    let envelope = Envelope { protocol: protocol.unwrap_or(1), request_id: request_id.filter(|_| id_ok) };
+    let result = match protocol {
+        _ if !id_ok => Err(VaultError::BadRequest(
             "request_id is a string of 1 to 128 printable ASCII characters, or a whole number".into(),
-        ))
-    } else {
-        match protocol {
-            Err(error) => Err(error),
-            Ok(version) if version > PROTOCOL_VERSION => Err(VaultError::UnsupportedProtocol(version)),
-            Ok(_) => Ok(()),
-        }
+        )),
+        None => Err(VaultError::BadRequest("protocol is a whole number from 1".into())),
+        Some(version) if version > PROTOCOL_VERSION => Err(VaultError::UnsupportedProtocol(version)),
+        Some(_) => Ok(()),
     };
     (envelope, result)
 }

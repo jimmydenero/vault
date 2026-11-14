@@ -6,18 +6,22 @@ user's own hardware", https://volgenic.com/pages/1f495021-effc-4fd2-9160-24cbcd7
 
 ## Build
 
-A Rust (Cargo) project, macOS only for now; Linux may come later.
+A Rust (Cargo) project for macOS and Linux.
 
 ```sh
-cargo build          # the gate
-cargo run            # the command-line executable
+cargo build                                    # the gate (on Linux it needs no OpenSSL headers)
+cargo check --target aarch64-apple-darwin      # from Linux: the macOS code still type-checks
+cargo run                                      # the command-line executable
 ```
 
-- `src/lib.rs`: the library crate, platform-neutral. Decisions live here as functions over plain
-  values, with nothing tied to macOS, so it can build on Linux later.
+- `src/lib.rs`: the library crate. Decisions live here as functions over plain values.
 - `src/main.rs`: the `vault` command-line executable, a thin shell around the library.
-- Keychain and Secure Enclave code goes behind one small key-protection module, the only place
-  that touches them. Nothing else in the crate calls macOS key storage directly.
+- What differs between macOS and Linux sits behind `cfg`, in a few places only: `platform` (the
+  socket caller check, hardening), `store` (paths), `keyprotect` (the vault key; the only code that
+  touches where it is kept), `install` (launchd or systemd) and the proxy's TLS backend.
+- A container usually has no systemd: `vault install` then writes the unit and says it didn't
+  start it, and `~/.local/share/volgenic/bin/vault daemon` runs the daemon by hand. The socket is
+  then `~/.local/share/volgenic/socket/vault.sock`, because there is no `/run/user/<uid>`.
 
 ## Tests: none, as an experiment
 

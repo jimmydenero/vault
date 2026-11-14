@@ -1,10 +1,13 @@
 //! The vault's library. Decisions live here as functions over plain values. The vault key is a
-//! mode-0600 file next to the vault file (`keyprotect`): no Secure Enclave, no Keychain, so the
-//! vault never raises a dialog.
+//! mode-0600 file next to the vault file, or on Linux sealed to the TPM by systemd-creds when
+//! there is one (`keyprotect`): no Secure Enclave, no Keychain, so the vault never raises a
+//! dialog.
 //!
-//! The vault runs as the owner: a daemon (`server`) started by a LaunchAgent in his login, a
-//! command-line tool that only talks to it (`client`), the installer (`install`) and the
-//! optional backup mirror (`mirror`).
+//! The vault runs as the owner: a daemon (`server`) started by a LaunchAgent in his login on
+//! macOS or by a systemd user service at boot on Linux, a command-line tool that only talks to
+//! it (`client`), the installer (`install`) and the optional backup mirror (`mirror`, macOS).
+//! What differs between the two systems sits behind `cfg` in `platform`, `store` (paths),
+//! `keyprotect`, `install` and the proxy's TLS setup.
 //!
 //! The rules this code follows are numbered on the threat model page,
 //! https://volgenic.com/pages/4171d207-a31e-4d38-b659-60ceed9ee5fd, and cited as R1, R2, ...

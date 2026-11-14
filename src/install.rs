@@ -142,7 +142,8 @@ pub fn install(for_restore: bool) -> Result<(), VaultError> {
 /// Whether `service::start` started the daemon.
 enum Started {
     Yes,
-    /// Not started, and why (the service manager isn't there).
+    /// Not started, and why (the service manager isn't there). Linux only.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     No(String),
 }
 
