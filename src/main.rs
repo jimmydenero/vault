@@ -1,8 +1,9 @@
 //! `vault`: the command-line tool, the daemon and the backup mirror, one binary.
 //!
-//! The vault runs as a LaunchAgent in the owner's login. Every command here except the two
-//! installers is a request to the daemon over its socket (R13, R26). Any agent on this Mac can run it, so no command prints a secret value: replies
-//! carry none (R4). Values are read at a hidden prompt or from standard input, never from
+//! The vault's daemon runs as the owner: a LaunchAgent in his login on macOS, a systemd user
+//! service started at boot on Linux. Every command here except the two installers is a request
+//! to the daemon over its socket (R13, R26). Any agent on the machine can run it, so no command
+//! prints a secret value: replies carry none (R4). Values are read at a hidden prompt or from standard input, never from
 //! arguments or the environment (R2).
 
 use std::io::{BufRead, IsTerminal, Read, Write};
@@ -14,8 +15,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use vault::client;
 use vault::error::VaultError;
 use vault::install;
-use vault::model::{BackupStatus, Kind};
-use vault::platform;
+use vault::model::{BackupStatus, Kind, SecretRef};
+use vault::platform::{self, MACHINE};
 use vault::protocol::RuleInput;
 use vault::secret::SecretValue;
 use vault::store::{self, Paths};
@@ -41,7 +42,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Confirm the Recovery Kit by pasting the recovery key back. Needed before any secret.
+    /// Optional: confirm the Recovery Kit by pasting the recovery key back; deletes the kit file.
     ConfirmKit,
     /// Add a secret. The value is read at a hidden prompt (or from standard input).
     Add {
@@ -79,7 +80,9 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// List secrets: names, kinds and sites only.
+    /// Rename a secret. It keeps its id, rule and value; its version goes up by one.
+    Rename { name: String, new_name: String },
+    /// List secrets: ids, names, kinds, sites and versions only.
     List,
     /// Show the vault's state. Information only; never a value.
     Status,
@@ -97,12 +100,12 @@ enum Command {
     },
     /// Have the daemon write (or re-check) the current backup now, e.g. after a failure.
     Backup,
-    /// Restore a backup into an empty vault on this Mac, with the recovery key. Without FILE,
+    /// Restore a backup into an empty vault here, with the recovery key. Without FILE,
     /// restores the copy `vault reset` kept.
     Restore { file: Option<PathBuf> },
-    /// Remove this Mac's vault so a backup can be restored (needs the recovery key).
+    /// Remove this machine's vault so a backup can be restored (needs the recovery key).
     Reset,
-    /// The vault's background part (run by launchd as root; drops to the vault's account).
+    /// The vault's background part, run as you by launchd (macOS) or systemd (Linux).
     #[command(hide = true)]
     Daemon,
     /// Copy backups to the mirror folder (run by the owner's LaunchAgent).
@@ -131,6 +134,7 @@ fn main() -> ExitCode {
             add(&paths, name, kind, site, host, port, methods, path, header, username, yes)
         }
         Command::Delete { name, yes } => delete(&paths, &name, yes),
+        Command::Rename { name, new_name } => rename(&paths, &name, &new_name),
         Command::List => list(&paths),
         Command::Status => status(&paths),
         Command::Audit { all } => show_audit(&paths, all),
@@ -279,7 +283,7 @@ fn add(
         Kind::TwoFactor => "2FA seed, base32 or otpauth:// link (hidden): ",
     };
     let value = read_hidden(prompt)?;
-    // R27: sent only to a daemon verified as the vault's account.
+    // R27: sent only to a daemon verified as your own user's.
     let reply = client::add(paths, &name, kind, &site, rule_input.as_ref(), username.as_deref(), &value)?;
     drop(value);
     println!("Saved {} {:?} for {}.", reply.secret.kind.label(), reply.secret.name, reply.secret.site);
@@ -292,8 +296,18 @@ fn delete(paths: &Paths, name: &str, yes: bool) -> Result<(), VaultError> {
         println!("Nothing deleted.");
         return Ok(());
     }
-    let reply = client::delete(paths, name)?;
+    let reply = client::delete(paths, &SecretRef::Name(name.into()))?;
     println!("Deleted {name:?}.");
+    print_backup(&reply.backup);
+    Ok(())
+}
+
+fn rename(paths: &Paths, name: &str, new_name: &str) -> Result<(), VaultError> {
+    let reply = client::rename(paths, &SecretRef::Name(name.into()), new_name)?;
+    println!(
+        "Renamed {name:?} to {:?}: id {} kept, now version {}.",
+        reply.secret.name, reply.secret.id, reply.secret.version
+    );
     print_backup(&reply.backup);
     Ok(())
 }
@@ -304,9 +318,16 @@ fn list(paths: &Paths) -> Result<(), VaultError> {
         println!("No secrets yet.");
         return Ok(());
     }
-    println!("{:<24} {:<8} SITE", "NAME", "KIND");
+    println!("{:<32}  {:<24} {:<8} {:>3}  SITE", "ID", "NAME", "KIND", "VER");
     for secret in reply.secrets {
-        println!("{:<24} {:<8} {}", secret.name, secret.kind.label(), secret.site);
+        println!(
+            "{:<32}  {:<24} {:<8} {:>3}  {}",
+            secret.id,
+            secret.name,
+            secret.kind.label(),
+            secret.version,
+            secret.site
+        );
     }
     Ok(())
 }
@@ -350,15 +371,17 @@ fn status(paths: &Paths) -> Result<(), VaultError> {
         }
     };
     println!(
-        "  daemon:            answering as user ID {}, pid {}, version {}",
+        "  daemon:            answering as user ID {}, pid {}, version {}, protocol {}, writes format {}",
         reply.uid,
         reply.pid,
-        reply.version
+        reply.version,
+        vault::protocol::PROTOCOL_VERSION,
+        reply.format
     );
     println!("  vault key:         {}", reply.key_protection);
     println!("  local backups:     {}", reply.local_backups);
     let Some(opened) = &reply.vault else {
-        println!("\nNo vault on this Mac yet.");
+        println!("\nNo vault on this {MACHINE} yet.");
         if reply.restore_point {
             println!("`vault reset` kept a restore point: restore it with `vault restore`.");
         } else {
@@ -366,7 +389,10 @@ fn status(paths: &Paths) -> Result<(), VaultError> {
         }
         return Ok(());
     };
-    println!("\nVault {}", opened.vault_id);
+    println!("\nVault {}", opened.vault_identity);
+    println!("  identity:          {} (stays the same through restores)", opened.vault_identity);
+    println!("  this copy:         {} (new at every restore; names the backup files)", opened.vault_id);
+    println!("  file format:       {}", opened.format);
     println!("  created:           {}", opened.created_at);
     println!("  recovery key:      fingerprint {}", opened.recovery_fingerprint);
     println!(
@@ -495,15 +521,18 @@ fn restore(paths: &Paths, file: Option<PathBuf>) -> Result<(), VaultError> {
     }
     let file = match file {
         Some(path) => {
-            println!("This reads the file you named from this terminal. In iCloud Drive, Desktop, Documents");
-            println!("or Downloads, macOS may first ask whether this terminal app may access it.");
+            #[cfg(target_os = "macos")]
+            {
+                println!("This reads the file you named from this terminal. In iCloud Drive, Desktop, Documents");
+                println!("or Downloads, macOS may first ask whether this terminal app may access it.");
+            }
             let data = std::fs::read(&path)
                 .map_err(|e| VaultError::BackupFailed(format!("can't read {}: {e}", path.display())))?;
             Some((path.display().to_string(), data))
         }
         None if !status.restore_point => {
             return Err(VaultError::InvalidSecret(
-                "no restore point on this Mac; name a backup file: vault restore FILE".into(),
+                format!("no restore point on this {MACHINE}; name a backup file: vault restore FILE"),
             ));
         }
         None => {
@@ -512,16 +541,19 @@ fn restore(paths: &Paths, file: Option<PathBuf>) -> Result<(), VaultError> {
         }
     };
     let typed = read_hidden("Recovery key (AGE-SECRET-KEY-1...), hidden: ")?;
-    // R27: sent only to a daemon verified as the vault's account.
+    // R27: sent only to a daemon verified as your own user's.
     let reply = client::restore(paths, &typed, file)?;
     drop(typed);
     println!(
-        "Restored as vault {} from vault {} generation {}.",
-        reply.vault_id, reply.from_vault_id, reply.from_generation
+        "Restored vault {} as copy {}, from copy {} generation {} (format {}).",
+        reply.vault_identity, reply.vault_id, reply.from_vault_id, reply.from_generation, reply.from_format
     );
-    println!("  new vault key and vault id; older backups stay as they are");
+    println!("  same identity and secret ids; new vault key and copy id; older backups stay as they are");
+    if reply.from_format < 2 {
+        println!("  the backup was format {}: its secrets got their ids now", reply.from_format);
+    }
     for secret in &reply.secrets {
-        println!("  {:<24} {:<8} {}", secret.name, secret.kind.label(), secret.site);
+        println!("  {:<32}  {:<24} {:<8} {}", secret.id, secret.name, secret.kind.label(), secret.site);
     }
     print_backup(&reply.backup);
     if reply.backup.ok { Ok(()) } else { Err(VaultError::BackupFailed(reply.backup.detail)) }
@@ -543,7 +575,7 @@ fn reset(paths: &Paths) -> Result<(), VaultError> {
         println!("`vault install`.");
         return Ok(());
     }
-    println!("This removes the vault from this Mac (its vault file and wrapped key) so a backup can");
+    println!("This removes the vault from this {MACHINE} (its vault file and key) so a backup can");
     println!("be restored. The backups and the audit log stay. It needs the");
     println!("recovery key, and it only goes ahead if the newest backup opens with that key and");
     println!("matches the vault.");
@@ -555,7 +587,7 @@ fn reset(paths: &Paths) -> Result<(), VaultError> {
     let reply = client::reset(paths, Some(&typed))?;
     drop(typed);
     println!(
-        "Vault removed from this Mac. Its newest backup ({}) is kept in the vault folder as a",
+        "Vault removed from this {MACHINE}. Its newest backup ({}) is kept in the vault folder as a",
         reply.newest_file.unwrap_or_default()
     );
     println!("restore point. Restore it with:");

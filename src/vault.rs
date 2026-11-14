@@ -1,5 +1,5 @@
-//! The vault's operations. They run only in the daemon, a LaunchAgent in the owner's login, and
-//! in `vault install` for the first vault (R13). The command-line tool
+//! The vault's operations. They run only in the daemon (a LaunchAgent in the owner's login on
+//! macOS, a systemd user service on Linux) and in `vault install` for the first vault (R13). The command-line tool
 //! never opens the vault; it asks the daemon. Nothing here returns a secret value: results are
 //! summaries, codes, statuses and reports (R4).
 
@@ -12,7 +12,7 @@ use crate::audit::{self, AuditEvent};
 use crate::backup;
 use crate::error::VaultError;
 use crate::keyprotect;
-use crate::model::{self, BackupStatus, Kind, Record, SecretSummary, VAULT_FORMAT, VaultDoc};
+use crate::model::{self, BackupStatus, Kind, Record, SecretRef, SecretSummary, VAULT_FORMAT, VaultDoc};
 use crate::protocol::{AuditReply, BackupCheck, OpenedStatus};
 use crate::rules::ProxyRule;
 use crate::secret::SecretValue;
@@ -39,14 +39,20 @@ pub struct NewSecret {
 
 pub struct InitReport {
     pub vault_id: String,
+    pub vault_identity: String,
     pub recovery_fingerprint: String,
+    /// How the vault key is kept (`keyprotect::protect`).
+    pub key_protection: String,
     pub kit_path: PathBuf,
     pub mirror_dir: PathBuf,
 }
 
 pub struct RestoreReport {
     pub vault_id: String,
+    pub vault_identity: String,
     pub from_vault_id: String,
+    /// The backup's format; a format-1 backup's secrets got their ids in this restore.
+    pub from_format: u32,
     pub secrets: Vec<SecretSummary>,
     pub from_generation: u64,
 }
@@ -65,7 +71,8 @@ fn audit_event(paths: &Paths, event: AuditEvent) -> Result<String, VaultError> {
 
 /// Makes a new vault (R16, R17). Runs in `vault install`, before the daemon starts. The first
 /// backup comes from the daemon when it starts. No gate: secrets can be stored right away; the
-/// kit stays in the owner's home folder until he stashes it.
+/// kit stays in the owner's home folder until he stashes it. Then the key is protected as well as
+/// this machine allows (`keyprotect::protect`: sealed to the TPM on Linux when there is one).
 pub fn init(paths: &Paths, kit_path: &Path, mirror_dir: &Path) -> Result<InitReport, VaultError> {
     if store::vault_exists(paths) || keyprotect::key_exists(&paths.dir) {
         return Err(VaultError::AlreadyInitialized);
@@ -104,7 +111,10 @@ pub fn init(paths: &Paths, kit_path: &Path, mirror_dir: &Path) -> Result<InitRep
     event.detail = Some(format!("vault {vault_id}, recovery key {fingerprint}"));
     doc.audit_head = audit_event(paths, event)?;
     store::save(paths, &key, &doc)?;
+    let key_protection = keyprotect::protect(&paths.dir, &key);
     Ok(InitReport {
+        vault_identity: model::vault_identity(&doc.recovery_recipient),
+        key_protection,
         vault_id,
         recovery_fingerprint: fingerprint,
         kit_path: kit_path.to_path_buf(),
@@ -140,12 +150,13 @@ fn write_kit(
          2. Optionally run `vault confirm-kit` and paste the key back; the vault checks it\n\
             and deletes this file. The vault works either way.\n\
          \n\
-         If your Mac is lost, this key plus a backup file brings the vault back on another\n\
-         Mac: `vault install --for-restore`, then\n\
+         If your {machine} is lost, this key plus a backup file brings the vault back on another\n\
+         {machine}: `vault install --for-restore`, then\n\
          `vault restore <backup file>`. Backups are standard age files, so\n\
          `age -d -i <file holding this key> <backup>` also opens them without Volgenic.\n\
          Nobody else, Volgenic included, can open your backups. Lose this key and a dead\n\
-         Mac means the secrets are gone.\n"
+         {machine} means the secrets are gone.\n",
+        machine = crate::platform::MACHINE,
     ));
     // `create_new` refuses an existing file or symbolic link at the path, and the caller runs
     // this as the kit's owner, so the write can't land anywhere that user can't write.
@@ -177,14 +188,32 @@ pub fn wipe_file(path: &Path) -> Result<(), VaultError> {
 }
 
 impl Vault {
-    /// Opens the vault: reads the vault key file, then decrypts the vault file.
-    pub fn open(paths: &Paths) -> Result<Vault, VaultError> {
+    /// Opens the vault: reads the vault key, then decrypts the vault file. A vault file in an
+    /// older format is migrated here, as a change of its own: every secret gets its id, and the
+    /// file and a new backup are written in the current format (read old, write new). The
+    /// returned text says what the migration did, for the daemon's log.
+    pub fn open(paths: &Paths) -> Result<(Vault, Option<String>), VaultError> {
         if !store::vault_exists(paths) {
             return Err(VaultError::NotInitialized);
         }
         let key = keyprotect::load(&paths.dir)?;
         let doc = store::load(paths, &key)?;
-        Ok(Vault { paths: paths.clone(), key, doc })
+        let from = doc.format;
+        let mut vault = Vault { paths: paths.clone(), key, doc };
+        let Some(given) = model::migrate(&mut vault.doc, store::new_random_id)? else {
+            return Ok((vault, None));
+        };
+        let mut event = AuditEvent::new("migrate", "ok");
+        event.detail = Some(format!("vault file format {from} to {VAULT_FORMAT}: {given} secrets given ids"));
+        let note = match vault.commit(event) {
+            Ok(backup) => format!(
+                "migrated the vault file from format {from} to {VAULT_FORMAT} ({given} secrets given ids); backup generation {} OK",
+                backup.generation
+            ),
+            // The migrated file is on disk; a failed backup is the alarm of R19, as for any change.
+            Err(error) => format!("migrated the vault file from format {from} to {VAULT_FORMAT}, but {error}"),
+        };
+        Ok((vault, Some(note)))
     }
 
     /// A fresh copy of the vault as it is on disk, for the daemon's read-only snapshot.
@@ -332,11 +361,19 @@ impl Vault {
             Kind::Login => model::validate_username(new.username.as_deref().unwrap_or(""))?,
             _ => {}
         }
+        let mut id = store::new_random_id()?;
+        while self.doc.records.iter().any(|record| record.id == id) {
+            id = store::new_random_id()?;
+        }
+        let created_at = crate::now_rfc3339();
         let record = Record {
+            id,
+            version: 1,
             name: new.name.clone(),
             kind: new.kind,
             site: new.site,
-            created_at: crate::now_rfc3339(),
+            updated_at: Some(created_at.clone()),
+            created_at,
             rule: if new.kind == Kind::ApiKey { new.rule } else { None },
             username: if new.kind == Kind::Login { new.username } else { None },
             totp: totp_params,
@@ -344,6 +381,7 @@ impl Vault {
         };
         let summary = record.summary();
         let mut event = AuditEvent::named("add", &record.name, "ok");
+        event.secret_id = Some(record.id.clone());
         event.detail = Some(match &record.rule {
             Some(rule) => format!("{}; rule {}", record.kind.label(), rule.describe()),
             None => format!("{} for {}", record.kind.label(), record.site),
@@ -368,15 +406,42 @@ impl Vault {
     }
 
     /// Deletes a secret. Earlier backup generations still hold it (R18).
-    pub fn delete(&mut self, name: &str) -> Result<BackupStatus, VaultError> {
+    pub fn delete(&mut self, secret: &SecretRef) -> Result<BackupStatus, VaultError> {
         self.reload()?;
         self.ready_for_change()?;
-        let before = self.doc.records.len();
-        self.doc.records.retain(|record| record.name != name);
-        if self.doc.records.len() == before {
-            return Err(VaultError::UnknownSecret(name.into()));
+        let (name, id) = match self.doc.find_ref(secret) {
+            Some(record) => (record.name.clone(), record.id.clone()),
+            None => return Err(secret.not_found()),
+        };
+        self.doc.records.retain(|record| record.id != id);
+        let mut event = AuditEvent::named("delete", &name, "ok");
+        event.secret_id = Some(id);
+        self.commit(event)
+    }
+
+    /// Renames a secret. Its id, rule and value stay; its version goes up by one.
+    pub fn rename(&mut self, secret: &SecretRef, new_name: &str) -> Result<(SecretSummary, BackupStatus), VaultError> {
+        self.reload()?;
+        self.ready_for_change()?;
+        model::validate_name(new_name)?;
+        if self.doc.find(new_name).is_some() {
+            return Err(VaultError::NameTaken(new_name.into()));
         }
-        self.commit(AuditEvent::named("delete", name, "ok"))
+        let now = crate::now_rfc3339();
+        let record = match secret {
+            SecretRef::Name(name) => self.doc.records.iter_mut().find(|record| &record.name == name),
+            SecretRef::Id(id) => self.doc.records.iter_mut().find(|record| &record.id == id),
+        }
+        .ok_or_else(|| secret.not_found())?;
+        let old_name = std::mem::replace(&mut record.name, new_name.to_string());
+        record.version += 1;
+        record.updated_at = Some(now);
+        let summary = record.summary();
+        let mut event = AuditEvent::named("rename", &old_name, "ok");
+        event.secret_id = Some(summary.id.clone());
+        event.detail = Some(format!("renamed to {new_name:?}, version {}", summary.version));
+        let status = self.commit(event)?;
+        Ok((summary, status))
     }
 
     /// Decrypts the newest local backup with the check key and compares it with the vault (R19).
@@ -478,7 +543,12 @@ impl Vault {
                 let recent = lines
                     .iter()
                     .rev()
-                    .filter(|l| matches!(l.event.event.as_str(), "add" | "delete" | "restore" | "confirm-kit" | "init" | "reset"))
+                    .filter(|l| {
+                        matches!(
+                            l.event.event.as_str(),
+                            "add" | "delete" | "rename" | "restore" | "confirm-kit" | "init" | "reset" | "migrate"
+                        )
+                    })
                     .take(5)
                     .map(|l| format!("{}  {} {}", l.t, l.event.event, l.event.name.clone().unwrap_or_default()))
                     .collect();
@@ -488,6 +558,8 @@ impl Vault {
         };
         OpenedStatus {
             vault_id: doc.vault_id.clone(),
+            vault_identity: model::vault_identity(&doc.recovery_recipient),
+            format: doc.format,
             created_at: doc.created_at.clone(),
             recovery_fingerprint: backup::fingerprint(&doc.recovery_recipient),
             kit_confirmed: doc.kit_confirmed,
@@ -504,20 +576,23 @@ impl Vault {
     }
 }
 
-pub(crate) fn totp_code(doc: &VaultDoc, name: &str) -> Result<TotpCode, VaultError> {
-    let record = doc.find(name).ok_or_else(|| VaultError::UnknownSecret(name.into()))?;
+pub(crate) fn totp_code<'a>(doc: &'a VaultDoc, secret: &SecretRef) -> Result<(TotpCode, &'a Record), VaultError> {
+    let record = doc.find_ref(secret).ok_or_else(|| secret.not_found())?;
     if record.kind != Kind::TwoFactor {
         return Err(VaultError::WrongKind);
     }
-    totp::code_at(&record.value, record.totp.unwrap_or_default(), crate::now_unix())
+    Ok((totp::code_at(&record.value, record.totp.unwrap_or_default(), crate::now_unix())?, record))
 }
 
-/// Whether two record lists hold the same secrets: names, kinds, sites, rules and values.
+/// Whether two record lists hold the same secrets: ids, versions, names, kinds, sites, rules and
+/// values.
 pub(crate) fn same_records(a: &[Record], b: &[Record]) -> bool {
     a.len() == b.len()
         && a.iter().all(|x| {
             b.iter().any(|y| {
-                x.name == y.name
+                x.id == y.id
+                    && x.version == y.version
+                    && x.name == y.name
                     && x.kind == y.kind
                     && x.site == y.site
                     && x.rule == y.rule
@@ -553,7 +628,9 @@ pub fn has_restore_point(paths: &Paths) -> bool {
 
 /// Restores a backup into an empty vault on this Mac, with the recovery key (R20). The backup is
 /// the file the person named, or the restore point `vault reset` kept. Makes a new vault key and
-/// a new vault id. The restored vault starts its own line of backups.
+/// a new vault id; the restored vault starts its own line of backups. Keeps what is stable: the
+/// recovery key (so the vault identity is the same) and every secret's id and version. A
+/// format-1 backup's secrets get their ids here.
 pub fn restore(
     paths: &Paths,
     file: Option<(String, Vec<u8>)>,
@@ -577,14 +654,17 @@ pub fn restore(
     };
     let identity = backup::parse_identity(&typed)?;
     drop(typed);
-    let payload = backup::open_bytes(&data, &identity)?;
+    let mut payload = backup::open_bytes(&data, &identity)?;
     if payload.recovery_recipient != backup::public_of(&identity) {
         return Err(VaultError::WrongRecoveryKey);
     }
+    let from_format = payload.format;
+    let migrated = model::migrate_records(&mut payload.records, store::new_random_id)?;
     let (check_secret, _) = backup::new_identity();
     let vault_id = store::new_vault_id()?;
     let key = SecretValue::random(32)?;
     keyprotect::store_new(&paths.dir, &key)?;
+    let vault_identity = model::vault_identity(&payload.recovery_recipient);
 
     let secrets = payload.records.iter().map(Record::summary).collect();
     let mut doc = VaultDoc {
@@ -603,11 +683,16 @@ pub fn restore(
     };
     let mut event = AuditEvent::new("restore", "ok");
     event.detail = Some(format!(
-        "new vault {vault_id} from {source} (vault {}, generation {}), audit head then {}",
-        payload.vault_id, payload.generation, payload.audit_head
+        "new vault {vault_id} from {source} (vault {}, generation {}, format {from_format}{}), audit head then {}",
+        payload.vault_id,
+        payload.generation,
+        if migrated > 0 { format!(", {migrated} secrets given ids") } else { String::new() },
+        payload.audit_head
     ));
     doc.audit_head = audit_event(paths, event)?;
     store::save(paths, &key, &doc)?;
+    let protection = keyprotect::protect(&paths.dir, &key);
+    eprintln!("{} vault daemon: restored vault key: {protection}", crate::now_rfc3339());
     if from_restore_point {
         let _ = fs::remove_file(&paths.restore_point);
         let _ = fs::remove_file(&paths.restore_point_info);
@@ -615,7 +700,14 @@ pub fn restore(
     let vault = Vault { paths: paths.clone(), key, doc };
     Ok((
         vault,
-        RestoreReport { vault_id, from_vault_id: payload.vault_id, secrets, from_generation: payload.generation },
+        RestoreReport {
+            vault_id,
+            vault_identity,
+            from_vault_id: payload.vault_id,
+            from_format,
+            secrets,
+            from_generation: payload.generation,
+        },
     ))
 }
 
