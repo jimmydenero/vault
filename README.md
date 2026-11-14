@@ -67,7 +67,8 @@ a Mac:
   and is the separate-account design the owner retired. A user service keeps everything yours,
   exactly as on a Mac: the same threat model, the same caller check, no sudo.
 - **The vault key is sealed to the TPM** when the machine has a TPM 2.0 and systemd 256 or later
-  (`systemd-creds --user encrypt --with-key=tpm2`). The daemon unseals it at each start,
+  (`systemd-creds --user encrypt --with-key=host+tpm2`: a user-scoped credential must also be
+  bound to the host secret, so `tpm2` alone is refused). The daemon unseals it at each start,
   unattended. A copy of the disk can't open the vault on another machine; code running as you on
   this machine still can, as with the key file. Otherwise the key stays a 0600 file, as on a Mac;
   `vault status` says which. Running `vault install` again seals a key file that can now be sealed.
