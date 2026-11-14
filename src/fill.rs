@@ -23,13 +23,14 @@
 //!    or tel `<input>`, and both must be in one document (`not_a_password_field`).
 //! 6. The audit line is written (R28). No line, no fill.
 //! 7. For each field: `DOM.focus`, then, in the isolated world, select what the field holds and
-//!    check that it is still connected, focused and on the site. Then `Input.insertText` through
-//!    the tab. The text replaces the selection.
+//!    check that it is still connected, focused and on the site. Then `Input.insertText` in the
+//!    session of the target that holds the field (a cross-origin frame's own, when named, after
+//!    checking that frame is inside the tab). The text replaces the selection.
 
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::devtools::{CdpError, DevTools};
 use crate::error::VaultError;
@@ -164,9 +165,14 @@ pub fn check_field(role: Role, node: u64, probe: &FieldProbe, domain: &str) -> R
 }
 
 /// Run on a node in an isolated world: what it is, and whether it belongs to this world's frame.
+///
+/// Isolated worlds of one name share their wrappers across a page's frames, so a node first
+/// wrapped through another frame's context keeps that frame's prototypes: `instanceof` is no
+/// test here, and `mine` compares documents instead. Every getter it reads is still an isolated
+/// world's own, which no page script can reach.
 const PROBE: &str = r#"function () {
   const doc = this.ownerDocument;
-  const input = this instanceof HTMLInputElement;
+  const input = String(this.tagName) === 'INPUT' && typeof this.type === 'string';
   return {
     mine: doc === document,
     tag: String(this.tagName || this.nodeName || ''),
@@ -244,6 +250,7 @@ pub(crate) fn fill(
         Some(frame_target) => {
             let frame_url = target_url(&mut cdp, frame_target, "iframe")?;
             sites::check_page(&frame_url, domain, "the frame")?;
+            check_inside(&mut cdp, frame_target, &request.target_id)?;
             attach(&mut cdp, frame_target)?
         }
         None => tab_session.clone(),
@@ -289,14 +296,14 @@ pub(crate) fn fill(
         match field.role {
             Role::Username => {
                 let username = record.username.as_deref().unwrap_or("");
-                cdp.call("Input.insertText", json!({ "text": username }), Some(&tab_session)).map_err(from_cdp)?;
+                cdp.call("Input.insertText", json!({ "text": username }), Some(&node_session)).map_err(from_cdp)?;
             }
             Role::Password => {
                 // R1: the fill's call site of `expose`. The value goes from the vault's memory
                 // into one wiped message buffer, and from there only to the browser.
                 let password = std::str::from_utf8(record.value.expose())
                     .map_err(|_| VaultError::InvalidSecret("this login's password isn't text".into()))?;
-                cdp.insert_secret_text(&tab_session, password).map_err(from_cdp)?;
+                cdp.insert_secret_text(&node_session, password).map_err(from_cdp)?;
             }
         }
         filled.push(field.role.label());
@@ -307,16 +314,37 @@ pub(crate) fn fill(
     Ok(Filled { filled })
 }
 
-/// A target's address from Chrome's own records, checking its type (`page` or `iframe`).
-fn target_url(cdp: &mut DevTools, target_id: &str, kind: &str) -> Result<String, VaultError> {
+/// A target's record in Chrome: its `targetInfo`.
+fn target_info(cdp: &mut DevTools, target_id: &str) -> Result<Value, VaultError> {
     let info = cdp
         .call("Target.getTargetInfo", json!({ "targetId": target_id }), None)
         .map_err(|_| unreachable(format!("the browser has no target {target_id}")))?;
-    let info = &info["targetInfo"];
+    Ok(info["targetInfo"].clone())
+}
+
+/// A target's address from Chrome's own records, checking its type (`page` or `iframe`).
+fn target_url(cdp: &mut DevTools, target_id: &str, kind: &str) -> Result<String, VaultError> {
+    let info = target_info(cdp, target_id)?;
     if info["type"].as_str() != Some(kind) {
         return Err(unreachable(format!("target {target_id} isn't a {}", if kind == "page" { "tab" } else { "frame" })));
     }
     Ok(info["url"].as_str().unwrap_or("").to_string())
+}
+
+/// That a frame target is inside the tab: its chain of `parentId`s reaches the tab. Otherwise
+/// a frame of another tab could be named, and the fields' checks would describe a page other
+/// than the one being filled.
+fn check_inside(cdp: &mut DevTools, frame_target: &str, tab: &str) -> Result<(), VaultError> {
+    let mut current = frame_target.to_string();
+    for _ in 0..16 {
+        let info = target_info(cdp, &current)?;
+        match info["parentId"].as_str() {
+            Some(parent) if parent == tab => return Ok(()),
+            Some(parent) if !parent.is_empty() => current = parent.to_string(),
+            _ => break,
+        }
+    }
+    Err(VaultError::FieldNotFound(format!("frame {frame_target} isn't inside tab {tab}")))
 }
 
 fn attach(cdp: &mut DevTools, target_id: &str) -> Result<String, VaultError> {

@@ -4,8 +4,10 @@ Volgenic's vault keeps your agents' secrets (API keys, website logins and 2FA se
 machine (a Mac, or a Linux box such as the always-on primary host), and lets agents **use** them
 without ever **seeing** them. An agent asks the vault to make
 an API call and gets the API's reply; the vault adds the key on the way out. An agent asks for a
-2FA code and gets the six digits, never the seed. Nothing the vault returns, to an agent or on
-the command line, can carry a secret value.
+2FA code and gets the six digits, never the seed. An agent signing in to a site asks the vault to
+fill a saved login into the agent browser on the same machine, and the vault types it into the
+page itself; for a sign-up, the vault makes the password and stores it, and nobody else ever
+holds it. Nothing the vault returns, to an agent or on the command line, can carry a secret value.
 
 - Design: [Volgenic v2 secret store](https://volgenic.com/pages/1f495021-effc-4fd2-9160-24cbcd73dbe3)
 - Threat model, with the numbered rules (R1, R2, ...) every change is reviewed against:
@@ -119,7 +121,7 @@ The `vault` tool can't print a secret, so it is safe for any agent on the machin
 |---|---|
 | `vault install [--for-restore]` | Installs or updates the vault for your user. |
 | `vault add NAME --kind api-key --host HOST --method GET --path /v1 --header "Authorization: Bearer {key}"` | Adds an API key with its rule. The value is read at a hidden prompt, or from standard input with `--yes`. |
-| `vault add NAME --kind login --site SITE --username USER` | Adds a login. Stored and listed only, for now. |
+| `vault add NAME --kind login --site SITE --username USER` | Adds a login, which `fill` types into the agent browser on its site only. |
 | `vault add NAME --kind 2fa --site SITE` | Adds a 2FA seed: base32, or an `otpauth://` link. |
 | `vault delete NAME` | Deletes a secret. Earlier backups keep it. |
 | `vault rename NAME NEW` | Renames a secret; its id, rule and value stay, its version goes up. |
@@ -149,7 +151,7 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   printable ASCII characters, or a whole number). Every reply, errors included, carries
   `"protocol": 2` and echoes the `request_id` as sent. A request without `protocol` is protocol 1
   and is served the same way. A newer protocol is refused with `unsupported_protocol`.
-- **Naming a secret:** `totp`, `proxy`, `delete` and `rename` take `"name"` or `"id"`, one of them.
+- **Naming a secret:** `totp`, `proxy`, `fill`, `delete` and `rename` take `"name"` or `"id"`, one of them.
 - `list` returns `{"ok":true,"secrets":[{"id","name","kind","site","version"}]}`.
 - `totp` returns `{"ok":true,"id":"...","name":"github-2fa","code":"123456","seconds_left":17}`.
 - `proxy` takes `method`, `path` (with query), optional `headers` (an object) and `body` or
@@ -157,6 +159,38 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   The key goes only into the header its rule names, only to the rule's host, method and path.
   Redirects come back to you unfollowed. A reply that contains the key is withheld
   (`echo_blocked`).
+- `fill` types a saved login into the agent browser, the Chrome for Testing the host daemon runs
+  on this machine, and answers only which fields it filled:
+
+  ```json
+  {"op":"fill","name":"shopify",
+   "cdp":{"port":9222,"target_id":"<the tab's target id>","frame_target_id":"<optional>"},
+   "fields":{"username":<backendNodeId>,"password":<backendNodeId>},
+   "expect_site":"shopify.com"}
+  ```
+
+  It answers `{"ok":true,"filled":["username","password"]}`. Either field may be left out, for a
+  sign-in that asks for them on two pages, but not both. `frame_target_id` names the target the
+  nodes belong to when the form is in a cross-origin frame with a target of its own (that frame
+  must be inside the tab); the text goes in through that frame's target.
+  - **Where it connects:** only to `127.0.0.1:<port>`, and only when the program listening there
+    is yours (your user ID). It reads `GET /json/version` and opens that browser's DevTools
+    WebSocket with no `Origin` header. Chrome needs `--remote-debugging-port` beside the pipe.
+  - **What it checks before typing anything:** `expect_site`, the tab's address (from Chrome's own
+    record), and each field's own document (read in an isolated world, where the page's scripts
+    can't change what it says) must all be `https:` and on the login's site, by registrable
+    domain (Public Suffix List: `a.github.io` and `b.github.io` are two sites). The password goes
+    only into an `<input type=password>`, the username only into a text, email or tel `<input>`,
+    both in one document. Then it writes the audit line, focuses each field, selects what it
+    holds, checks it still has the focus and is on the site, and types with `Input.insertText`.
+  - **Failures:** `no_such_login`, `site_mismatch`, `browser_unreachable`, `field_not_found`,
+    `not_a_password_field`. A refusal before typing types nothing.
+- `generate-login` makes a login for a sign-up: a random password the vault makes and stores
+  itself, so it exists nowhere else. `{"op":"generate-login","name":"shopify","site":"shopify.com",
+  "username":"jo@example.com","length":20,"symbols":true}` (`length` 12 to 128, 20 by default;
+  `symbols` true by default, false for letters and digits only). It answers
+  `{"ok":true,"name","id","site"}`, never the password; `fill` then types it into the sign-up
+  form. A name already in the vault is refused with `exists`.
 - The other requests (`status`, `audit`, `add`, `delete`, `rename`, `confirm-kit`, `reset`, `restore`,
   `backup`, `verify-backup`, `read-backup`, `mirror-plan`, `mirror-report`) are what the
   command-line tool and the mirror send; `src/protocol.rs` lists them.
