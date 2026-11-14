@@ -2,7 +2,11 @@
 //! only process that reads or changes the vault (R13, R26).
 //!
 //! Before sending anything, the client checks the socket's folder and the socket are its own
-//! user's and not symbolic links, and that `getpeereid` reports its own user ID (R22, R27).
+//! user's and not symbolic links, and that the peer's user ID is its own (`getpeereid` on macOS,
+//! `SO_PEERCRED` on Linux; R22, R27).
+//!
+//! Every request carries `"protocol": 2` and a fresh request id, and every reply must echo that
+//! id (protocol 2). A reply without a protocol version comes from an older daemon.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
@@ -18,10 +22,12 @@ use zeroize::Zeroizing;
 
 use crate::backup;
 use crate::error::VaultError;
-use crate::model::Kind;
+use crate::model::{Kind, SecretRef};
+use crate::platform;
 use crate::protocol::{
-    AddReply, AuditReply, BackupCheck, BackupReply, ConfirmKitReply, ErrorReply, ListReply, MirrorPlanReply, OkReply,
-    ReadBackupReply, ResetReply, RestoreReply, RuleInput, SecretRequest, StatusReply, VerifyBackupReply,
+    self, AddReply, AuditReply, BackupCheck, BackupReply, ConfirmKitReply, ErrorReply, ListReply, MirrorPlanReply,
+    OkReply, Outgoing, ReadBackupReply, RenameReply, ReplyFrame, ResetReply, RestoreReply, RuleInput, SecretRequest,
+    StatusReply, VerifyBackupReply,
 };
 use crate::secret::SecretValue;
 use crate::store::{self, Paths};
@@ -40,11 +46,20 @@ fn connect_verified(paths: &Paths) -> Result<UnixStream, VaultError> {
         return Err(VaultError::DaemonNotVerified(format!("{} isn't a socket of yours", paths.socket.display())));
     }
     let stream = UnixStream::connect(&paths.socket).map_err(|_| VaultError::DaemonNotRunning)?;
-    let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
-    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 || uid != me {
-        return Err(VaultError::DaemonNotVerified(format!("the process behind the socket is user ID {uid}, not you")));
+    match platform::peer_uid(stream.as_raw_fd()) {
+        Some(uid) if uid == me => Ok(stream),
+        Some(uid) => {
+            Err(VaultError::DaemonNotVerified(format!("the process behind the socket is user ID {uid}, not you")))
+        }
+        None => Err(VaultError::DaemonNotVerified("can't tell who is behind the socket".into())),
     }
-    Ok(stream)
+}
+
+/// A fresh request id: `cli-` and 8 random bytes as hex.
+fn new_request_id() -> String {
+    let mut bytes = [0u8; 8];
+    let _ = getrandom::getrandom(&mut bytes);
+    format!("cli-{}", hex::encode(bytes))
 }
 
 fn exchange(paths: &Paths, request: &[u8], payload: Option<&[u8]>, wait: Duration) -> Result<Vec<u8>, VaultError> {
@@ -65,7 +80,18 @@ fn exchange(paths: &Paths, request: &[u8], payload: Option<&[u8]>, wait: Duratio
     Ok(line)
 }
 
-fn parse<T: DeserializeOwned>(line: &[u8]) -> Result<T, VaultError> {
+/// Checks the reply is a protocol-2 reply to this request, then reads it.
+fn parse<T: DeserializeOwned>(line: &[u8], request_id: &str) -> Result<T, VaultError> {
+    let frame = serde_json::from_slice::<ReplyFrame>(line)
+        .map_err(|_| VaultError::Daemon("the daemon sent an unreadable reply".into()))?;
+    if frame.protocol.is_none() {
+        return Err(VaultError::Daemon(
+            "the daemon is an older build (protocol 1); run `vault install` with this build to update it".into(),
+        ));
+    }
+    if frame.request_id.as_ref().and_then(|id| id.as_str()) != Some(request_id) {
+        return Err(VaultError::ReplyMismatch(format!("sent request id {request_id}, got {:?}", frame.request_id)));
+    }
     if let Ok(error) = serde_json::from_slice::<ErrorReply>(line) {
         if !error.ok {
             return Err(VaultError::Daemon(error.message));
@@ -75,8 +101,20 @@ fn parse<T: DeserializeOwned>(line: &[u8]) -> Result<T, VaultError> {
 }
 
 fn call<T: DeserializeOwned>(paths: &Paths, request: serde_json::Value, wait: Duration) -> Result<T, VaultError> {
+    let mut request = request;
+    let request_id = new_request_id();
+    request["protocol"] = json!(protocol::PROTOCOL_VERSION);
+    request["request_id"] = json!(request_id);
     let bytes = serde_json::to_vec(&request).map_err(|_| VaultError::Io("request encoding".into()))?;
-    parse(&exchange(paths, &bytes, None, wait)?)
+    parse(&exchange(paths, &bytes, None, wait)?, &request_id)
+}
+
+/// The JSON fields that name a secret: `name` or `id`.
+fn secret_fields(secret: &SecretRef) -> serde_json::Value {
+    match secret {
+        SecretRef::Name(name) => json!({"name": name}),
+        SecretRef::Id(id) => json!({"id": id}),
+    }
 }
 
 /// Sends a request that carries a secret. The buffer is sized up front so it isn't reallocated,
@@ -87,9 +125,11 @@ fn call_secret<T: DeserializeOwned>(
     payload: Option<&[u8]>,
     wait: Duration,
 ) -> Result<T, VaultError> {
+    let request_id = new_request_id();
+    let outgoing = Outgoing { request, protocol: protocol::PROTOCOL_VERSION, request_id: &request_id };
     let mut bytes = Zeroizing::new(Vec::with_capacity(128 * 1024));
-    serde_json::to_writer(&mut *bytes, request).map_err(|_| VaultError::Io("request encoding".into()))?;
-    parse(&exchange(paths, &bytes, payload, wait)?)
+    serde_json::to_writer(&mut *bytes, &outgoing).map_err(|_| VaultError::Io("request encoding".into()))?;
+    parse(&exchange(paths, &bytes, payload, wait)?, &request_id)
 }
 
 pub fn status(paths: &Paths) -> Result<StatusReply, VaultError> {
@@ -117,8 +157,17 @@ pub fn add(
     call_secret(paths, &request, None, CHANGE_WAIT)
 }
 
-pub fn delete(paths: &Paths, name: &str) -> Result<BackupReply, VaultError> {
-    call(paths, json!({"op": "delete", "name": name}), CHANGE_WAIT)
+pub fn delete(paths: &Paths, secret: &SecretRef) -> Result<BackupReply, VaultError> {
+    let mut request = secret_fields(secret);
+    request["op"] = json!("delete");
+    call(paths, request, CHANGE_WAIT)
+}
+
+pub fn rename(paths: &Paths, secret: &SecretRef, new_name: &str) -> Result<RenameReply, VaultError> {
+    let mut request = secret_fields(secret);
+    request["op"] = json!("rename");
+    request["new_name"] = json!(new_name);
+    call(paths, request, CHANGE_WAIT)
 }
 
 pub fn confirm_kit(paths: &Paths, recovery_key: &SecretValue) -> Result<ConfirmKitReply, VaultError> {

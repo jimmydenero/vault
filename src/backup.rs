@@ -13,7 +13,7 @@ use serde::Serialize;
 use zeroize::Zeroizing;
 
 use crate::error::VaultError;
-use crate::model::{BackupPayload, BackupStatus, Record, VAULT_FORMAT, VaultDoc};
+use crate::model::{self, BackupPayload, BackupStatus, Record, VAULT_FORMAT, VaultDoc};
 use crate::protocol::BackupCheck;
 use crate::secret::SecretValue;
 use crate::store;
@@ -226,14 +226,24 @@ pub(crate) fn open(path: &Path, identity: &dyn age::Identity) -> Result<BackupPa
     open_bytes(&data, identity)
 }
 
-/// Decrypts and parses a backup held in memory.
+/// Decrypts and parses a backup held in memory, in any format this build reads (1 or 2). A
+/// format-1 backup's records have no ids yet; `vault::restore` gives them ids
+/// (`model::migrate_records`).
 pub(crate) fn open_bytes(data: &[u8], identity: &dyn age::Identity) -> Result<BackupPayload, VaultError> {
     let plain = decrypt_bytes(data, identity)?;
     let payload: BackupPayload =
         serde_json::from_slice(&plain).map_err(|_| VaultError::BackupFailed("the backup's contents are damaged".into()))?;
-    if payload.format != VAULT_FORMAT {
+    if payload.format > VAULT_FORMAT {
+        return Err(VaultError::BackupFailed(format!(
+            "the backup is format {}, written by a newer build of the vault",
+            payload.format
+        )));
+    }
+    if !model::READABLE_FORMATS.contains(&payload.format) {
         return Err(VaultError::BackupFailed("unknown backup format".into()));
     }
+    model::check_ids(&payload.records, payload.format)
+        .map_err(|_| VaultError::BackupFailed("the backup's secret ids are damaged".into()))?;
     Ok(payload)
 }
 

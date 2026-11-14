@@ -1,7 +1,7 @@
 //! The proxy: makes an HTTPS request with an API key added to the one header its rule names
 //! (R7 to R12). The key never goes into the body, query or URL, redirects are never followed,
-//! certificates are always checked against macOS's trust store, and replies that echo the key
-//! are withheld.
+//! certificates are always checked against the operating system's trust store (Security.framework
+//! on macOS, the system's root certificates on Linux), and replies that echo the key are withheld.
 
 use std::io::Read;
 use std::time::Duration;
@@ -36,11 +36,15 @@ pub struct ProxyReply {
 
 /// The HTTP client. Built once; no redirects, no proxies from the environment, HTTPS only.
 pub fn client() -> Result<Client, VaultError> {
-    Client::builder()
+    let builder = Client::builder()
         .redirect(reqwest::redirect::Policy::none()) // R10
         .no_proxy() // R11: HTTP_PROXY, HTTPS_PROXY and ALL_PROXY are ignored
-        .https_only(true)
-        .use_native_tls() // R11: Security.framework, macOS's trust store
+        .https_only(true);
+    #[cfg(target_os = "macos")]
+    let builder = builder.use_native_tls(); // R11: Security.framework, macOS's trust store
+    #[cfg(target_os = "linux")]
+    let builder = builder.use_rustls_tls(); // R11: rustls with the system's root certificates
+    builder
         .timeout(TIMEOUT)
         .connect_timeout(Duration::from_secs(10))
         .user_agent(concat!("volgenic-vault/", env!("CARGO_PKG_VERSION")))

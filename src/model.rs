@@ -37,21 +37,38 @@ impl Kind {
     }
 }
 
-/// What a listing shows: name, kind and site, nothing else (the item's "list" contract).
+/// What a listing shows: the secret's stable id and version, name, kind and site, nothing else.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SecretSummary {
+    /// Random, given when the secret is added; it never changes, through renames and restores.
+    /// Absent only in a reply from a daemon older than format 2.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub kind: Kind,
     pub site: String,
+    /// 1 when added, plus one for every change to this secret (a rename, today).
+    #[serde(default)]
+    pub version: u64,
 }
 
 /// One stored secret.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Record {
+    /// The secret's stable id: 16 random bytes as hex (`new_random_id`). Format 1 had none;
+    /// `migrate` gives every record one.
+    #[serde(default)]
+    pub id: String,
+    /// Starts at 1 and goes up by one with every change to this record.
+    #[serde(default)]
+    pub version: u64,
     pub name: String,
     pub kind: Kind,
     pub site: String,
     pub created_at: String,
+    /// When the record last changed (its creation, for a record never changed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule: Option<ProxyRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,7 +81,13 @@ pub(crate) struct Record {
 
 impl Record {
     pub fn summary(&self) -> SecretSummary {
-        SecretSummary { name: self.name.clone(), kind: self.kind, site: self.site.clone() }
+        SecretSummary {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            kind: self.kind,
+            site: self.site.clone(),
+            version: self.version,
+        }
     }
 }
 
@@ -107,16 +130,120 @@ pub(crate) struct VaultDoc {
     pub records: Vec<Record>,
 }
 
-pub(crate) const VAULT_FORMAT: u32 = 1;
+/// The format this build writes, in the vault file and in backups.
+///
+/// - **1** (pull requests #2 to #4): records keyed by name only.
+/// - **2**: every record has a random `id`, a `version` and an `updated_at`.
+pub(crate) const VAULT_FORMAT: u32 = 2;
+
+/// Every format this build reads. Older ones are migrated to `VAULT_FORMAT` when read.
+pub(crate) const READABLE_FORMATS: [u32; 2] = [1, 2];
+
+/// A secret as a request names it: by its name, or by its stable id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SecretRef {
+    Name(String),
+    Id(String),
+}
+
+impl SecretRef {
+    /// How the audit log and errors show it.
+    pub fn label(&self) -> String {
+        match self {
+            SecretRef::Name(name) => name.clone(),
+            SecretRef::Id(id) => format!("id {id}"),
+        }
+    }
+
+    pub fn not_found(&self) -> VaultError {
+        VaultError::UnknownSecret(self.label())
+    }
+}
 
 impl VaultDoc {
     pub fn find(&self, name: &str) -> Option<&Record> {
         self.records.iter().find(|record| record.name == name)
     }
 
+    pub fn find_ref(&self, secret: &SecretRef) -> Option<&Record> {
+        match secret {
+            SecretRef::Name(name) => self.find(name),
+            SecretRef::Id(id) => self.records.iter().find(|record| &record.id == id),
+        }
+    }
+
     pub fn summaries(&self) -> Vec<SecretSummary> {
         self.records.iter().map(Record::summary).collect()
     }
+}
+
+/// The vault's stable identity: the first 128 bits of the SHA-256 of its recovery public key,
+/// as hex. The recovery key is made once, at install, and every restore keeps it (R16, R20), so
+/// this survives restores and moves to another machine, and it never names a machine. Its
+/// first 12 digits are the recovery-key fingerprint the kit and `vault status` show, so a
+/// person can match the two by eye.
+pub fn vault_identity(recovery_recipient: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(recovery_recipient.as_bytes())[..16])
+}
+
+/// Brings a document read in an older format up to `VAULT_FORMAT`: format 1 records get a
+/// random id each (from `new_id`), version 1, and `updated_at` equal to `created_at`. Returns
+/// how many records were given ids, or `None` when the document was already current. Pure apart
+/// from `new_id`; the caller writes the result back (read old, write new).
+pub(crate) fn migrate(
+    doc: &mut VaultDoc,
+    new_id: impl FnMut() -> Result<String, VaultError>,
+) -> Result<Option<usize>, VaultError> {
+    if doc.format == VAULT_FORMAT {
+        return Ok(None);
+    }
+    if !READABLE_FORMATS.contains(&doc.format) {
+        return Err(VaultError::NewerFormat(doc.format));
+    }
+    let given = migrate_records(&mut doc.records, new_id)?;
+    doc.format = VAULT_FORMAT;
+    Ok(Some(given))
+}
+
+/// Gives every record without an id one, with version 1: format-1 records, in a vault file or a
+/// backup. Returns how many it gave.
+pub(crate) fn migrate_records(
+    records: &mut [Record],
+    mut new_id: impl FnMut() -> Result<String, VaultError>,
+) -> Result<usize, VaultError> {
+    let mut given = 0;
+    for record in records.iter_mut().filter(|record| record.id.is_empty()) {
+        record.id = new_id()?;
+        record.version = record.version.max(1);
+        if record.updated_at.is_none() {
+            record.updated_at = Some(record.created_at.clone());
+        }
+        given += 1;
+    }
+    Ok(given)
+}
+
+/// A format-2 document or backup must give every record a well-formed, unique id and a version
+/// of at least 1; format 1 had neither. Anything else is damage.
+pub(crate) fn check_ids(records: &[Record], format: u32) -> Result<(), VaultError> {
+    if format < 2 {
+        return Ok(());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for record in records {
+        let well_formed = record.id.len() == 32 && record.id.bytes().all(|b| b.is_ascii_hexdigit());
+        if !well_formed || record.version == 0 || !seen.insert(record.id.as_str()) {
+            return Err(VaultError::VaultFileCorrupt);
+        }
+    }
+    Ok(())
+}
+
+/// Ids are 32 lower-case hex digits; anything else can't name a secret.
+pub fn validate_id(id: &str) -> Result<(), VaultError> {
+    let ok = id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if ok { Ok(()) } else { Err(VaultError::BadRequest("an id is 32 lower-case hex digits".into())) }
 }
 
 /// What a backup holds: every secret and rule, plus enough to rebuild the vault (R18).

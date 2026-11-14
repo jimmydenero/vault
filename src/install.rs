@@ -1,8 +1,18 @@
-//! Installing the vault: `vault install`, run as the owner, no sudo. It copies the program to
-//! `~/Library/Application Support/Volgenic/bin/vault`, makes the vault (if there is none yet)
-//! with its key file and Recovery Kit, and starts the daemon as a LaunchAgent in the owner's
-//! login. Running it again with a new build updates the program and restarts the daemon, and
-//! keeps the vault. `vault install-mirror` adds the optional backup mirror.
+//! Installing the vault: `vault install`, run as the owner, no sudo. It copies the program into
+//! the vault's base folder (`bin/vault`), makes the vault (if there is none yet) with its key
+//! and Recovery Kit, and starts the daemon. Running it again with a new build updates the
+//! program and restarts the daemon, and keeps the vault.
+//!
+//! - **macOS:** the daemon is a LaunchAgent in the owner's login, `com.volgenic.vault`.
+//!   `vault install-mirror` adds the optional backup mirror (macOS only for now).
+//! - **Linux:** the daemon is a systemd *user* service, `volgenic-vault.service`, with
+//!   lingering turned on for the owner (`loginctl enable-linger`), so systemd starts it at boot
+//!   with nobody logged in, and restarts it whenever it stops (`Restart=always`). A user unit
+//!   rather than a system unit under a dedicated account because it needs no root: the
+//!   program, the files and the daemon stay the owner's, exactly as on a Mac, so the same
+//!   threat model and caller check apply, and `vault install` updates it without sudo. A
+//!   dedicated account is the separate-user design the owner retired in pull request #4.
+//!   The vault key is sealed to the TPM when there is one (`keyprotect::protect`).
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, Write};
@@ -17,6 +27,12 @@ use crate::keyprotect;
 use crate::store::{self, OwnerPaths, Paths};
 use crate::vault;
 
+#[cfg(target_os = "macos")]
+use self::launchd as service;
+#[cfg(not(target_os = "macos"))]
+use self::systemd as service;
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn ask(prompt: &str) -> Result<String, VaultError> {
     print!("{prompt}");
     std::io::stdout().flush()?;
@@ -25,8 +41,19 @@ fn ask(prompt: &str) -> Result<String, VaultError> {
     Ok(line.trim().to_string())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn run(program: &str, args: &[&str]) -> Result<String, VaultError> {
-    let out = Command::new(program).args(args).output()?;
+    run_with(program, args, &[])
+}
+
+/// Runs a program at its fixed path (never through `$PATH`) and returns what it printed.
+fn run_with(program: &str, args: &[&str], env: &[(&str, &str)]) -> Result<String, VaultError> {
+    // No input: a polkit agent (which `loginctl` starts only on a terminal) can never prompt (R33).
+    let out = Command::new(program)
+        .args(args)
+        .envs(env.iter().copied())
+        .stdin(std::process::Stdio::null())
+        .output()?;
     if !out.status.success() {
         return Err(VaultError::Io(format!(
             "{program} {} failed: {}",
@@ -62,13 +89,112 @@ fn install_program(paths: &Paths, exe: &Path) -> Result<(), VaultError> {
     Ok(())
 }
 
-fn xml_escape(text: &str) -> String {
-    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+/// `vault install`: as the owner, no sudo, no questions.
+pub fn install(for_restore: bool) -> Result<(), VaultError> {
+    let uid = unsafe { libc::getuid() };
+    if uid == 0 || unsafe { libc::geteuid() } == 0 {
+        return Err(VaultError::Io("run `vault install` as yourself, without sudo".into()));
+    }
+    let paths = Paths::current();
+    let owner = OwnerPaths::for_uid(uid)?;
+    for dir in [&paths.base, &paths.bin_dir, &paths.dir, &paths.local_backups, &paths.log_dir] {
+        ensure_dir(dir)?;
+    }
+    // On Linux the socket's folder under /run/user is systemd's to make (RuntimeDirectory).
+    if paths.socket_dir.starts_with(&paths.base) {
+        ensure_dir(&paths.socket_dir)?;
+    }
+    if let Some(dir) = paths.service_file.parent() {
+        fs::create_dir_all(dir)?;
+    }
+
+    // Stop a running daemon before replacing the program.
+    service::stop(uid);
+    let exe = std::env::current_exe()?.canonicalize()?;
+    install_program(&paths, &exe)?;
+    println!("program:  {}", paths.program.display());
+
+    if store::vault_exists(&paths) {
+        println!("vault:    kept");
+        #[cfg(target_os = "linux")]
+        reseal_if_possible(&paths);
+    } else if for_restore || keyprotect::key_exists(&paths.dir) {
+        println!("vault:    none (restore one with `vault restore FILE`)");
+    } else {
+        let report = vault::init(&paths, &owner.default_kit, &owner.default_mirror_dir())?;
+        println!("vault:    {} made (identity {})", report.vault_id, report.vault_identity);
+        println!("key:      {}", report.key_protection);
+        println!("kit:      {} (holds the recovery key for backups; stash it when you like)", report.kit_path.display());
+    }
+
+    match service::start(&paths, &owner)? {
+        Started::Yes => {}
+        Started::No(why) => {
+            println!("daemon:   not started: {why}");
+            println!("          start it yourself: {} daemon", paths.program.display());
+            return Ok(());
+        }
+    }
+    if client::wait_for_daemon(&paths, Duration::from_secs(30)) {
+        let status = client::status(&paths)?;
+        println!("daemon:   running (pid {}), socket {}", status.pid, paths.socket.display());
+        Ok(())
+    } else {
+        Err(VaultError::Daemon(format!("the daemon didn't answer within 30s; its log is {}", paths.daemon_log.display())))
+    }
 }
 
-fn daemon_plist(paths: &Paths) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+/// Whether `service::start` started the daemon.
+enum Started {
+    Yes,
+    /// Not started, and why (the service manager isn't there). Linux only.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    No(String),
+}
+
+/// An existing vault whose key is still the plain file (made before sealing existed, on a
+/// machine that got a TPM, or just restored): seal it now if this machine can.
+#[cfg(target_os = "linux")]
+fn reseal_if_possible(paths: &Paths) {
+    let plain = paths.dir.join(keyprotect::KEY_FILE);
+    if fs::symlink_metadata(&plain).is_err() {
+        println!("key:      {}", keyprotect::describe(&paths.dir));
+        return;
+    }
+    match keyprotect::load(&paths.dir) {
+        Ok(key) => println!("key:      {}", keyprotect::protect(&paths.dir, &key)),
+        Err(error) => println!("key:      can't read the key file to seal it: {error}"),
+    }
+}
+
+/// The LaunchAgent in the owner's login (macOS).
+#[cfg(target_os = "macos")]
+mod launchd {
+    use std::process::Command;
+
+    use super::{Started, run};
+    use crate::error::VaultError;
+    use crate::store::{self, OwnerPaths, Paths};
+
+    pub fn stop(uid: u32) {
+        let domain = format!("gui/{uid}");
+        let _ = Command::new("/bin/launchctl").args(["bootout", &format!("{domain}/{}", store::DAEMON_LABEL)]).output();
+    }
+
+    pub fn start(paths: &Paths, owner: &OwnerPaths) -> Result<Started, VaultError> {
+        let domain = format!("gui/{}", owner.uid);
+        store::write_atomic_mode(&paths.service_file, daemon_plist(paths).as_bytes(), 0o644)?;
+        run("/bin/launchctl", &["bootstrap", &domain, &paths.service_file.display().to_string()])?;
+        Ok(Started::Yes)
+    }
+
+    pub fn xml_escape(text: &str) -> String {
+        text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    }
+
+    fn daemon_plist(paths: &Paths) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -84,55 +210,120 @@ fn daemon_plist(paths: &Paths) -> String {
 </dict>
 </plist>
 "#,
-        label = store::DAEMON_LABEL,
-        program = xml_escape(&paths.program.display().to_string()),
-        log = xml_escape(&paths.daemon_log.display().to_string()),
-    )
-}
-
-/// `vault install`: as the owner, no sudo, no questions.
-pub fn install(for_restore: bool) -> Result<(), VaultError> {
-    let uid = unsafe { libc::getuid() };
-    if uid == 0 || unsafe { libc::geteuid() } == 0 {
-        return Err(VaultError::Io("run `vault install` as yourself, without sudo".into()));
-    }
-    let paths = Paths::current();
-    let owner = OwnerPaths::for_uid(uid)?;
-    for dir in [&paths.base, &paths.bin_dir, &paths.dir, &paths.local_backups, &paths.socket_dir, &paths.log_dir] {
-        ensure_dir(dir)?;
-    }
-    if let Some(dir) = paths.daemon_plist.parent() {
-        fs::create_dir_all(dir)?;
-    }
-
-    // Stop a running daemon before replacing the program.
-    let domain = format!("gui/{uid}");
-    let _ = Command::new("/bin/launchctl").args(["bootout", &format!("{domain}/{}", store::DAEMON_LABEL)]).output();
-    let exe = std::env::current_exe()?.canonicalize()?;
-    install_program(&paths, &exe)?;
-    println!("program:  {}", paths.program.display());
-
-    if store::vault_exists(&paths) {
-        println!("vault:    kept");
-    } else if for_restore || keyprotect::key_exists(&paths.dir) {
-        println!("vault:    none (restore one with `vault restore FILE`)");
-    } else {
-        let report = vault::init(&paths, &owner.default_kit, &owner.icloud_backups())?;
-        println!("vault:    {} made", report.vault_id);
-        println!("kit:      {} (holds the recovery key for backups; stash it when you like)", report.kit_path.display());
-    }
-
-    store::write_atomic_mode(&paths.daemon_plist, daemon_plist(&paths).as_bytes(), 0o644)?;
-    run("/bin/launchctl", &["bootstrap", &domain, &paths.daemon_plist.display().to_string()])?;
-    if client::wait_for_daemon(&paths, Duration::from_secs(30)) {
-        let status = client::status(&paths)?;
-        println!("daemon:   running (pid {}), socket {}", status.pid, paths.socket.display());
-        Ok(())
-    } else {
-        Err(VaultError::Daemon(format!("the daemon didn't answer within 30s; its log is {}", paths.daemon_log.display())))
+            label = store::DAEMON_LABEL,
+            program = xml_escape(&paths.program.display().to_string()),
+            log = xml_escape(&paths.daemon_log.display().to_string()),
+        )
     }
 }
 
+/// The systemd user service, started at boot by lingering (Linux).
+#[cfg(not(target_os = "macos"))]
+mod systemd {
+    use std::process::Command;
+
+    use super::{Started, run_with};
+    use crate::error::VaultError;
+    use crate::platform;
+    use crate::store::{self, OwnerPaths, Paths};
+
+    const SYSTEMCTL: &str = "/usr/bin/systemctl";
+    const LOGINCTL: &str = "/usr/bin/loginctl";
+
+    /// `systemctl --user` finds the user's service manager through `$XDG_RUNTIME_DIR`; a shell
+    /// from `su` or `sudo -u` may not have it set.
+    fn user_env(uid: u32) -> Vec<(String, String)> {
+        match std::env::var_os("XDG_RUNTIME_DIR") {
+            Some(_) => Vec::new(),
+            None => vec![("XDG_RUNTIME_DIR".into(), format!("/run/user/{uid}"))],
+        }
+    }
+
+    pub fn stop(uid: u32) {
+        if platform::systemd_booted() {
+            let _ = Command::new(SYSTEMCTL)
+                .args(["--user", "stop", store::DAEMON_LABEL])
+                .envs(user_env(uid))
+                .stdin(std::process::Stdio::null())
+                .output();
+        }
+    }
+
+    /// A value for a unit file: `%` doubled (systemd's specifiers), and for `ExecStart` the
+    /// program in double quotes with `"` and `\` escaped.
+    fn escape(text: &str) -> String {
+        text.replace('%', "%%")
+    }
+
+    fn quoted(text: &str) -> String {
+        format!("\"{}\"", escape(text).replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    pub fn unit(paths: &Paths) -> String {
+        format!(
+            "# Written by `vault install`; running it again rewrites this file.\n\
+             [Unit]\n\
+             Description=Volgenic vault: agents use your secrets without seeing them\n\
+             Documentation=https://github.com/volgenic/vault\n\
+             # Never give up restarting it.\n\
+             StartLimitIntervalSec=0\n\
+             \n\
+             [Service]\n\
+             Type=simple\n\
+             ExecStart={program} daemon\n\
+             Restart=always\n\
+             RestartSec=2\n\
+             # The socket's folder: $XDG_RUNTIME_DIR/volgenic, that is /run/user/<uid>/volgenic, 0700.\n\
+             RuntimeDirectory=volgenic\n\
+             RuntimeDirectoryMode=0700\n\
+             UMask=0077\n\
+             LimitCORE=0\n\
+             NoNewPrivileges=yes\n\
+             UnsetEnvironment=SSL_CERT_FILE SSL_CERT_DIR\n\
+             StandardOutput=append:{log}\n\
+             StandardError=append:{log}\n\
+             \n\
+             [Install]\n\
+             # With lingering on, the user's service manager starts at boot, and this with it.\n\
+             WantedBy=default.target\n",
+            program = quoted(&paths.program.display().to_string()),
+            log = escape(&paths.daemon_log.display().to_string()),
+        )
+    }
+
+    pub fn start(paths: &Paths, owner: &OwnerPaths) -> Result<Started, VaultError> {
+        store::write_atomic_mode(&paths.service_file, unit(paths).as_bytes(), 0o644)?;
+        println!("service:  {}", paths.service_file.display());
+        if !platform::systemd_booted() {
+            return Ok(Started::No("this machine isn't running systemd".into()));
+        }
+        // Lingering first: it starts the user's service manager now and at every boot, with
+        // nobody logged in. Turning it on for yourself needs no root on most distributions
+        // (polkit's `set-self-linger`); where it does, say how.
+        let lingering = run_with(LOGINCTL, &["enable-linger", &owner.name], &[]).is_ok()
+            || linger_is_on(&owner.name);
+        if lingering {
+            println!("boot:     starts at boot with nobody logged in (lingering is on for {})", owner.name);
+        } else {
+            println!("boot:     lingering couldn't be turned on, so the vault runs only while you're logged in.");
+            println!("          To serve after a reboot with nobody logged in, run once:");
+            println!("            sudo loginctl enable-linger {}", owner.name);
+        }
+        let env = user_env(owner.uid);
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        run_with(SYSTEMCTL, &["--user", "daemon-reload"], &env)?;
+        run_with(SYSTEMCTL, &["--user", "enable", store::DAEMON_LABEL], &env)?;
+        run_with(SYSTEMCTL, &["--user", "restart", store::DAEMON_LABEL], &env)?;
+        Ok(Started::Yes)
+    }
+
+    fn linger_is_on(name: &str) -> bool {
+        run_with(LOGINCTL, &["show-user", name, "--property=Linger", "--value"], &[])
+            .is_ok_and(|out| out.trim() == "yes")
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn mirror_plist(paths: &Paths, owner: &OwnerPaths) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -154,13 +345,20 @@ fn mirror_plist(paths: &Paths, owner: &OwnerPaths) -> String {
 </plist>
 "#,
         label = store::MIRROR_LABEL,
-        program = xml_escape(&paths.program.display().to_string()),
-        watch = xml_escape(&paths.local_backups.display().to_string()),
-        log = xml_escape(&owner.mirror_log.display().to_string()),
+        program = launchd::xml_escape(&paths.program.display().to_string()),
+        watch = launchd::xml_escape(&paths.local_backups.display().to_string()),
+        log = launchd::xml_escape(&owner.mirror_log.display().to_string()),
     )
 }
 
+/// `vault install-mirror` on Linux: not yet (the mirror is a LaunchAgent).
+#[cfg(not(target_os = "macos"))]
+pub fn install_mirror(_yes: bool) -> Result<(), VaultError> {
+    Err(VaultError::UnsupportedPlatform("the backup mirror (`vault install-mirror`)".into()))
+}
+
 /// `vault install-mirror`: the owner's LaunchAgent that copies backups to the mirror folder.
+#[cfg(target_os = "macos")]
 pub fn install_mirror(yes: bool) -> Result<(), VaultError> {
     let uid = unsafe { libc::getuid() };
     if uid == 0 || unsafe { libc::geteuid() } == 0 {

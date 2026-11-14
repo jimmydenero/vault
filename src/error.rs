@@ -3,17 +3,22 @@
 
 use std::fmt;
 
+use crate::platform::MACHINE;
+
+/// Where to look when the daemon doesn't answer.
+#[cfg(target_os = "macos")]
+const DAEMON_HINT: &str = "It runs in your login (a LaunchAgent), so after a restart it waits for you to log in; \
+     otherwise see ~/Library/Logs/Volgenic/vault.log";
+#[cfg(not(target_os = "macos"))]
+const DAEMON_HINT: &str = "See `systemctl --user status volgenic-vault` and ~/.local/state/volgenic/vault.log";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VaultError {
-    UnsupportedPlatform,
-    SecureEnclave,
+    UnsupportedPlatform(String),
     KeyProtection,
     Random,
     AlreadyInitialized,
     NotInitialized,
-    AutoLoginOn,
-    NoSecureEnclave,
-    KitNotConfirmed,
     KitAlreadyConfirmed,
     WrongRecoveryKey,
     VaultFileCorrupt,
@@ -40,11 +45,13 @@ pub enum VaultError {
     AuditChainBroken(usize),
     AuditUnavailable,
     NotInstalled,
-    NotRoot,
     DaemonNotRunning,
     DaemonNotVerified(String),
     Daemon(String),
-    Unsigned(String),
+    NewerFormat(u32),
+    SealedKey(String),
+    UnsupportedProtocol(u32),
+    ReplyMismatch(String),
 }
 
 impl VaultError {
@@ -52,15 +59,11 @@ impl VaultError {
     pub fn code(&self) -> &'static str {
         use VaultError::*;
         match self {
-            UnsupportedPlatform => "unsupported_platform",
-            SecureEnclave => "secure_enclave_error",
+            UnsupportedPlatform(_) => "unsupported_platform",
             KeyProtection => "key_protection_error",
             Random => "random_error",
             AlreadyInitialized => "already_initialized",
             NotInitialized => "not_initialized",
-            AutoLoginOn => "auto_login_on",
-            NoSecureEnclave => "no_secure_enclave",
-            KitNotConfirmed => "kit_not_confirmed",
             KitAlreadyConfirmed => "kit_already_confirmed",
             WrongRecoveryKey => "wrong_recovery_key",
             VaultFileCorrupt => "vault_file_corrupt",
@@ -87,11 +90,13 @@ impl VaultError {
             AuditChainBroken(_) => "audit_chain_broken",
             AuditUnavailable => "audit_unavailable",
             NotInstalled => "not_installed",
-            NotRoot => "not_root",
             DaemonNotRunning => "daemon_not_running",
             DaemonNotVerified(_) => "daemon_not_verified",
             Daemon(_) => "daemon_refused",
-            Unsigned(_) => "unsigned_build",
+            NewerFormat(_) => "newer_format",
+            SealedKey(_) => "sealed_key_error",
+            UnsupportedProtocol(_) => "unsupported_protocol",
+            ReplyMismatch(_) => "reply_mismatch",
         }
     }
 }
@@ -100,24 +105,13 @@ impl fmt::Display for VaultError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use VaultError::*;
         match self {
-            UnsupportedPlatform => write!(f, "the vault runs only on macOS for now (Linux is planned)"),
-            SecureEnclave => write!(f, "the Secure Enclave refused the operation"),
+            UnsupportedPlatform(what) => write!(f, "{what} isn't available on this platform yet"),
             KeyProtection => write!(f, "the protected vault key is damaged or can't be opened"),
             Random => write!(f, "the operating system's random number generator failed"),
-            AlreadyInitialized => write!(f, "a vault already exists on this Mac"),
+            AlreadyInitialized => write!(f, "a vault already exists on this {MACHINE}"),
             NotInitialized => write!(
                 f,
-                "no vault on this Mac: install one with `vault install`, or restore one with `vault restore`"
-            ),
-            AutoLoginOn => write!(
-                f,
-                "macOS automatic login is on; turn it off in System Settings > Users & Groups first \
-                 (it keeps the login password in /etc/kcpassword, easy to reverse)"
-            ),
-            NoSecureEnclave => write!(f, "this Mac has no Secure Enclave"),
-            KitNotConfirmed => write!(
-                f,
-                "the Recovery Kit isn't confirmed yet; run `vault confirm-kit` before storing secrets"
+                "no vault on this {MACHINE}: install one with `vault install`, or restore one with `vault restore`"
             ),
             KitAlreadyConfirmed => write!(f, "the Recovery Kit is already confirmed"),
             WrongRecoveryKey => write!(f, "that recovery key doesn't match this vault"),
@@ -150,16 +144,21 @@ impl fmt::Display for VaultError {
                 f,
                 "the vault can't write its audit log, so it refuses every use until it can (R28)"
             ),
-            NotInstalled => write!(f, "the vault isn't installed on this Mac; run `sudo vault install-system`"),
-            NotRoot => write!(f, "this command must run as root: `sudo vault install-system`"),
-            DaemonNotRunning => write!(
-                f,
-                "the vault's daemon isn't answering. After a restart it waits for the first login; \
-                 otherwise see /Library/Logs/Volgenic/vault.log"
-            ),
+            NotInstalled => write!(f, "the vault isn't installed for you on this {MACHINE}; run `vault install`"),
+            DaemonNotRunning => write!(f, "the vault's daemon isn't answering. {DAEMON_HINT}"),
             DaemonNotVerified(why) => write!(f, "refusing to talk to the socket: {why}"),
             Daemon(message) => write!(f, "{message}"),
-            Unsigned(why) => write!(f, "this build isn't signed as the vault: {why}"),
+            NewerFormat(format) => write!(
+                f,
+                "the vault file is format {format}, written by a newer build of the vault; install that build"
+            ),
+            SealedKey(why) => write!(f, "the TPM-sealed vault key can't be opened: {why}"),
+            UnsupportedProtocol(version) => write!(
+                f,
+                "protocol {version} is newer than this vault speaks (protocol {})",
+                crate::protocol::PROTOCOL_VERSION
+            ),
+            ReplyMismatch(why) => write!(f, "the daemon's reply doesn't belong to this request: {why}"),
         }
     }
 }

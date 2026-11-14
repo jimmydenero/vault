@@ -26,7 +26,6 @@ hex = "0.4"
 hmac = "0.12"
 libc = "0.2"
 memchr = "2"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,6 +34,15 @@ sha2 = "0.10"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 url = "2"
 zeroize = "1"
+
+# The proxy's HTTPS client verifies certificates against the operating system's trust store (R11):
+# Security.framework on macOS, the system's root certificates (rustls with native roots) on Linux,
+# so a Linux build needs no OpenSSL headers.
+[target.'cfg(target_os = "macos")'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
 
 [profile.dev]
 panic = "abort"

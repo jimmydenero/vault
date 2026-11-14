@@ -1,16 +1,23 @@
 //! Where the vault keeps its files, and the encrypted vault file itself (R13).
 //!
-//! Everything is the owner's own, under `~/Library/Application Support/Volgenic/` (home from the
-//! user database, never `$HOME`):
+//! Everything is the owner's own, under a base folder in his home (home from the user database,
+//! never `$HOME`, R15):
 //!
 //! | Folder           | Mode | Holds                                                    |
 //! |------------------|------|----------------------------------------------------------|
 //! | `bin/`           | 0700 | the installed program                                    |
 //! | `vault/`         | 0700 | vault file, vault key (0600), audit log, restore point   |
 //! | `vault-backups/` | 0700 | backups (ciphertext)                                     |
-//! | `socket/`        | 0700 | the socket                                               |
 //!
-//! The daemon is a LaunchAgent in the owner's login (`~/Library/LaunchAgents/`).
+//! - **macOS:** the base is `~/Library/Application Support/Volgenic/`, the socket is in its
+//!   `socket/` folder (0700), and the daemon is a LaunchAgent in the owner's login
+//!   (`~/Library/LaunchAgents/`).
+//! - **Linux:** the base is `~/.local/share/volgenic/`, and the daemon is a systemd user service
+//!   (`~/.config/systemd/user/volgenic-vault.service`) that starts at boot through lingering. The
+//!   socket is in `/run/user/<uid>/volgenic/` (0700), the folder systemd makes for the service
+//!   (`RuntimeDirectory=volgenic`, which is `$XDG_RUNTIME_DIR/volgenic`). The path is worked out
+//!   from the user ID, not read from `$XDG_RUNTIME_DIR` (R15). A machine with no
+//!   `/run/user/<uid>` (no systemd, such as a container) uses the base's `socket/` folder.
 
 use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions};
@@ -23,14 +30,27 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use zeroize::Zeroizing;
 
 use crate::error::VaultError;
-use crate::model::{VAULT_FORMAT, VaultDoc};
+use crate::model::{self, VAULT_FORMAT, VaultDoc};
 use crate::secret::SecretValue;
 
-const MAGIC: &[u8; 8] = b"VGVAULT\x01";
+/// The file's magic: `VGVAULT` and the format's number in the last byte, bound into the
+/// encryption as associated data together with the vault id (R13).
+const MAGIC_PREFIX: &[u8; 7] = b"VGVAULT";
+const MAGIC_LEN: usize = 8;
 const ID_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 
+fn magic(format: u32) -> [u8; MAGIC_LEN] {
+    let mut magic = [0u8; MAGIC_LEN];
+    magic[..7].copy_from_slice(MAGIC_PREFIX);
+    magic[7] = format as u8;
+    magic
+}
+
+#[cfg(target_os = "macos")]
 pub const DAEMON_LABEL: &str = "com.volgenic.vault";
+#[cfg(not(target_os = "macos"))]
+pub const DAEMON_LABEL: &str = "volgenic-vault.service";
 pub const MIRROR_LABEL: &str = "com.volgenic.vault.mirror";
 
 /// Every path the vault uses.
@@ -48,7 +68,8 @@ pub struct Paths {
     pub local_backups: PathBuf,
     pub socket_dir: PathBuf,
     pub socket: PathBuf,
-    pub daemon_plist: PathBuf,
+    /// The daemon's job: the LaunchAgent's plist on macOS, the systemd user unit on Linux.
+    pub service_file: PathBuf,
     pub log_dir: PathBuf,
     pub daemon_log: PathBuf,
 }
@@ -56,18 +77,35 @@ pub struct Paths {
 impl Paths {
     /// The running user's vault.
     pub fn current() -> Paths {
-        let home = account_by_uid(unsafe { libc::getuid() })
-            .map(|a| a.home)
-            .unwrap_or_else(|| PathBuf::from("/var/empty"));
-        Paths::for_home(&home)
+        let uid = unsafe { libc::getuid() };
+        let home = account_by_uid(uid).map(|a| a.home).unwrap_or_else(|| PathBuf::from("/var/empty"));
+        Paths::for_user(uid, &home)
     }
 
-    pub fn for_home(home: &Path) -> Paths {
+    #[cfg(target_os = "macos")]
+    pub fn for_user(_uid: u32, home: &Path) -> Paths {
         let base = home.join("Library/Application Support/Volgenic");
-        let bin_dir = base.join("bin");
-        let dir = base.join("vault");
         let socket_dir = base.join("socket");
         let log_dir = home.join("Library/Logs/Volgenic");
+        let service_file = home.join(format!("Library/LaunchAgents/{DAEMON_LABEL}.plist"));
+        Paths::assemble(base, socket_dir, log_dir, service_file)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn for_user(uid: u32, home: &Path) -> Paths {
+        let base = home.join(".local/share/volgenic");
+        let socket_dir = match runtime_dir(uid) {
+            Some(runtime) => runtime.join("volgenic"),
+            None => base.join("socket"),
+        };
+        let log_dir = home.join(".local/state/volgenic");
+        let service_file = home.join(format!(".config/systemd/user/{DAEMON_LABEL}"));
+        Paths::assemble(base, socket_dir, log_dir, service_file)
+    }
+
+    fn assemble(base: PathBuf, socket_dir: PathBuf, log_dir: PathBuf, service_file: PathBuf) -> Paths {
+        let bin_dir = base.join("bin");
+        let dir = base.join("vault");
         Paths {
             program: bin_dir.join("vault"),
             vault_file: dir.join("vault.bin"),
@@ -77,8 +115,8 @@ impl Paths {
             mirror_state: dir.join("mirror.json"),
             local_backups: base.join("vault-backups"),
             socket: socket_dir.join("vault.sock"),
-            daemon_plist: home.join(format!("Library/LaunchAgents/{DAEMON_LABEL}.plist")),
             daemon_log: log_dir.join("vault.log"),
+            service_file,
             log_dir,
             bin_dir,
             dir,
@@ -86,6 +124,17 @@ impl Paths {
             base,
         }
     }
+}
+
+/// The user's runtime folder, `/run/user/<uid>`, when it exists and is the user's own: systemd's
+/// login manager makes it at the first login, or at boot for a user with lingering on. It is
+/// what `$XDG_RUNTIME_DIR` names, worked out from the user ID instead of read from the
+/// environment (R15).
+#[cfg(not(target_os = "macos"))]
+pub fn runtime_dir(uid: u32) -> Option<PathBuf> {
+    let dir = PathBuf::from(format!("/run/user/{uid}"));
+    let meta = fs::symlink_metadata(&dir).ok()?;
+    (meta.is_dir() && meta.uid() == uid).then_some(dir)
 }
 
 /// The paths that belong to the person who owns the vault.
@@ -114,9 +163,18 @@ impl OwnerPaths {
         })
     }
 
-    /// The suggested mirror folder, in iCloud Drive. Only `vault mirror` ever opens it (R32).
-    pub fn icloud_backups(&self) -> PathBuf {
+    /// The suggested mirror folder: in iCloud Drive on macOS. Only `vault mirror` ever opens it
+    /// (R32).
+    #[cfg(target_os = "macos")]
+    pub fn default_mirror_dir(&self) -> PathBuf {
         self.home.join("Library/Mobile Documents/com~apple~CloudDocs/Volgenic Vault Backups")
+    }
+
+    /// The suggested mirror folder on Linux, where the mirror isn't installable yet: a folder in
+    /// the home folder, for the person to point at another disk or a synced folder later.
+    #[cfg(not(target_os = "macos"))]
+    pub fn default_mirror_dir(&self) -> PathBuf {
+        self.home.join("Volgenic Vault Backups")
     }
 
     /// `~/x` in something the person typed, against this user's home.
@@ -195,59 +253,76 @@ pub fn vault_exists(paths: &Paths) -> bool {
     fs::symlink_metadata(&paths.vault_file).is_ok()
 }
 
-/// A fresh random vault id, as hex.
-pub fn new_vault_id() -> Result<String, VaultError> {
+/// A fresh random id, 16 bytes as hex: a vault id, or a secret's id.
+pub fn new_random_id() -> Result<String, VaultError> {
     let mut id = [0u8; ID_LEN];
     getrandom::getrandom(&mut id).map_err(|_| VaultError::Random)?;
     Ok(hex::encode(id))
 }
 
-/// Encrypts and writes the vault file atomically, mode 0600 (R13).
+/// A fresh random vault id, as hex.
+pub fn new_vault_id() -> Result<String, VaultError> {
+    new_random_id()
+}
+
+/// Encrypts and writes the vault file atomically, mode 0600 (R13), always in the current format.
 /// The vault-file call site of `expose` in R1.
 pub(crate) fn save(paths: &Paths, key: &SecretValue, doc: &VaultDoc) -> Result<(), VaultError> {
     let id = hex::decode(&doc.vault_id).map_err(|_| VaultError::VaultFileCorrupt)?;
     if id.len() != ID_LEN || doc.format != VAULT_FORMAT {
         return Err(VaultError::VaultFileCorrupt);
     }
+    let magic = magic(VAULT_FORMAT);
     let plain = Zeroizing::new(serde_json::to_vec(doc).map_err(|_| VaultError::VaultFileCorrupt)?);
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::getrandom(&mut nonce).map_err(|_| VaultError::Random)?;
     let cipher = XChaCha20Poly1305::new_from_slice(key.expose()).map_err(|_| VaultError::KeyProtection)?;
-    let aad = [MAGIC.as_slice(), &id].concat();
+    let aad = [magic.as_slice(), &id].concat();
     let sealed = cipher
         .encrypt(XNonce::from_slice(&nonce), Payload { msg: &plain, aad: &aad })
         .map_err(|_| VaultError::VaultFileCorrupt)?;
-    let mut out = Vec::with_capacity(MAGIC.len() + ID_LEN + NONCE_LEN + sealed.len());
-    out.extend_from_slice(MAGIC);
+    let mut out = Vec::with_capacity(MAGIC_LEN + ID_LEN + NONCE_LEN + sealed.len());
+    out.extend_from_slice(&magic);
     out.extend_from_slice(&id);
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&sealed);
     write_atomic(&paths.vault_file, &out)
 }
 
-/// Reads and decrypts the vault file. Any change to the file, including its id, fails here.
+/// Reads and decrypts the vault file. Any change to the file, including its id or its format
+/// byte, fails here. Reads every format this build knows (1 and 2); a format-1 document comes
+/// back as it is, and the caller migrates it (`model::migrate`) and writes it back in format 2.
+/// A file from a newer build is refused with `NewerFormat`, never guessed at.
 pub(crate) fn load(paths: &Paths, key: &SecretValue) -> Result<VaultDoc, VaultError> {
     let mut data = Vec::new();
     File::open(&paths.vault_file)
         .and_then(|mut file| file.read_to_end(&mut data))
         .map_err(|error| VaultError::VaultFileUnreadable(error.to_string()))?;
-    let header = MAGIC.len() + ID_LEN + NONCE_LEN;
-    if data.len() <= header || &data[..MAGIC.len()] != MAGIC {
+    let header = MAGIC_LEN + ID_LEN + NONCE_LEN;
+    if data.len() <= header || &data[..MAGIC_PREFIX.len()] != MAGIC_PREFIX {
         return Err(VaultError::VaultFileCorrupt);
     }
-    let id = &data[MAGIC.len()..MAGIC.len() + ID_LEN];
-    let nonce = &data[MAGIC.len() + ID_LEN..header];
+    let format = u32::from(data[MAGIC_LEN - 1]);
+    if format > VAULT_FORMAT {
+        return Err(VaultError::NewerFormat(format));
+    }
+    if !model::READABLE_FORMATS.contains(&format) {
+        return Err(VaultError::VaultFileCorrupt);
+    }
+    let id = &data[MAGIC_LEN..MAGIC_LEN + ID_LEN];
+    let nonce = &data[MAGIC_LEN + ID_LEN..header];
     let cipher = XChaCha20Poly1305::new_from_slice(key.expose()).map_err(|_| VaultError::KeyProtection)?;
-    let aad = [MAGIC.as_slice(), id].concat();
+    let aad = [&data[..MAGIC_LEN], id].concat();
     let plain = Zeroizing::new(
         cipher
             .decrypt(XNonce::from_slice(nonce), Payload { msg: &data[header..], aad: &aad })
             .map_err(|_| VaultError::VaultFileCorrupt)?,
     );
     let doc: VaultDoc = serde_json::from_slice(&plain).map_err(|_| VaultError::VaultFileCorrupt)?;
-    if doc.vault_id != hex::encode(id) || doc.format != VAULT_FORMAT {
+    if doc.vault_id != hex::encode(id) || doc.format != format {
         return Err(VaultError::VaultFileCorrupt);
     }
+    model::check_ids(&doc.records, format)?;
     Ok(doc)
 }
 

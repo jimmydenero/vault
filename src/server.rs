@@ -1,7 +1,9 @@
-//! `vault daemon`: the vault's background part, run by the LaunchAgent `com.volgenic.vault` in
-//! the owner's login, as the owner. It reads the vault key file, opens the socket and serves. It
-//! is the only process that reads or changes the vault (R13), and the only one that writes the
-//! local backups (R32). Callers must be the owner's own user ID (R22).
+//! `vault daemon`: the vault's background part, run as the owner by the LaunchAgent
+//! `com.volgenic.vault` in his login (macOS) or the systemd user service `volgenic-vault.service`,
+//! which lingering starts at boot (Linux). It reads the vault key, opens the socket and serves.
+//! It is the only process that reads or changes the vault (R13), and the only one that writes
+//! the local backups (R32). Callers must be the owner's own user ID (R22): `getpeereid` on
+//! macOS, `SO_PEERCRED` on Linux (`platform::peer_of`).
 
 use std::fs;
 use std::io::{Read, Write};
@@ -22,11 +24,12 @@ use crate::backup;
 use crate::secret::WipingBuf;
 use crate::error::VaultError;
 use crate::keyprotect;
-use crate::model::{Kind, MirrorState, VaultDoc};
+use crate::model::{Kind, MirrorState, SecretRef, VaultDoc};
 use crate::platform::{self, Peer};
 use crate::protocol::{
-    self, AddReply, BackupReply, ConfirmKitReply, ErrorReply, ListReply, MirrorPlanReply, OkReply, ProxyReplyOut,
-    ReadBackupReply, Request, ResetReply, RestoreReply, StatusReply, TotpReply, VerifyBackupReply,
+    self, AddReply, BackupReply, ConfirmKitReply, Envelope, ErrorReply, Framed, ListReply, MirrorPlanReply, OkReply,
+    ProxyReplyOut, ReadBackupReply, RenameReply, Request, ResetReply, RestoreReply, StatusReply, TotpReply,
+    VerifyBackupReply,
 };
 use crate::proxy::{self, ProxyRequest};
 use crate::rules;
@@ -38,7 +41,7 @@ const MAX_CONNECTIONS: usize = 16;
 struct Server {
     paths: Paths,
     owner_uid: u32,
-    /// The mirror folder a restored-from-file vault gets: the owner's iCloud Drive.
+    /// The mirror folder a restored-from-file vault gets: the owner's iCloud Drive on macOS.
     default_mirror_dir: PathBuf,
     /// The open vault, or none (before a restore). Every change and backup holds this lock, so
     /// changes happen one at a time (R13).
@@ -59,14 +62,34 @@ pub fn run() -> Result<(), VaultError> {
         return Err(VaultError::Io("the vault runs as its owner, never as root".into()));
     }
     let paths = Paths::current();
+    unsafe {
+        libc::umask(0o077);
+        // R11, R15: no environment variable changes which certificates the proxy trusts. On
+        // Linux the system's root certificates are read by rustls-native-certs, which would
+        // otherwise honour these two. Nothing else runs yet, so changing the environment is safe.
+        std::env::remove_var("SSL_CERT_FILE");
+        std::env::remove_var("SSL_CERT_DIR");
+    }
+    // On Linux systemd makes the socket's folder (`RuntimeDirectory=volgenic`, 0700) before it
+    // starts the daemon. Run any other way (by hand, or with no systemd), the daemon makes it.
+    #[cfg(not(target_os = "macos"))]
+    if fs::symlink_metadata(&paths.socket_dir).is_err() {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(&paths.socket_dir)?;
+    }
     for dir in [&paths.dir, &paths.local_backups, &paths.socket_dir] {
         store::check_dir(dir, owner_uid, 0o077)?;
     }
-    unsafe {
-        libc::umask(0o077);
-    }
-    let opened = if store::vault_exists(&paths) { Some(Vault::open(&paths)?) } else { None };
-    let default_mirror_dir = OwnerPaths::for_uid(owner_uid)?.icloud_backups();
+    let opened = if store::vault_exists(&paths) {
+        let (vault, migrated) = Vault::open(&paths)?;
+        if let Some(note) = migrated {
+            log(&note);
+        }
+        Some(vault)
+    } else {
+        None
+    };
+    let default_mirror_dir = OwnerPaths::for_uid(owner_uid)?.default_mirror_dir();
 
     let client = proxy::client()?;
     match fs::symlink_metadata(&paths.socket) {
@@ -81,6 +104,7 @@ pub fn run() -> Result<(), VaultError> {
     }
     let listener = UnixListener::bind(&paths.socket)?;
     // Only the owner can reach it: the folder is 0700, and every caller is checked (R22).
+    log(&format!("vault key: {}", keyprotect::describe(&paths.dir)));
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
 
     let snapshot = match &opened {
@@ -121,7 +145,7 @@ pub fn run() -> Result<(), VaultError> {
         if server.active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
             server.active.fetch_sub(1, Ordering::SeqCst);
             let mut stream = stream;
-            let _ = reply(&mut stream, &ErrorReply::from(&VaultError::Busy));
+            let _ = reply(&mut stream, &Envelope::default(), &ErrorReply::from(&VaultError::Busy));
             continue;
         }
         std::thread::spawn(move || {
@@ -188,21 +212,32 @@ fn read_payload(stream: &mut UnixStream, mut data: Vec<u8>, len: usize) -> Resul
     Ok(data)
 }
 
-fn reply<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> std::io::Result<()> {
-    let mut line = serde_json::to_vec(value).unwrap_or_else(|_| b"{\"ok\":false,\"error\":\"encoding\"}".to_vec());
+/// Writes one reply line: the reply's fields plus this daemon's protocol version and the
+/// request's id, echoed as it came (protocol 2).
+fn reply<T: serde::Serialize>(stream: &mut UnixStream, envelope: &Envelope, value: &T) -> std::io::Result<()> {
+    let framed = Framed { body: value, protocol: protocol::PROTOCOL_VERSION, request_id: envelope.request_id.as_ref() };
+    let mut line = serde_json::to_vec(&framed).unwrap_or_else(|_| b"{\"ok\":false,\"error\":\"encoding\"}".to_vec());
     line.push(b'\n');
     stream.write_all(&line)?;
     stream.flush()
 }
 
-fn with_peer(mut event: AuditEvent, peer: &Peer) -> AuditEvent {
-    event.peer_pid = peer.pid;
-    event.peer_program = peer.program.clone();
+/// Who sent a request: the peer (R22, R23) and the request's envelope (its protocol version and
+/// request id).
+struct Caller {
+    peer: Peer,
+    envelope: Envelope,
+}
+
+fn with_peer(mut event: AuditEvent, caller: &Caller) -> AuditEvent {
+    event.peer_pid = caller.peer.pid;
+    event.peer_program = caller.peer.program.clone();
+    event.request_id = caller.envelope.request_id_text();
     event
 }
 
-fn error_reply(stream: &mut UnixStream, error: &VaultError) -> std::io::Result<()> {
-    reply(stream, &ErrorReply::from(error))
+fn error_reply(stream: &mut UnixStream, caller: &Caller, error: &VaultError) -> std::io::Result<()> {
+    reply(stream, &caller.envelope, &ErrorReply::from(error))
 }
 
 impl Server {
@@ -247,13 +282,13 @@ impl Server {
     fn finish<T: serde::Serialize>(
         &self,
         stream: &mut UnixStream,
-        peer: &Peer,
+        peer: &Caller,
         op: &str,
         name: Option<&str>,
         result: Result<T, VaultError>,
     ) -> std::io::Result<()> {
         match result {
-            Ok(value) => reply(stream, &value),
+            Ok(value) => reply(stream, &peer.envelope, &value),
             Err(error) => {
                 let mut event = AuditEvent::new(op, &format!("denied: {}", error.code()));
                 event.name = name.map(str::to_string);
@@ -261,7 +296,7 @@ impl Server {
                     event.detail = Some(why.clone());
                 }
                 self.audit(with_peer(event, peer));
-                error_reply(stream, &error)
+                error_reply(stream, peer, &error)
             }
         }
     }
@@ -269,9 +304,10 @@ impl Server {
     fn handle(&self, mut stream: UnixStream) {
         // R22: only the owner's user ID. R23: the caller's pid and program are a hint.
         let Some(peer) = platform::peer_of(stream.as_raw_fd()) else { return };
-        if peer.uid != self.owner_uid {
+        let mut peer = Caller { peer, envelope: Envelope::default() };
+        if peer.peer.uid != self.owner_uid {
             let mut event = AuditEvent::new("connect", "denied: not the owner's user ID");
-            event.detail = Some(format!("uid {}", peer.uid));
+            event.detail = Some(format!("uid {}", peer.peer.uid));
             self.audit(with_peer(event, &peer));
             return;
         }
@@ -282,16 +318,24 @@ impl Server {
             Ok(read) => read,
             Err(error) => {
                 self.audit(with_peer(AuditEvent::new("request", &format!("denied: {}", error.code())), &peer));
-                let _ = error_reply(&mut stream, &error);
+                let _ = error_reply(&mut stream, &peer, &error);
                 return;
             }
         };
+        let (envelope, accepted) = protocol::parse_envelope(line.as_slice());
+        peer.envelope = envelope;
+        if let Err(error) = accepted {
+            self.audit(with_peer(AuditEvent::new("request", &format!("denied: {}", error.code())), &peer));
+            let _ = error_reply(&mut stream, &peer, &error);
+            return;
+        }
         let request: Request = match protocol::parse_request(line.as_slice()) {
             Ok(request) => request,
             Err(_) => {
+                // A fixed message: serde's own can quote a field's value, which may be a secret (R2).
                 let error = VaultError::BadRequest("not a valid request; see the protocol in the README".into());
                 self.audit(with_peer(AuditEvent::new("request", "denied: bad_request"), &peer));
-                let _ = error_reply(&mut stream, &error);
+                let _ = error_reply(&mut stream, &peer, &error);
                 return;
             }
         };
@@ -302,7 +346,7 @@ impl Server {
                 Ok(data) => Some(data),
                 Err(error) => {
                     self.audit(with_peer(AuditEvent::new("restore", &format!("denied: {}", error.code())), &peer));
-                    let _ = error_reply(&mut stream, &error);
+                    let _ = error_reply(&mut stream, &peer, &error);
                     return;
                 }
             },
@@ -314,7 +358,7 @@ impl Server {
     fn dispatch(
         &self,
         stream: &mut UnixStream,
-        peer: &Peer,
+        peer: &Caller,
         request: Request,
         payload: Option<Vec<u8>>,
     ) -> std::io::Result<()> {
@@ -326,21 +370,29 @@ impl Server {
                 });
                 self.finish(stream, peer, "list", None, result)
             }
-            Request::Totp { name } => {
+            Request::Totp { secret } => {
                 let result = self.snapshot().and_then(|doc| {
-                    let code = vault::totp_code(&doc, &name)?;
-                    self.record(with_peer(AuditEvent::named("totp", &name, "ok"), peer))?;
-                    Ok(TotpReply { ok: true, name: name.clone(), code: code.code, seconds_left: code.seconds_left })
+                    let (code, record) = vault::totp_code(&doc, &secret)?;
+                    let mut event = AuditEvent::named("totp", &record.name, "ok");
+                    event.secret_id = Some(record.id.clone());
+                    self.record(with_peer(event, peer))?;
+                    Ok(TotpReply {
+                        ok: true,
+                        id: record.id.clone(),
+                        name: record.name.clone(),
+                        code: code.code,
+                        seconds_left: code.seconds_left,
+                    })
                 });
-                self.finish(stream, peer, "totp", Some(&name), result)
+                self.finish(stream, peer, "totp", Some(&secret.label()), result)
             }
-            Request::Proxy { name, method, path, headers, body, body_base64 } => {
+            Request::Proxy { secret, method, path, headers, body, body_base64 } => {
                 match self.snapshot() {
-                    Ok(doc) => match self.proxy(&doc, &name, method, path, headers, body, body_base64, peer) {
-                        Ok(out) => reply(stream, &out),
-                        Err(error) => error_reply(stream, &error),
+                    Ok(doc) => match self.proxy(&doc, &secret, method, path, headers, body, body_base64, peer) {
+                        Ok(out) => reply(stream, &peer.envelope, &out),
+                        Err(error) => error_reply(stream, peer, &error),
                     },
-                    Err(error) => self.finish::<OkReply>(stream, peer, "proxy", Some(&name), Err(error)),
+                    Err(error) => self.finish::<OkReply>(stream, peer, "proxy", Some(&secret.label()), Err(error)),
                 }
             }
             Request::Status => {
@@ -353,12 +405,14 @@ impl Server {
                 self.audit(with_peer(AuditEvent::new("status", "ok"), peer));
                 reply(
                     stream,
+                    &peer.envelope,
                     &StatusReply {
                         ok: true,
                         version: crate::VERSION.into(),
+                        format: crate::model::VAULT_FORMAT,
                         pid: std::process::id(),
                         uid: unsafe { libc::getuid() },
-                        key_protection: keyprotect::DESCRIPTION.into(),
+                        key_protection: keyprotect::describe(&self.paths.dir),
                         local_backups: self.paths.local_backups.display().to_string(),
                         restore_point: vault::has_restore_point(&self.paths),
                         vault: opened,
@@ -369,7 +423,7 @@ impl Server {
             Request::Audit { all } => {
                 let report = vault::audit_report(&self.paths, all);
                 self.audit(with_peer(AuditEvent::new("audit", "ok"), peer));
-                reply(stream, &report)
+                reply(stream, &peer.envelope, &report)
             }
             Request::Add { name, kind, site, rule, username, value } => {
                 let result = (|| {
@@ -390,9 +444,15 @@ impl Server {
                 })();
                 self.finish(stream, peer, "add", Some(&name), result)
             }
-            Request::Delete { name } => {
-                let result = self.with_vault(|vault| vault.delete(&name)).map(|backup| BackupReply { ok: true, backup });
-                self.finish(stream, peer, "delete", Some(&name), result)
+            Request::Delete { secret } => {
+                let result = self.with_vault(|vault| vault.delete(&secret)).map(|backup| BackupReply { ok: true, backup });
+                self.finish(stream, peer, "delete", Some(&secret.label()), result)
+            }
+            Request::Rename { secret, new_name } => {
+                let result = self
+                    .with_vault(|vault| vault.rename(&secret, &new_name))
+                    .map(|(secret, backup)| RenameReply { ok: true, secret, backup });
+                self.finish(stream, peer, "rename", Some(&secret.label()), result)
             }
             Request::ConfirmKit { recovery_key } => {
                 let result = self
@@ -437,7 +497,9 @@ impl Server {
                     Ok(RestoreReply {
                         ok: true,
                         vault_id: report.vault_id,
+                        vault_identity: report.vault_identity,
                         from_vault_id: report.from_vault_id,
+                        from_format: report.from_format,
                         from_generation: report.from_generation,
                         secrets: report.secrets,
                         backup,
@@ -513,16 +575,18 @@ impl Server {
     fn proxy(
         &self,
         doc: &VaultDoc,
-        name: &str,
+        secret: &SecretRef,
         method: String,
         path: String,
         headers: std::collections::BTreeMap<String, String>,
         body: Option<String>,
         body_base64: Option<String>,
-        peer: &Peer,
+        peer: &Caller,
     ) -> Result<ProxyReplyOut, VaultError> {
         let logged_path: String = path.split(['?', '#']).next().unwrap_or("").chars().take(200).collect();
-        let mut event = AuditEvent::named("proxy", name, "");
+        let record = doc.find_ref(secret);
+        let mut event = AuditEvent::named("proxy", &record.map_or_else(|| secret.label(), |r| r.name.clone()), "");
+        event.secret_id = record.map(|r| r.id.clone());
         event.method = Some(method.chars().take(16).collect());
         event.path = Some(logged_path);
         let event = with_peer(event, peer);
@@ -535,8 +599,8 @@ impl Server {
             error
         };
 
-        let Some(record) = doc.find(name) else {
-            return Err(fail(VaultError::UnknownSecret(name.into()), event));
+        let Some(record) = record else {
+            return Err(fail(secret.not_found(), event));
         };
         if record.kind != Kind::ApiKey {
             return Err(fail(VaultError::WrongKind, event)); // R5

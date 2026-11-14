@@ -21,6 +21,9 @@ pub struct AuditEvent {
     pub event: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The secret's stable id, when the event is about one secret (format 2 on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_id: Option<String>,
     pub outcome: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -38,6 +41,10 @@ pub struct AuditEvent {
     pub peer_pid: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_program: Option<String>,
+    /// The id the caller gave its request (protocol 2), so a caller can match its own requests
+    /// to lines here. The caller's own text: printable, at most 128 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 impl AuditEvent {

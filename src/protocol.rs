@@ -1,16 +1,27 @@
 //! The local socket's protocol: one JSON request per connection, one JSON reply line back.
 //!
-//! The daemon accepts connections only from the owner's user ID and root (R22). Every agent on
-//! the Mac runs as the owner, so every request here is open to every agent.
+//! The daemon accepts connections only from the owner's own user ID, not root (R22). Every
+//! agent on the machine runs as the owner, so every request here is open to every agent.
+//!
+//! **Versions and request ids (protocol 2).** A request may carry `"protocol": 2` and a
+//! `"request_id"` (a string of at most 128 printable ASCII characters, or a whole number). Every
+//! reply, errors included, carries `"protocol"` (the daemon's version, `PROTOCOL_VERSION`) and
+//! echoes the `request_id` exactly as sent. A request with no `protocol` is protocol 1 and is
+//! served the same way: everything protocol 2 added is optional on the way in and extra fields
+//! on the way out. A request for a newer protocol than the daemon's is refused with
+//! `unsupported_protocol`.
+//!
+//! **Naming a secret.** `totp`, `proxy`, `delete` and `rename` take `"name"` or `"id"` (the
+//! secret's stable id from `list`), exactly one of them.
 //!
 //! For agents:
 //!   {"op":"list"}
-//!   {"op":"totp","name":"github-2fa"}
+//!   {"op":"totp","name":"github-2fa"}                  (or "id":"<32 hex digits>")
 //!   {"op":"proxy","name":"openai","method":"GET","path":"/v1/models",
 //!    "headers":{"accept":"application/json"},"body":"..."}            (or "body_base64")
 //!
 //! For the command-line tool (R13: only the daemon changes the vault; R26):
-//!   status, audit, add, delete, confirm-kit, reset, restore,
+//!   status, audit, add, delete, rename, confirm-kit, reset, restore,
 //!   backup         write this generation's backup if it isn't written yet, and verify it
 //!   verify-backup  decrypt the newest backup with the check key and compare it
 //!   read-backup    the newest backup's encrypted bytes, for checks with the recovery key
@@ -22,7 +33,7 @@
 //!
 //! `add`, `confirm-kit`, `reset` and `restore` carry a typed value or the recovery key. The
 //! command-line tool sends them only after checking that the socket and the process behind it
-//! belong to the vault's own account (R22, R27).
+//! are its own user's (R22, R27).
 //!
 //! No reply type has a field that could carry a secret value (R4): `SecretValue` doesn't
 //! implement `Serialize`, so it can't appear in any of them.
@@ -33,10 +44,99 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditLine;
 use crate::error::VaultError;
-use crate::model::{BackupStatus, Kind, MirrorState, SecretSummary, secret_bytes};
+use crate::model::{self, BackupStatus, Kind, MirrorState, SecretRef, SecretSummary, secret_bytes};
 use crate::secret::SecretValue;
 
 pub const MAX_REQUEST_LINE: usize = 2 * 1024 * 1024;
+
+/// The protocol this build speaks. 1 is the protocol of pull requests #2 to #4 (no version, no
+/// request id, secrets by name only); 2 adds the version, request ids, secret ids and `rename`.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// What every request carries besides its operation: its protocol version and request id.
+#[derive(Clone, Debug)]
+pub struct Envelope {
+    /// 1 when the request didn't say.
+    pub protocol: u32,
+    /// Exactly as the caller sent it, to echo back.
+    pub request_id: Option<serde_json::Value>,
+}
+
+impl Default for Envelope {
+    fn default() -> Self {
+        Envelope { protocol: 1, request_id: None }
+    }
+}
+
+impl Envelope {
+    /// The request id as the audit log records it.
+    pub fn request_id_text(&self) -> Option<String> {
+        match &self.request_id {
+            Some(serde_json::Value::String(text)) => Some(text.clone()),
+            Some(other) => Some(other.to_string()),
+            None => None,
+        }
+    }
+}
+
+/// Reads the envelope alone; every other field is skipped without being kept (R1). Returns the
+/// envelope even when it is unacceptable, so the refusal can still echo an acceptable request id.
+pub fn parse_envelope(line: &[u8]) -> (Envelope, Result<(), VaultError>) {
+    #[derive(Deserialize)]
+    struct Wire {
+        #[serde(default)]
+        protocol: Option<serde_json::Value>,
+        #[serde(default)]
+        request_id: Option<serde_json::Value>,
+    }
+    let Ok(wire) = serde_json::from_slice::<Wire>(line) else {
+        return (Envelope::default(), Err(VaultError::BadRequest("not a JSON object".into())));
+    };
+    let request_id = wire.request_id.filter(|value| !value.is_null());
+    let id_ok = match &request_id {
+        None => true,
+        Some(serde_json::Value::String(text)) => {
+            !text.is_empty() && text.len() <= 128 && text.bytes().all(|b| (0x20..0x7f).contains(&b))
+        }
+        Some(serde_json::Value::Number(number)) => number.is_u64(),
+        Some(_) => false,
+    };
+    // No `protocol` is protocol 1; anything but a whole number from 1 is malformed (`None`).
+    let protocol = match &wire.protocol {
+        None => Some(1),
+        Some(value) => value.as_u64().and_then(|v| u32::try_from(v).ok()).filter(|v| *v >= 1),
+    };
+    let envelope = Envelope { protocol: protocol.unwrap_or(1), request_id: request_id.filter(|_| id_ok) };
+    let result = match protocol {
+        _ if !id_ok => Err(VaultError::BadRequest(
+            "request_id is a string of 1 to 128 printable ASCII characters, or a whole number".into(),
+        )),
+        None => Err(VaultError::BadRequest("protocol is a whole number from 1".into())),
+        Some(version) if version > PROTOCOL_VERSION => Err(VaultError::UnsupportedProtocol(version)),
+        Some(_) => Ok(()),
+    };
+    (envelope, result)
+}
+
+/// A reply as it goes on the wire: the reply's own fields, plus the protocol version and the
+/// request's id.
+#[derive(Serialize)]
+pub struct Framed<'a, T: Serialize> {
+    #[serde(flatten)]
+    pub body: &'a T,
+    pub protocol: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<&'a serde_json::Value>,
+}
+
+/// What the command-line tool reads of every reply before the reply itself.
+#[derive(Deserialize)]
+pub struct ReplyFrame {
+    #[serde(default)]
+    pub protocol: Option<u32>,
+    #[serde(default)]
+    pub request_id: Option<serde_json::Value>,
+}
 
 /// An API key's rule as the person typed it. The daemon parses and checks it (R7); it never
 /// takes a ready-made rule from a caller.
@@ -55,10 +155,10 @@ pub struct RuleInput {
 pub enum Request {
     List,
     Totp {
-        name: String,
+        secret: SecretRef,
     },
     Proxy {
-        name: String,
+        secret: SecretRef,
         method: String,
         path: String,
         headers: BTreeMap<String, String>,
@@ -78,7 +178,11 @@ pub enum Request {
         value: SecretValue,
     },
     Delete {
-        name: String,
+        secret: SecretRef,
+    },
+    Rename {
+        secret: SecretRef,
+        new_name: String,
     },
     ConfirmKit {
         recovery_key: SecretValue,
@@ -123,12 +227,23 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
 
     #[derive(Deserialize)]
     struct Named {
-        name: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        id: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct RenameWire {
+        new_name: String,
     }
 
     #[derive(Deserialize)]
     struct ProxyWire {
-        name: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        id: Option<String>,
         method: String,
         path: String,
         #[serde(default)]
@@ -195,6 +310,22 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
         detail: String,
     }
 
+    /// Exactly one of `name` and `id`.
+    fn secret_ref(name: Option<String>, id: Option<String>) -> Result<SecretRef, serde_json::Error> {
+        match (name, id) {
+            (Some(name), None) => Ok(SecretRef::Name(name)),
+            (None, Some(id)) => {
+                model::validate_id(&id).map_err(|_| serde_json::Error::custom("an id is 32 lower-case hex digits"))?;
+                Ok(SecretRef::Id(id))
+            }
+            _ => Err(serde_json::Error::custom("give name or id, exactly one")),
+        }
+    }
+    let named = |line: &[u8]| -> Result<SecretRef, serde_json::Error> {
+        let w: Named = serde_json::from_slice(line)?;
+        secret_ref(w.name, w.id)
+    };
+
     let op = serde_json::from_slice::<Op>(line)?.op;
     Ok(match op.as_str() {
         "list" => Request::List,
@@ -203,12 +334,16 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
         "verify-backup" => Request::VerifyBackup,
         "read-backup" => Request::ReadBackup,
         "mirror-plan" => Request::MirrorPlan,
-        "totp" => Request::Totp { name: serde_json::from_slice::<Named>(line)?.name },
-        "delete" => Request::Delete { name: serde_json::from_slice::<Named>(line)?.name },
+        "totp" => Request::Totp { secret: named(line)? },
+        "delete" => Request::Delete { secret: named(line)? },
+        "rename" => Request::Rename {
+            secret: named(line)?,
+            new_name: serde_json::from_slice::<RenameWire>(line)?.new_name,
+        },
         "proxy" => {
             let w: ProxyWire = serde_json::from_slice(line)?;
             Request::Proxy {
-                name: w.name,
+                secret: secret_ref(w.name, w.id)?,
                 method: w.method,
                 path: w.path,
                 headers: w.headers,
@@ -242,8 +377,8 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
     })
 }
 
-/// The requests that carry a secret, as the command-line tool sends them. Built only in
-/// `client`, which checks the daemon first (R27).
+/// The requests that carry a secret, as the command-line tool sends them (inside `Outgoing`).
+/// Built only in `client`, which checks the daemon first (R27).
 #[derive(Serialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub(crate) enum SecretRequest<'a> {
@@ -272,6 +407,17 @@ pub(crate) enum SecretRequest<'a> {
     },
 }
 
+/// A request as the command-line tool sends it: its own fields, plus the protocol version and a
+/// request id. Serializing it writes straight into the caller's (wiped) buffer; flattening
+/// keeps no copy of its own.
+#[derive(Serialize)]
+pub(crate) struct Outgoing<'a, T: Serialize> {
+    #[serde(flatten)]
+    pub request: &'a T,
+    pub protocol: u32,
+    pub request_id: &'a str,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct OkReply {
     pub ok: bool,
@@ -286,6 +432,7 @@ pub struct ListReply {
 #[derive(Serialize)]
 pub struct TotpReply {
     pub ok: bool,
+    pub id: String,
     pub name: String,
     pub code: String,
     pub seconds_left: u64,
@@ -307,6 +454,9 @@ pub struct ProxyReplyOut {
 pub struct StatusReply {
     pub ok: bool,
     pub version: String,
+    /// The vault-file format this daemon writes.
+    #[serde(default)]
+    pub format: u32,
     pub pid: u32,
     pub uid: u32,
     pub key_protection: String,
@@ -318,7 +468,14 @@ pub struct StatusReply {
 
 #[derive(Serialize, Deserialize)]
 pub struct OpenedStatus {
+    /// This copy of the vault; a restore makes a new one.
     pub vault_id: String,
+    /// The vault's stable identity, the same after every restore (`model::vault_identity`).
+    #[serde(default)]
+    pub vault_identity: String,
+    /// The vault file's format.
+    #[serde(default)]
+    pub format: u32,
     pub created_at: String,
     pub recovery_fingerprint: String,
     pub kit_confirmed: bool,
@@ -344,6 +501,13 @@ pub struct AuditReply {
 
 #[derive(Serialize, Deserialize)]
 pub struct AddReply {
+    pub ok: bool,
+    pub secret: SecretSummary,
+    pub backup: BackupStatus,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RenameReply {
     pub ok: bool,
     pub secret: SecretSummary,
     pub backup: BackupStatus,
@@ -377,7 +541,11 @@ pub struct ResetReply {
 pub struct RestoreReply {
     pub ok: bool,
     pub vault_id: String,
+    #[serde(default)]
+    pub vault_identity: String,
     pub from_vault_id: String,
+    #[serde(default)]
+    pub from_format: u32,
     pub from_generation: u64,
     pub secrets: Vec<SecretSummary>,
     pub backup: BackupStatus,
