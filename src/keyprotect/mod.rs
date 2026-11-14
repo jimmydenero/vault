@@ -5,8 +5,11 @@
 //! This module is the only code that touches where the key is kept.
 //!
 //! **On Linux, sealed to the TPM when there is one.** `seal` hands the key file to
-//! `systemd-creds --user encrypt --with-key=tpm2` (systemd 256 or later, a TPM 2.0), which
-//! writes `vault.key.cred`: the key encrypted to this machine's TPM and bound to the owner's user.
+//! `systemd-creds --user encrypt --with-key=host+tpm2` (systemd 256 or later, a TPM 2.0), which
+//! writes `vault.key.cred`: the key encrypted to this machine's TPM and its host secret, and bound
+//! to the owner's user. A user-scoped credential can't be `tpm2` alone: `systemd-creds` refuses
+//! it ("Selected key not available in --uid= scoped mode"), because the user scoping is keyed off
+//! the host secret.
 //! The round trip is checked (decrypted again and compared) before the plain file is wiped. The
 //! daemon unseals it at every start with `systemd-creds --user decrypt`, unattended, which is
 //! what lets the vault come back after a reboot with nobody logged in. What it adds: a copy of
@@ -232,7 +235,8 @@ mod sealed {
         let temp = dir.join(format!(".{SEALED_FILE}.tmp-{}", std::process::id()));
         let _ = fs::remove_file(&temp);
         let out = Command::new(&tool)
-            .args(["--user", "encrypt", "--with-key=tpm2", &format!("--name={CREDENTIAL_NAME}")])
+            // `host+tpm2`, not `tpm2`: in user scope `systemd-creds` allows only host-bound keys.
+            .args(["--user", "encrypt", "--with-key=host+tpm2", &format!("--name={CREDENTIAL_NAME}")])
             .arg(&plain)
             .arg(&temp)
             .stdin(Stdio::null())
@@ -244,7 +248,7 @@ mod sealed {
         };
         if !out.status.success() {
             return Err(fail(format!(
-                "systemd-creds --user encrypt failed (it needs systemd 256 or later): {}",
+                "systemd-creds --user encrypt --with-key=host+tpm2 failed (it needs systemd 256 or later): {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             )));
         }
