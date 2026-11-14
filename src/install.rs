@@ -48,7 +48,12 @@ fn run(program: &str, args: &[&str]) -> Result<String, VaultError> {
 
 /// Runs a program at its fixed path (never through `$PATH`) and returns what it printed.
 fn run_with(program: &str, args: &[&str], env: &[(&str, &str)]) -> Result<String, VaultError> {
-    let out = Command::new(program).args(args).envs(env.iter().copied()).output()?;
+    // No input: a polkit agent (which `loginctl` starts only on a terminal) can never prompt (R33).
+    let out = Command::new(program)
+        .args(args)
+        .envs(env.iter().copied())
+        .stdin(std::process::Stdio::null())
+        .output()?;
     if !out.status.success() {
         return Err(VaultError::Io(format!(
             "{program} {} failed: {}",
@@ -239,6 +244,7 @@ mod systemd {
             let _ = Command::new(SYSTEMCTL)
                 .args(["--user", "stop", store::DAEMON_LABEL])
                 .envs(user_env(uid))
+                .stdin(std::process::Stdio::null())
                 .output();
         }
     }
