@@ -151,7 +151,7 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   printable ASCII characters, or a whole number). Every reply, errors included, carries
   `"protocol": 2` and echoes the `request_id` as sent. A request without `protocol` is protocol 1
   and is served the same way. A newer protocol is refused with `unsupported_protocol`.
-- **Naming a secret:** `totp`, `proxy`, `fill`, `delete` and `rename` take `"name"` or `"id"`, one of them.
+- **Naming a secret:** `totp`, `proxy`, `delete` and `rename` take `"name"` or `"id"`, one of them.
 - `list` returns `{"ok":true,"secrets":[{"id","name","kind","site","version"}]}`.
 - `totp` returns `{"ok":true,"id":"...","name":"github-2fa","code":"123456","seconds_left":17}`.
 - `proxy` takes `method`, `path` (with query), optional `headers` (an object) and `body` or
@@ -164,15 +164,13 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
 
   ```json
   {"op":"fill","name":"shopify",
-   "cdp":{"port":9222,"target_id":"<the tab's target id>","frame_target_id":"<optional>"},
+   "cdp":{"port":9222,"target_id":"<the tab's target id>"},
    "fields":{"username":<backendNodeId>,"password":<backendNodeId>},
    "expect_site":"shopify.com"}
   ```
 
-  It answers `{"ok":true,"filled":["username","password"]}`. Either field may be left out, for a
-  sign-in that asks for them on two pages, but not both. `frame_target_id` names the target the
-  nodes belong to when the form is in a cross-origin frame with a target of its own (that frame
-  must be inside the tab); the text goes in through that frame's target.
+  It answers `{"ok":true,"filled":["username","password"]}`. The nodes are the tab's: a field in
+  a cross-origin frame that has a target of its own isn't found.
   - **Where it connects:** only to `127.0.0.1:<port>`, and only when the program listening there
     is yours (your user ID). It reads `GET /json/version` and opens that browser's DevTools
     WebSocket with no `Origin` header. Chrome needs `--remote-debugging-port` beside the pipe.
@@ -183,14 +181,14 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
     only into an `<input type=password>`, the username only into a text, email or tel `<input>`,
     both in one document. Then it writes the audit line, focuses each field, selects what it
     holds, checks it still has the focus and is on the site, and types with `Input.insertText`.
-  - **Failures:** `no_such_login`, `site_mismatch`, `browser_unreachable`, `field_not_found`,
-    `not_a_password_field`. A refusal before typing types nothing.
+  - **Failures:** `no_such_login`, `site_mismatch`, `browser_unreachable`, `field_not_found` (a
+    node that isn't there, or isn't the right kind of field). A refusal before typing types
+    nothing.
 - `generate-login` makes a login for a sign-up: a random password the vault makes and stores
   itself, so it exists nowhere else. `{"op":"generate-login","name":"shopify","site":"shopify.com",
-  "username":"jo@example.com","length":20,"symbols":true}` (`length` 12 to 128, 20 by default;
-  `symbols` true by default, false for letters and digits only). It answers
-  `{"ok":true,"name","id","site"}`, never the password; `fill` then types it into the sign-up
-  form. A name already in the vault is refused with `exists`.
+  "username":"jo@example.com","length":20}` (`length` optional, 12 to 128, 20 by default). It
+  answers `{"ok":true,"name":"shopify"}`, never the password; `fill` then types it into the
+  sign-up form. A name already in the vault is refused with `exists`.
 - The other requests (`status`, `audit`, `add`, `delete`, `rename`, `confirm-kit`, `reset`, `restore`,
   `backup`, `verify-backup`, `read-backup`, `mirror-plan`, `mirror-report`) are what the
   command-line tool and the mirror send; `src/protocol.rs` lists them.

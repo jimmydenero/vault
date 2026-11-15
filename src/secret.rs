@@ -38,22 +38,19 @@ impl SecretValue {
     }
 
     /// A new random password for a sign-up (`generate-login`): `length` characters from letters,
-    /// digits and, with `symbols`, ten punctuation marks most sites accept. It has at least one
-    /// character of each kind, because many sites demand that. Every character is uniform over its
+    /// digits and ten punctuation marks most sites accept. It has at least one character of each
+    /// kind, because many sites demand that. Every character is uniform over its
     /// alphabet (rejection sampling of random bytes). It is made straight into wiped buffers and
     /// exists nowhere but the vault.
-    pub fn random_password(length: usize, symbols: bool) -> Result<Self, crate::error::VaultError> {
+    pub fn random_password(length: usize) -> Result<Self, crate::error::VaultError> {
         use zeroize::Zeroizing;
         const LOWER: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
         const UPPER: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         const DIGITS: &[u8] = b"0123456789";
         const SYMBOLS: &[u8] = b"!#%+-.=?@_";
         let mut alphabet = Vec::with_capacity(72);
-        for set in [LOWER, UPPER, DIGITS] {
+        for set in [LOWER, UPPER, DIGITS, SYMBOLS] {
             alphabet.extend_from_slice(set);
-        }
-        if symbols {
-            alphabet.extend_from_slice(SYMBOLS);
         }
         // The largest multiple of the alphabet's size that fits in a byte: bytes at or above it
         // are thrown away, so no character is likelier than another.
@@ -71,7 +68,7 @@ impl SecretValue {
                 }
             }
             let has = |set: &[u8]| password.iter().any(|c| set.contains(c));
-            if has(LOWER) && has(UPPER) && has(DIGITS) && (!symbols || has(SYMBOLS)) {
+            if has(LOWER) && has(UPPER) && has(DIGITS) && has(SYMBOLS) {
                 return Ok(SecretValue::from_vec(std::mem::take(&mut *password)));
             }
         }

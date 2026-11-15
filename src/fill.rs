@@ -14,23 +14,23 @@
 //! 3. The port's listener is a program of the owner's own user ID (`browser_unreachable`), so
 //!    another user on the machine can't stand in for the browser.
 //! 4. The tab is an `https:` page on the login's site, from Chrome's own record of it
-//!    (`Target.getTargetInfo`). So is a cross-origin frame's target, when one is named.
+//!    (`Target.getTargetInfo`).
 //! 5. Each field is found in the tab's frames, each frame searched in an isolated world of its
 //!    own, where the page's scripts can't change what `tagName`, `type` or `document.URL` say. The
 //!    field's own document must be `https:` and on the login's site too (`site_mismatch`), so a
 //!    page can't frame another site's form, or put a field of its own in an ad's frame. The
 //!    password goes only into an `<input type=password>`, the username only into a text, email
-//!    or tel `<input>`, and both must be in one document (`not_a_password_field`).
+//!    or tel `<input>`, and both must be in one document (`field_not_found`). A field in a
+//!    cross-origin frame with a target of its own isn't in the tab's session, so it isn't found.
 //! 6. The audit line is written (R28). No line, no fill.
 //! 7. For each field: `DOM.focus`, then, in the isolated world, select what the field holds and
-//!    check that it is still connected, focused and on the site. Then `Input.insertText` in the
-//!    session of the target that holds the field (a cross-origin frame's own, when named, after
-//!    checking that frame is inside the tab). The text replaces the selection.
+//!    check that it is still connected, focused and on the site. Then `Input.insertText` through
+//!    the tab. The text replaces the selection.
 
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::devtools::{CdpError, DevTools};
 use crate::error::VaultError;
@@ -48,12 +48,9 @@ pub struct FillRequest {
     pub port: u16,
     /// The tab: a `page` target.
     pub target_id: String,
-    /// The target the field nodes belong to, when they are in a cross-origin frame with its own
-    /// target. Absent: the tab's.
-    pub frame_target_id: Option<String>,
-    /// `backendNodeId`s, in the session of `frame_target_id` or else the tab.
-    pub username: Option<u64>,
-    pub password: Option<u64>,
+    /// `backendNodeId`s, in the tab's session.
+    pub username: u64,
+    pub password: u64,
     pub expect_site: String,
 }
 
@@ -114,14 +111,11 @@ pub(crate) fn check_request(request: &FillRequest, record: Option<&Record>, labe
     if request.port == 0 {
         return Err(VaultError::BadRequest("cdp.port is a TCP port, 1 to 65535".into()));
     }
-    if !valid_target_id(&request.target_id) || request.frame_target_id.as_deref().is_some_and(|id| !valid_target_id(id)) {
+    if !valid_target_id(&request.target_id) {
         return Err(VaultError::BadRequest("a target id is 1 to 64 letters and digits".into()));
     }
-    if request.username.is_none() && request.password.is_none() {
-        return Err(VaultError::BadRequest("fields names a username or a password node, or both".into()));
-    }
-    if request.username.is_some() && request.username == request.password {
-        return Err(VaultError::NotAPasswordField("the username and password are the same node".into()));
+    if request.username == request.password {
+        return Err(VaultError::FieldNotFound("the username and password are the same node".into()));
     }
     let domain = sites::login_domain(&record.site)?;
     let expected = sites::site_host(&request.expect_site)
@@ -153,7 +147,7 @@ pub fn check_field(role: Role, node: u64, probe: &FieldProbe, domain: &str) -> R
             Some(t) => format!("<input type={t}>"),
             None => format!("<{}>", probe.tag.to_ascii_lowercase().chars().take(30).collect::<String>()),
         };
-        return Err(VaultError::NotAPasswordField(format!(
+        return Err(VaultError::FieldNotFound(format!(
             "the {} field must be {wanted}; node {node} is {found}",
             role.label()
         )));
@@ -245,28 +239,16 @@ pub(crate) fn fill(
     let tab_url = target_url(&mut cdp, &request.target_id, "page")?;
     sites::check_page(&tab_url, domain, "the tab")?;
     let page_host = url::Url::parse(&tab_url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
-    let tab_session = attach(&mut cdp, &request.target_id)?;
-    let node_session = match &request.frame_target_id {
-        Some(frame_target) => {
-            let frame_url = target_url(&mut cdp, frame_target, "iframe")?;
-            sites::check_page(&frame_url, domain, "the frame")?;
-            check_inside(&mut cdp, frame_target, &request.target_id)?;
-            attach(&mut cdp, frame_target)?
-        }
-        None => tab_session.clone(),
-    };
+    let session = attach(&mut cdp, &request.target_id)?;
 
     // Step 5: find each field's frame and check it.
-    let frames = frame_list(&mut cdp, &node_session)?;
-    let mut located = Vec::new();
-    for (role, node) in [(Role::Username, request.username), (Role::Password, request.password)] {
-        let Some(node) = node else { continue };
-        located.push(locate(&mut cdp, &node_session, &frames, role, node, domain)?);
-    }
-    if let [first, second] = &located[..] {
-        if first.frame_id != second.frame_id {
-            return Err(VaultError::NotAPasswordField("the username and password fields are in different frames".into()));
-        }
+    let frames = frame_list(&mut cdp, &session)?;
+    let located = [
+        locate(&mut cdp, &session, &frames, Role::Username, request.username, domain)?,
+        locate(&mut cdp, &session, &frames, Role::Password, request.password, domain)?,
+    ];
+    if located[0].frame_id != located[1].frame_id {
+        return Err(VaultError::FieldNotFound("the username and password fields are in different frames".into()));
     }
     // The browser's own record of the form's frame must agree with what the document said.
     for frame in located.iter().map(|l| &l.frame_id) {
@@ -282,9 +264,9 @@ pub(crate) fn fill(
     // Step 7.
     let mut filled = Vec::new();
     for field in &located {
-        cdp.call("DOM.focus", json!({ "backendNodeId": field.node }), Some(&node_session))
+        cdp.call("DOM.focus", json!({ "backendNodeId": field.node }), Some(&session))
             .map_err(|_| VaultError::FieldNotFound(format!("node {} couldn't be focused", field.node)))?;
-        let selected: Selected = call_on(&mut cdp, &node_session, field.node, field.context, SELECT)?;
+        let selected: Selected = call_on(&mut cdp, &session, field.node, field.context, SELECT)?;
         if !selected.focused {
             return Err(VaultError::FieldNotFound(format!(
                 "node {} didn't keep the focus{}",
@@ -296,55 +278,32 @@ pub(crate) fn fill(
         match field.role {
             Role::Username => {
                 let username = record.username.as_deref().unwrap_or("");
-                cdp.call("Input.insertText", json!({ "text": username }), Some(&node_session)).map_err(from_cdp)?;
+                cdp.call("Input.insertText", json!({ "text": username }), Some(&session)).map_err(from_cdp)?;
             }
             Role::Password => {
                 // R1: the fill's call site of `expose`. The value goes from the vault's memory
                 // into one wiped message buffer, and from there only to the browser.
                 let password = std::str::from_utf8(record.value.expose())
                     .map_err(|_| VaultError::InvalidSecret("this login's password isn't text".into()))?;
-                cdp.insert_secret_text(&node_session, password).map_err(from_cdp)?;
+                cdp.insert_secret_text(&session, password).map_err(from_cdp)?;
             }
         }
         filled.push(field.role.label());
     }
-    for session in [&node_session, &tab_session] {
-        let _ = cdp.call("Target.detachFromTarget", json!({ "sessionId": session }), None);
-    }
+    let _ = cdp.call("Target.detachFromTarget", json!({ "sessionId": session }), None);
     Ok(Filled { filled })
 }
 
-/// A target's record in Chrome: its `targetInfo`.
-fn target_info(cdp: &mut DevTools, target_id: &str) -> Result<Value, VaultError> {
+/// The tab's address from Chrome's own record of the target, which must be a `page`.
+fn target_url(cdp: &mut DevTools, target_id: &str, kind: &str) -> Result<String, VaultError> {
     let info = cdp
         .call("Target.getTargetInfo", json!({ "targetId": target_id }), None)
         .map_err(|_| unreachable(format!("the browser has no target {target_id}")))?;
-    Ok(info["targetInfo"].clone())
-}
-
-/// A target's address from Chrome's own records, checking its type (`page` or `iframe`).
-fn target_url(cdp: &mut DevTools, target_id: &str, kind: &str) -> Result<String, VaultError> {
-    let info = target_info(cdp, target_id)?;
+    let info = &info["targetInfo"];
     if info["type"].as_str() != Some(kind) {
-        return Err(unreachable(format!("target {target_id} isn't a {}", if kind == "page" { "tab" } else { "frame" })));
+        return Err(unreachable(format!("target {target_id} isn't a tab")));
     }
     Ok(info["url"].as_str().unwrap_or("").to_string())
-}
-
-/// That a frame target is inside the tab: its chain of `parentId`s reaches the tab. Otherwise
-/// a frame of another tab could be named, and the fields' checks would describe a page other
-/// than the one being filled.
-fn check_inside(cdp: &mut DevTools, frame_target: &str, tab: &str) -> Result<(), VaultError> {
-    let mut current = frame_target.to_string();
-    for _ in 0..16 {
-        let info = target_info(cdp, &current)?;
-        match info["parentId"].as_str() {
-            Some(parent) if parent == tab => return Ok(()),
-            Some(parent) if !parent.is_empty() => current = parent.to_string(),
-            _ => break,
-        }
-    }
-    Err(VaultError::FieldNotFound(format!("frame {frame_target} isn't inside tab {tab}")))
 }
 
 fn attach(cdp: &mut DevTools, target_id: &str) -> Result<String, VaultError> {

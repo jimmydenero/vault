@@ -11,7 +11,7 @@
 //! on the way out. A request for a newer protocol than the daemon's is refused with
 //! `unsupported_protocol`.
 //!
-//! **Naming a secret.** `totp`, `proxy`, `fill`, `delete` and `rename` take `"name"` or `"id"` (the
+//! **Naming a secret.** `totp`, `proxy`, `delete` and `rename` take `"name"` or `"id"` (the
 //! secret's stable id from `list`), exactly one of them.
 //!
 //! For agents:
@@ -22,10 +22,10 @@
 //!
 //! For the host daemon's agent browser (the browser on this machine, over DevTools on
 //! 127.0.0.1; see `fill`):
-//!   {"op":"fill","name":"shopify","cdp":{"port":9222,"target_id":"<tab>","frame_target_id":"<frame>"?},
-//!    "fields":{"username":<backendNodeId>?,"password":<backendNodeId>?},"expect_site":"shopify.com"}
+//!   {"op":"fill","name":"shopify","cdp":{"port":9222,"target_id":"<tab>"},
+//!    "fields":{"username":<backendNodeId>,"password":<backendNodeId>},"expect_site":"shopify.com"}
 //!   {"op":"generate-login","name":"shopify","site":"shopify.com","username":"jo@example.com",
-//!    "length":20?,"symbols":true?}
+//!    "length":20?}
 //!
 //! For the command-line tool (R13: only the daemon changes the vault; R26):
 //!   status, audit, add, delete, rename, confirm-kit, reset, restore,
@@ -173,7 +173,7 @@ pub enum Request {
         body_base64: Option<String>,
     },
     Fill {
-        secret: SecretRef,
+        name: String,
         request: crate::fill::FillRequest,
     },
     GenerateLogin {
@@ -181,7 +181,6 @@ pub enum Request {
         site: String,
         username: String,
         length: Option<usize>,
-        symbols: bool,
     },
     Status,
     Audit {
@@ -276,24 +275,17 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
     struct CdpWire {
         port: u16,
         target_id: String,
-        #[serde(default)]
-        frame_target_id: Option<String>,
     }
 
     #[derive(Deserialize)]
     struct FieldsWire {
-        #[serde(default)]
-        username: Option<u64>,
-        #[serde(default)]
-        password: Option<u64>,
+        username: u64,
+        password: u64,
     }
 
     #[derive(Deserialize)]
     struct FillWire {
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default)]
-        id: Option<String>,
+        name: String,
         cdp: CdpWire,
         fields: FieldsWire,
         expect_site: String,
@@ -306,8 +298,6 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
         username: String,
         #[serde(default)]
         length: Option<usize>,
-        #[serde(default)]
-        symbols: Option<bool>,
     }
 
     #[derive(Deserialize)]
@@ -410,11 +400,10 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
         "fill" => {
             let w: FillWire = serde_json::from_slice(line)?;
             Request::Fill {
-                secret: secret_ref(w.name, w.id)?,
+                name: w.name,
                 request: crate::fill::FillRequest {
                     port: w.cdp.port,
                     target_id: w.cdp.target_id,
-                    frame_target_id: w.cdp.frame_target_id,
                     username: w.fields.username,
                     password: w.fields.password,
                     expect_site: w.expect_site,
@@ -428,7 +417,6 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
                 site: w.site,
                 username: w.username,
                 length: w.length,
-                symbols: w.symbols.unwrap_or(true),
             }
         }
         "audit" => Request::Audit { all: serde_json::from_slice::<AuditWire>(line)?.all },
@@ -525,14 +513,12 @@ pub struct FillReply {
     pub filled: Vec<&'static str>,
 }
 
-/// A login `generate-login` made: its name, id and site. The password it made isn't here and
-/// can't be (R4): it is filled into a page with `fill`.
+/// A login `generate-login` made: its name. The password it made isn't here and can't be (R4):
+/// it is typed into a page with `fill`.
 #[derive(Serialize)]
 pub struct GenerateLoginReply {
     pub ok: bool,
     pub name: String,
-    pub id: String,
-    pub site: String,
 }
 
 #[derive(Serialize)]
