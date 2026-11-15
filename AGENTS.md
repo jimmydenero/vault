@@ -17,8 +17,9 @@ cargo run                                      # the command-line executable
 - `src/lib.rs`: the library crate. Decisions live here as functions over plain values.
 - `src/main.rs`: the `vault` command-line executable, a thin shell around the library.
 - What differs between macOS and Linux sits behind `cfg`, in a few places only: `platform` (the
-  socket caller check, hardening, who listens on a DevTools port), `store` (paths), `keyprotect` (the vault key; the only code that
-  touches where it is kept), `install` (launchd or systemd) and the proxy's TLS backend.
+  socket caller check, hardening, who listens on a DevTools port), `store` (paths), `keyprotect`
+  (the vault key; the only code that touches where it is kept), `install` (launchd or systemd)
+  and the proxy's TLS backend.
 - A container usually has no systemd: `vault install` then writes the unit and says it didn't
   start it, and `~/.local/share/volgenic/bin/vault daemon` runs the daemon by hand. The socket is
   then `~/.local/share/volgenic/socket/vault.sock`, because there is no `/run/user/<uid>`.
