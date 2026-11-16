@@ -204,7 +204,9 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   `{"op":"add_sealed","name":"main","kind":"claude_plan","sealed_base64":"<base64 of an age file>","replace":true}`.
   What is sealed is `{"v":1,"name","kind","site"?,"rule"?,"username"?,"value"}`; `name` and `kind`
   must match the request's, and the rule is read only from inside it. `replace` replaces a stored
-  secret of that name and kind (same id, version up). Delete with `delete` by name, as for any secret.
+  secret of that name and kind (same id, version up), for a `claude_plan` only, whose hosts the
+  vault fixes; a sealed API key can only be added under a new name, never replace a stored one
+  (`sealed_invalid`), since that would let whoever sealed it change where the key is sent. Delete with `delete` by name, as for any secret.
 - **`import_plan`** is the upgrade's move of the host's existing plan tokens into the vault:
   `{"op":"import_plan","plans":[{"name":"main","value":"sk-ant-oat01-..."}]}` returns each plan's
   `result` by name: `done` (added, or a different value replaced, version up), `unchanged` (already

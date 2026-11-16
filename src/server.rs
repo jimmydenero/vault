@@ -454,6 +454,16 @@ impl Server {
             }
             Request::AddSealed { name, kind, sealed_base64, replace } => {
                 let result = (|| {
+                    // R40: a sealed value may replace a stored one only for a kind whose hosts and
+                    // headers the kind table fixes (`claude_plan`). Anyone can seal to the intake
+                    // key, so replacing an API key's value would also replace its rule and could
+                    // send that name's agent traffic to another host.
+                    if replace && kinds::spec(kind).is_none() {
+                        return Err(VaultError::SealedInvalid(format!(
+                            "a sealed value can't replace a stored {}; only a kind with fixed hosts (claude_plan) can be replaced this way",
+                            kind.label()
+                        )));
+                    }
                     let doc = self.snapshot()?;
                     let identity = doc
                         .intake_identity
