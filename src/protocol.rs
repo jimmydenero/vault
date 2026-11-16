@@ -59,7 +59,15 @@
 //! within the wallet's caps, and answers the signed transaction and its ladder (the same
 //! transfer at rising fees, for the relay to send if the first stalls):
 //! `{"ok":true,"signed":{"raw","hash","max_fee_per_gas","max_priority_fee_per_gas"},"ladder":[...],...}`.
-//! Over a cap it answers `over_cap` and signs nothing. `caps` is
+//! Over a cap it answers `over_cap` and signs nothing.
+//!
+//! **A cancel** (#7491) is `sign` with `"cancel":true`, `chain`, `nonce` and fees (and the same
+//! optional `ladder`, its ceiling and `on_behalf_of`), and no `to`, `token` or `amount`:
+//!   {"op":"sign","name":"main-wallet","cancel":true,"chain":"ethereum","nonce":7,
+//!    "max_fee_per_gas":40000000000,"max_priority_fee_per_gas":2500000000,"ladder":2}
+//! The vault signs a 0-ETH transfer from the wallet to itself, 21,000 gas and no data, only at a
+//! nonce it signed a payment for in the last day, and answers
+//! `{"ok":true,"cancel":true,"signed":{...},"ladder":[...],"cancels":[...],...}`. `caps` is
 //! `{"per_payment_micros","daily_micros","max_fee_per_gas","daily_fees_wei"}`: dollars in
 //! millionths, fees in wei. Fees and amounts in wei are JSON numbers up to 2^64.
 //!
@@ -284,6 +292,20 @@ pub enum Request {
         ladder_max_fee_per_gas: Option<u64>,
         on_behalf_of: Option<String>,
     },
+    /// `sign` with `"cancel":true` (#7491).
+    SignCancel {
+        secret: SecretRef,
+        chain: String,
+        /// The payment fields the caller sent, which a cancel refuses: `to`, `token`, `amount`.
+        extra: Vec<&'static str>,
+        gas_limit: Option<u64>,
+        nonce: u64,
+        max_fee_per_gas: u64,
+        max_priority_fee_per_gas: u64,
+        ladder: usize,
+        ladder_max_fee_per_gas: Option<u64>,
+        on_behalf_of: Option<String>,
+    },
     WalletCreate {
         name: String,
         chain: String,
@@ -488,11 +510,17 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
         #[serde(default)]
         id: Option<String>,
         chain: String,
-        token: String,
-        to: String,
-        amount: String,
+        #[serde(default)]
+        cancel: bool,
+        #[serde(default)]
+        token: Option<String>,
+        #[serde(default)]
+        to: Option<String>,
+        #[serde(default)]
+        amount: Option<String>,
         nonce: u64,
-        gas_limit: u64,
+        #[serde(default)]
+        gas_limit: Option<u64>,
         max_fee_per_gas: u64,
         max_priority_fee_per_gas: u64,
         #[serde(default)]
@@ -668,14 +696,37 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
         }
         "sign" => {
             let w: SignWire = serde_json::from_slice(line)?;
+            let secret = secret_ref(w.name, w.id)?;
+            // A cancel (#7491) is the one transaction the vault builds for it: nothing a caller
+            // could point at a recipient, a token or an amount is taken, so none may be sent.
+            // `wallet::check_cancel` refuses one that names any (`extra`), with its own message.
+            if w.cancel {
+                let extra = [("to", w.to.is_some()), ("token", w.token.is_some()), ("amount", w.amount.is_some())]
+                    .into_iter()
+                    .filter_map(|(field, given)| given.then_some(field))
+                    .collect();
+                return Ok(Request::SignCancel {
+                    secret,
+                    chain: w.chain,
+                    extra,
+                    gas_limit: w.gas_limit,
+                    nonce: w.nonce,
+                    max_fee_per_gas: w.max_fee_per_gas,
+                    max_priority_fee_per_gas: w.max_priority_fee_per_gas,
+                    ladder: w.ladder,
+                    ladder_max_fee_per_gas: w.ladder_max_fee_per_gas,
+                    on_behalf_of: w.on_behalf_of,
+                });
+            }
+            let missing = |field: &str| serde_json::Error::custom(format!("missing field `{field}`"));
             Request::Sign {
-                secret: secret_ref(w.name, w.id)?,
+                secret,
                 chain: w.chain,
-                token: w.token,
-                to: w.to,
-                amount: w.amount,
+                token: w.token.ok_or_else(|| missing("token"))?,
+                to: w.to.ok_or_else(|| missing("to"))?,
+                amount: w.amount.ok_or_else(|| missing("amount"))?,
                 nonce: w.nonce,
-                gas_limit: w.gas_limit,
+                gas_limit: w.gas_limit.ok_or_else(|| missing("gas_limit"))?,
                 max_fee_per_gas: w.max_fee_per_gas,
                 max_priority_fee_per_gas: w.max_priority_fee_per_gas,
                 ladder: w.ladder,
@@ -975,6 +1026,37 @@ pub struct SignReply {
     pub counted_micros: u64,
     pub counted_fees_wei: u64,
     /// The wallet's caps, and what the last 24 hours count against them now, this payment in.
+    pub caps: crate::wallet::Caps,
+    pub spent_today_micros: u64,
+    pub fees_today_wei: u64,
+    pub backup: BackupStatus,
+}
+
+/// `sign`'s answer to a cancel (#7491): the cancel as the vault built it (0 ETH from the wallet
+/// to itself, 21,000 gas, no data), its first transaction, its ladder in rising order, and what it
+/// counted against the daily fee cap. Signatures, never a key (R4).
+#[derive(Serialize, Deserialize)]
+pub struct CancelReply {
+    pub ok: bool,
+    /// Always true: tells this answer from a payment's.
+    pub cancel: bool,
+    pub id: String,
+    pub name: String,
+    pub chain: crate::wallet::Chain,
+    pub chain_id: u64,
+    /// The wallet's address, EIP-55 mixed case: the cancel's sender and its recipient.
+    pub from: String,
+    pub to: String,
+    pub nonce: u64,
+    pub gas_limit: u64,
+    /// The payments signed at this nonce in the last day that it cancels.
+    pub cancels: Vec<String>,
+    pub signed: SignedTx,
+    pub ladder: Vec<SignedTx>,
+    /// The most any of these transactions could burn in fees: 21,000 gas at the top rung.
+    pub worst_fee_wei: u64,
+    /// What it raised the nonce's worst-case fee by, counted against `daily_fees`.
+    pub counted_fees_wei: u64,
     pub caps: crate::wallet::Caps,
     pub spent_today_micros: u64,
     pub fees_today_wei: u64,

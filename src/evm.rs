@@ -101,8 +101,9 @@ pub fn parse_address(text: &str) -> Result<[u8; 20], VaultError> {
     Ok(address)
 }
 
-/// An EIP-1559 (type 2) transaction with no value and no access list: the only kind the vault
-/// signs is a token's `transfer`, built here from structured fields, never from caller bytes.
+/// An EIP-1559 (type 2) transaction with no value and no access list. The vault signs two kinds,
+/// both built from structured fields, never from caller bytes: a token's `transfer`, and a cancel
+/// (no data, to the wallet's own address) at a payment's nonce (#7491).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tx {
     pub chain_id: u64,
@@ -110,9 +111,9 @@ pub struct Tx {
     pub max_priority_fee_per_gas: u64,
     pub max_fee_per_gas: u64,
     pub gas_limit: u64,
-    /// The token's contract.
+    /// The token's contract, or for a cancel the wallet itself.
     pub to: [u8; 20],
-    /// The call data: always `transfer_data`.
+    /// The call data: `transfer_data`, or empty for a cancel.
     pub data: Vec<u8>,
 }
 

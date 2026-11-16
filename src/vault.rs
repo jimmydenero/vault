@@ -20,7 +20,7 @@ use crate::rules::ProxyRule;
 use crate::secret::SecretValue;
 use crate::store::{self, Paths};
 use crate::totp::{self, TotpCode};
-use crate::wallet::{self, Caps, Chain, Payment, SignArgs, WalletInfo};
+use crate::wallet::{self, Cancel, CancelArgs, Caps, Chain, Payment, SignArgs, WalletInfo};
 
 /// An open vault: its paths, its key and its decrypted document.
 pub struct Vault {
@@ -51,6 +51,17 @@ pub struct SignOutcome {
     pub summary: SecretSummary,
     pub from: String,
     pub payment: Payment,
+    pub signed: crate::evm::Signed,
+    pub ladder: Vec<(wallet::Fees, crate::evm::Signed)>,
+    pub counted: wallet::Counted,
+    pub backup: BackupStatus,
+}
+
+/// What a cancel made (#7491): the cancel as checked, its first transaction and its ladder,
+/// signed, and what it counted against the daily fee cap.
+pub struct CancelOutcome {
+    pub summary: SecretSummary,
+    pub cancel: Cancel,
     pub signed: crate::evm::Signed,
     pub ladder: Vec<(wallet::Fees, crate::evm::Signed)>,
     pub counted: wallet::Counted,
@@ -670,6 +681,68 @@ impl Vault {
         ));
         let backup = self.commit(stamp(event))?;
         Ok(SignOutcome { summary, from: crate::evm::address_text(&from), payment, signed, ladder, counted, backup })
+    }
+
+    /// `sign` with `cancel` (#7491): a 0-ETH transfer from the wallet to itself at the nonce of a
+    /// payment it signed in the last day, and its ladder, within the fee caps. One change, whose
+    /// `sign-cancel` line (the nonce, the fees, what it cancels, every hash, the caller) is on disk
+    /// before anything is returned (R28); `stamp` adds the caller's hint to it.
+    pub fn sign_cancel(
+        &mut self,
+        secret: &SecretRef,
+        args: &CancelArgs<'_>,
+        stamp: impl Fn(AuditEvent) -> AuditEvent,
+    ) -> Result<CancelOutcome, VaultError> {
+        self.reload()?;
+        self.ready_for_change()?;
+        let now = crate::now_unix();
+        let index = self
+            .doc
+            .records
+            .iter()
+            .position(|record| match secret {
+                SecretRef::Name(name) => &record.name == name,
+                SecretRef::Id(id) => &record.id == id,
+            })
+            .ok_or_else(|| secret.not_found())?;
+        let record = &self.doc.records[index];
+        let info = record.wallet.as_ref().filter(|_| record.kind == Kind::Wallet).ok_or(VaultError::WrongKind)?;
+        let cancel = wallet::check_cancel(info, args, now)?;
+        let counted = wallet::decide_cancel(info, &cancel, now)?;
+        let signed = crate::evm::sign(&cancel.tx(cancel.first), &record.value, &cancel.address)?;
+        let mut ladder = Vec::with_capacity(cancel.ladder.len());
+        for fees in &cancel.ladder {
+            ladder.push((*fees, crate::evm::sign(&cancel.tx(*fees), &record.value, &cancel.address)?));
+        }
+        let record = &mut self.doc.records[index];
+        if let Some(info) = record.wallet.as_mut() {
+            wallet::record_cancel(info, &cancel, counted, now);
+        }
+        self.check_fits()?;
+        let record = &self.doc.records[index];
+        let summary = record.summary();
+        let mut event = AuditEvent::named("sign-cancel", &record.name, "ok");
+        event.secret_id = Some(record.id.clone());
+        let ladder_text = if ladder.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; {} replacement(s) up to {} gwei/gas, hashes {}",
+                ladder.len(),
+                wallet::decimal(cancel.top().max_fee_per_gas as u128, 9),
+                ladder.iter().map(|(_, signed)| format!("0x{}", hex::encode(signed.hash))).collect::<Vec<_>>().join(", ")
+            )
+        };
+        event.detail = Some(format!(
+            "{}; hash 0x{}{}; worst-case fee {} ETH, {} ETH more counted against the daily fee cap",
+            cancel.describe(),
+            hex::encode(signed.hash),
+            ladder_text,
+            wallet::decimal(cancel.worst_fee_wei() as u128, 18),
+            wallet::decimal(counted.fee_wei as u128, 18)
+        ));
+        let backup = self.commit(stamp(event))?;
+        Ok(CancelOutcome { summary, cancel, signed, ladder, counted, backup })
     }
 
     /// Every backup must stay small enough for `vault restore FILE` to take back. Measured

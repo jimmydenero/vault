@@ -32,7 +32,7 @@ use crate::platform::{self, Peer};
 use crate::protocol::{
     self, AddReply, AddSealedReply, AuditReply, BackupReply, ClaimReply, ConfirmKitReply, Envelope, ErrorReply, Framed,
     HealthReply, ImportLoginReply, ImportReply, ImportedLogin, ImportedPlan, ListReply, MirrorPlanReply, OkReply,
-    LeaseReply, LeasedSecret, ProxyReplyOut, ReadBackupReply, RenameReply, Request, ResetReply, RestoreReply, SignReply,
+    CancelReply, LeaseReply, LeasedSecret, ProxyReplyOut, ReadBackupReply, RenameReply, Request, ResetReply, RestoreReply, SignReply,
     SignedTx, StatusReply, TotpReply, VerifyBackupReply, WalletReply,
 };
 use crate::proxy::{self, ProxyRequest};
@@ -42,7 +42,7 @@ use crate::stream::{self, Streamer};
 use crate::vault::{self, ImportOutcome, NewSecret, Vault};
 use crate::intake;
 use crate::lease;
-use crate::wallet::{self, SignArgs};
+use crate::wallet::{self, CancelArgs, SignArgs};
 
 /// After a renewal that failed (not refused), the vault sends none for that login for this long,
 /// so calls during a token server's outage don't each send one.
@@ -691,6 +691,31 @@ impl Server {
                 };
                 self.sign(stream, peer, &secret, &args)
             }
+            Request::SignCancel {
+                secret,
+                chain,
+                extra,
+                gas_limit,
+                nonce,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+                ladder,
+                ladder_max_fee_per_gas,
+                on_behalf_of,
+            } => {
+                let args = CancelArgs {
+                    chain: &chain,
+                    extra,
+                    gas_limit,
+                    nonce,
+                    max_fee_per_gas,
+                    max_priority_fee_per_gas,
+                    ladder,
+                    ladder_max_fee_per_gas,
+                    on_behalf_of: on_behalf_of.as_deref(),
+                };
+                self.sign_cancel(stream, peer, &secret, &args)
+            }
             Request::WalletCreate { name, chain, caps, recovery_key } => {
                 let result = wallet::Chain::parse(&chain).and_then(|chain| {
                     self.with_vault(|vault| vault.create_wallet(&name, chain, caps, recovery_key))
@@ -977,6 +1002,63 @@ impl Server {
                 event.detail = Some(format!(
                     "{shown_chain} {shown_amount} {shown_token} to {shown_to} at nonce {}{}: {error}",
                     args.nonce,
+                    if shown_for.is_empty() { String::new() } else { format!(", for {shown_for}") }
+                ));
+                self.audit(with_peer(event, peer));
+                error_reply(out, peer, &error)
+            }
+        }
+    }
+
+    /// `sign` with `cancel` (#7491): a 0-ETH transfer from the wallet to itself at a payment's
+    /// nonce, and its ladder. Its one `sign-cancel` line (the nonce, the fees, what it cancels,
+    /// every hash, the caller) is written with the change and flushed before the answer leaves
+    /// (R28). A refusal is one `sign-cancel denied: <code>` line.
+    fn sign_cancel(&self, out: &mut UnixStream, peer: &Caller, secret: &SecretRef, args: &CancelArgs<'_>) -> std::io::Result<()> {
+        let result = (|| -> Result<CancelReply, VaultError> {
+            let outcome = self.with_vault(|vault| vault.sign_cancel(secret, args, |event| with_peer(event, peer)))?;
+            let cancel = &outcome.cancel;
+            let out_tx = |fees: wallet::Fees, signed: &crate::evm::Signed| SignedTx {
+                raw: format!("0x{}", hex::encode(&signed.raw)),
+                hash: format!("0x{}", hex::encode(signed.hash)),
+                max_fee_per_gas: fees.max_fee_per_gas,
+                max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+            };
+            let wallet = outcome.summary.wallet.as_ref().ok_or(VaultError::VaultFileCorrupt)?;
+            Ok(CancelReply {
+                ok: true,
+                cancel: true,
+                id: outcome.summary.id.clone(),
+                name: outcome.summary.name.clone(),
+                chain: cancel.chain,
+                chain_id: cancel.chain.chain_id(),
+                from: wallet.checksummed.clone(),
+                to: wallet.checksummed.clone(),
+                nonce: cancel.nonce,
+                gas_limit: wallet::CANCEL_GAS,
+                cancels: cancel.cancels.clone(),
+                signed: out_tx(cancel.first, &outcome.signed),
+                ladder: outcome.ladder.iter().map(|(fees, signed)| out_tx(*fees, signed)).collect(),
+                worst_fee_wei: cancel.worst_fee_wei(),
+                counted_fees_wei: outcome.counted.fee_wei,
+                caps: wallet.caps,
+                spent_today_micros: wallet.spent_today_micros,
+                fees_today_wei: wallet.fees_today_wei,
+                backup: outcome.backup,
+            })
+        })();
+        match result {
+            Ok(reply_value) => reply(out, &peer.envelope, &reply_value),
+            Err(error) => {
+                let mut event = AuditEvent::new("sign-cancel", &format!("denied: {}", error.code()));
+                event.name = Some(secret.label());
+                let shown_chain: String = args.chain.chars().filter(|c| !c.is_control()).take(16).collect();
+                let shown_for: String =
+                    args.on_behalf_of.unwrap_or("").chars().filter(|c| !c.is_control()).take(wallet::MAX_LABEL_CHARS).collect();
+                event.detail = Some(format!(
+                    "{shown_chain} cancel at nonce {}, max fee {} gwei/gas{}: {error}",
+                    args.nonce,
+                    wallet::decimal(args.max_fee_per_gas as u128, 9),
                     if shown_for.is_empty() { String::new() } else { format!(", for {shown_for}") }
                 ));
                 self.audit(with_peer(event, peer));

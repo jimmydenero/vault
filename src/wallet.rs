@@ -28,6 +28,13 @@
 //! **A replacement** (the same transfer at a nonce already signed for in the last day) counts
 //! once against the amount caps, since only one of the two can mine; its fee counts only for
 //! what it raises the worst case by.
+//!
+//! **A cancel** (#7491; v1's owner's cancel, `Execution.cancel`): a transfer of 0 ETH from the
+//! wallet to itself, 21,000 gas and no data, at the nonce of a payment it signed in the last day,
+//! and at no other nonce. Whichever of the two mines takes the nonce, so if the cancel does,
+//! nothing is paid. It moves no value and counts no amount; its fee is bounded by
+//! `max_fee_per_gas` like any rung, its own ladder follows the payment ladder's bounds, and its
+//! worst case counts against `daily_fees` for what it raises that nonce's worst case by.
 
 use serde::{Deserialize, Serialize};
 
@@ -526,6 +533,169 @@ pub fn record(info: &mut WalletInfo, payment: &Payment, counted: Counted, now: u
             micros: payment.micros,
             fee_wei: worst,
         });
+    }
+    info.spends.retain(|spend| spend.at.saturating_add(DAY_SECS) > now);
+}
+
+/// A `sign` request's cancel (#7491), as the caller gave it: no recipient, token or amount, since
+/// the vault builds the one transaction a cancel can be.
+pub struct CancelArgs<'a> {
+    pub chain: &'a str,
+    /// Payment fields the caller sent anyway (`to`, `token`, `amount`): any refuses the cancel.
+    pub extra: Vec<&'static str>,
+    /// Refused unless absent or 21,000.
+    pub gas_limit: Option<u64>,
+    pub nonce: u64,
+    pub max_fee_per_gas: u64,
+    pub max_priority_fee_per_gas: u64,
+    /// How many replacement rungs to sign, 0 to `MAX_LADDER`.
+    pub ladder: usize,
+    pub ladder_max_fee_per_gas: Option<u64>,
+    pub on_behalf_of: Option<&'a str>,
+}
+
+/// The gas a cancel is given: a plain transfer of ETH, which takes exactly 21,000.
+pub const CANCEL_GAS: u64 = 21_000;
+
+/// A checked cancel: a transfer of 0 ETH from the wallet to itself, with no data, at the nonce of
+/// a payment it signed in the last day. Whichever of the two mines takes the nonce; if the cancel
+/// does, nothing is paid (v1's `Wallets.Chains.replace(..., :cancel)`).
+pub struct Cancel {
+    pub chain: Chain,
+    /// The wallet's own address: the cancel's sender and its recipient.
+    pub address: [u8; 20],
+    pub nonce: u64,
+    pub first: Fees,
+    /// The rungs after the first transaction, in rising order.
+    pub ladder: Vec<Fees>,
+    /// The payments it cancels: those signed at this nonce in the last day.
+    pub cancels: Vec<String>,
+    pub on_behalf_of: Option<String>,
+}
+
+impl Cancel {
+    pub fn top(&self) -> Fees {
+        *self.ladder.last().unwrap_or(&self.first)
+    }
+
+    /// Its worst-case fee in wei: 21,000 gas at the top rung's fee.
+    pub fn worst_fee_wei(&self) -> u64 {
+        u64::try_from(CANCEL_GAS as u128 * self.top().max_fee_per_gas as u128).unwrap_or(u64::MAX)
+    }
+
+    /// The transaction at one rung's fees: value 0, to itself, no data.
+    pub fn tx(&self, fees: Fees) -> evm::Tx {
+        evm::Tx {
+            chain_id: self.chain.chain_id(),
+            nonce: self.nonce,
+            max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+            max_fee_per_gas: fees.max_fee_per_gas,
+            gas_limit: CANCEL_GAS,
+            to: self.address,
+            data: Vec::new(),
+        }
+    }
+
+    /// How the audit log describes it: the nonce, the fees, what it cancels and who it is for.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} cancel at nonce {} (0 ETH to itself, gas {}), max fee {} gwei/gas (tip {}); cancels {}{}",
+            self.chain.label(),
+            self.nonce,
+            CANCEL_GAS,
+            decimal(self.first.max_fee_per_gas as u128, 9),
+            decimal(self.first.max_priority_fee_per_gas as u128, 9),
+            self.cancels.join(" and "),
+            self.on_behalf_of.as_ref().map(|who| format!(", for {who}")).unwrap_or_default()
+        )
+    }
+}
+
+/// Checks a cancel against the wallet: its chain, a nonce it signed a payment for in the last
+/// day (a cancel anywhere else could only take a nonce the relay hasn't used yet, or one already
+/// mined), and fees in order and within the fee cap, with the ladder cut at the ceiling exactly
+/// as a payment's is. The daily fee cap is `decide_cancel`'s.
+pub fn check_cancel(info: &WalletInfo, args: &CancelArgs<'_>, now: u64) -> Result<Cancel, VaultError> {
+    let chain = Chain::parse(args.chain)?;
+    if chain != info.chain {
+        return Err(bad(&format!("this wallet is for {}, not {}", info.chain.label(), chain.label())));
+    }
+    if !args.extra.is_empty() {
+        return Err(bad(&format!(
+            "a cancel takes no {}: the vault builds it as 0 ETH from the wallet to itself",
+            args.extra.join(" or ")
+        )));
+    }
+    if args.gas_limit.is_some_and(|gas| gas != CANCEL_GAS) {
+        return Err(bad(&format!("a cancel's gas_limit is {CANCEL_GAS}, a plain transfer of ETH")));
+    }
+    let address = evm::parse_address(&info.address).map_err(|_| VaultError::VaultFileCorrupt)?;
+    let cancels: Vec<String> = info
+        .in_window(now)
+        .filter(|spend| spend.nonce == args.nonce)
+        .map(|spend| {
+            let decimals = asset(info.chain, spend.token).map_or(6, |asset| asset.decimals);
+            format!("{} {} to {}", decimal(spend.units, decimals), spend.token.label(), spend.to)
+        })
+        .collect();
+    if cancels.is_empty() {
+        return Err(bad(&format!(
+            "this wallet signed no payment at nonce {} in the last 24 hours, so there is nothing there to cancel",
+            args.nonce
+        )));
+    }
+    let first = Fees { max_fee_per_gas: args.max_fee_per_gas, max_priority_fee_per_gas: args.max_priority_fee_per_gas };
+    if first.max_fee_per_gas == 0 || first.max_priority_fee_per_gas > first.max_fee_per_gas {
+        return Err(bad("max_fee_per_gas is above zero and at least max_priority_fee_per_gas"));
+    }
+    if first.max_fee_per_gas > info.caps.max_fee_per_gas {
+        return Err(VaultError::OverCap(format!(
+            "max_fee_per_gas {} gwei is over this wallet's fee cap of {} gwei",
+            decimal(first.max_fee_per_gas as u128, 9),
+            decimal(info.caps.max_fee_per_gas as u128, 9)
+        )));
+    }
+    if args.ladder > MAX_LADDER {
+        return Err(bad(&format!("ladder is 0 to {MAX_LADDER} rungs")));
+    }
+    let ceiling = args.ladder_max_fee_per_gas.map_or(info.caps.max_fee_per_gas, |own| own.min(info.caps.max_fee_per_gas));
+    let on_behalf_of = args.on_behalf_of.map(check_label).transpose()?;
+    Ok(Cancel { chain, address, nonce: args.nonce, first, ladder: ladder(first, args.ladder, ceiling), cancels, on_behalf_of })
+}
+
+/// What a cancel counts against the daily fee cap: only one transaction per nonce can mine, so
+/// it counts for what it raises that nonce's worst case by (the costliest spend there), the way a
+/// replacement does. It moves no value and counts no amount. Refused (`over_cap`) when that would
+/// pass the daily fee cap.
+pub fn decide_cancel(info: &WalletInfo, cancel: &Cancel, now: u64) -> Result<Counted, VaultError> {
+    let at_nonce = info
+        .spends
+        .iter()
+        .enumerate()
+        .filter(|(_, spend)| spend.at.saturating_add(DAY_SECS) > now && spend.nonce == cancel.nonce)
+        .max_by_key(|(_, spend)| spend.fee_wei)
+        .map(|(index, _)| index)
+        .ok_or_else(|| bad(&format!("this wallet signed no payment at nonce {} in the last 24 hours", cancel.nonce)))?;
+    let worst = cancel.worst_fee_wei();
+    let counted = Counted { micros: 0, fee_wei: worst.saturating_sub(info.spends[at_nonce].fee_wei), replaces: Some(at_nonce) };
+    let (_, fees) = info.spent(now);
+    if fees.saturating_add(counted.fee_wei) > info.caps.daily_fees_wei {
+        return Err(VaultError::OverCap(format!(
+            "its fees could reach {} ETH, bringing the last 24 hours to {} ETH, over this wallet's daily fee cap of {} ETH",
+            decimal(worst as u128, 18),
+            decimal(fees.saturating_add(counted.fee_wei) as u128, 18),
+            decimal(info.caps.daily_fees_wei as u128, 18)
+        )));
+    }
+    Ok(counted)
+}
+
+/// Records a cancel `decide_cancel` allowed: the spend at its nonce now counts the cancel's worst
+/// case if that is higher, and spends older than a day leave.
+pub fn record_cancel(info: &mut WalletInfo, cancel: &Cancel, counted: Counted, now: u64) {
+    if let Some(index) = counted.replaces {
+        let spend = &mut info.spends[index];
+        spend.fee_wei = spend.fee_wei.max(cancel.worst_fee_wei());
     }
     info.spends.retain(|spend| spend.at.saturating_add(DAY_SECS) > now);
 }
