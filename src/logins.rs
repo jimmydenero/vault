@@ -32,8 +32,10 @@
 //! id, `grant_type=refresh_token`, the refresh token, scope `openid profile email`); Grok at
 //! `auth.x.ai/oauth2/token` with a form body (the client id from its sign-in's scope). Both
 //! providers rotate the refresh token: the reply's new one replaces the old, which is dead from
-//! then on. A 400, 401 or 403 from the token server means the login is gone (revoked, reused,
-//! expired): the person signs in again. Anything else is tried again later.
+//! then on. A 401 from the token server, or an OAuth error saying the refresh token is dead
+//! (`invalid_grant`, `refresh_token_expired`, `refresh_token_reused`,
+//! `refresh_token_invalidated`), means the login is gone: the person signs in again. Anything
+//! else (a firewall's 403, an `invalid_request`, a 429, a 5xx) is tried again later.
 
 use std::fmt;
 
@@ -472,8 +474,7 @@ struct TokenReplyWire {
 fn renewed(kind: Kind, stored: &SecretValue, status: u16, body: &[u8], now: u64) -> Result<(SecretValue, Option<u64>), VaultError> {
     match status {
         200..=299 => {}
-        400 | 401 | 403 => return Err(VaultError::CredentialRefused),
-        other => return Err(VaultError::UpstreamFailed(format!("the token server answered {other}"))),
+        _ => return Err(refusal(status, body)),
     }
     let old = Login::read(kind, stored)?;
     let reply: TokenReplyWire = serde_json::from_slice(body)
@@ -506,6 +507,52 @@ fn renewed(kind: Kind, stored: &SecretValue, status: u16, body: &[u8], now: u64)
     };
     login.check(kind)?;
     Ok((login.to_value(), expires_at))
+}
+
+/// The OAuth error codes that say the refresh token itself is dead: expired, revoked, already
+/// used (rotation), or otherwise no longer a grant. Only these, or a 401, mean "sign in again".
+const DEAD_GRANT: &[&str] =
+    &["invalid_grant", "refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated"];
+
+/// The OAuth error code in a token server's error reply: `{"error":"..."}` or
+/// `{"error":{"code":"..."}}`. Only a short code of letters, digits and `_.-` (never anything
+/// else from the body, which could quote what was sent).
+fn oauth_error_code(body: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ErrorField {
+        Code(String),
+        Object { code: Option<String> },
+    }
+    #[derive(Deserialize)]
+    struct ErrorReply {
+        error: Option<ErrorField>,
+    }
+    let reply: ErrorReply = serde_json::from_slice(body).ok()?;
+    let code = match reply.error? {
+        ErrorField::Code(code) => code,
+        ErrorField::Object { code } => code?,
+    };
+    let plain = !code.is_empty()
+        && code.len() <= 64
+        && code.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+    plain.then_some(code)
+}
+
+/// What a token server's non-2xx reply means. `CredentialRefused` (sign in again, and the vault
+/// stops trying that refresh token) only when it says the refresh token is dead: a 401, or one of
+/// `DEAD_GRANT`. Anything else, a web firewall's 403, an `invalid_request` or `invalid_client`
+/// from a request shape the provider changed, a 429 or a 5xx, didn't spend the refresh token: it
+/// is a failure the vault tries again later (review round 1 of #7380).
+fn refusal(status: u16, body: &[u8]) -> VaultError {
+    let code = oauth_error_code(body);
+    if status == 401 || code.as_deref().is_some_and(|code| DEAD_GRANT.contains(&code)) {
+        return VaultError::CredentialRefused;
+    }
+    VaultError::UpstreamFailed(match code {
+        Some(code) => format!("the token server answered {status} ({code})"),
+        None => format!("the token server answered {status}"),
+    })
 }
 
 pub(crate) fn codex_renewed(stored: &SecretValue, status: u16, body: &[u8], now: u64) -> Result<(SecretValue, Option<u64>), VaultError> {

@@ -42,6 +42,13 @@ use crate::stream::{self, Streamer};
 use crate::vault::{self, ImportOutcome, NewSecret, Vault};
 use crate::intake;
 
+/// After a renewal that failed (not refused), the vault sends none for that login for this long,
+/// so calls during a token server's outage don't each send one.
+const RENEW_RETRY: Duration = Duration::from_secs(60);
+/// After a renewal that worked, an early one (the login due but not expired) waits this long, so
+/// a provider whose tokens last less than the kind's `ahead_secs` isn't renewed every minute.
+const RENEW_EARLY_GAP: Duration = Duration::from_secs(3600);
+
 /// Streamed model calls hold their connection for minutes, so there is room for many at once.
 const MAX_CONNECTIONS: usize = 128;
 
@@ -66,6 +73,9 @@ struct Server {
     /// One lock per login the vault renews, by secret id: one renewal of a login at a time, so
     /// two calls that find it due never spend the same refresh token twice (`renew_login`).
     renewing: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// The last renewal attempt of each login, by secret id: when, and whether it worked
+    /// (`renew_login`'s back-off).
+    last_renewal: Mutex<HashMap<String, (std::time::Instant, bool)>>,
     active: AtomicUsize,
 }
 
@@ -154,6 +164,7 @@ pub fn run() -> Result<(), VaultError> {
         health: Mutex::new(health),
         audit_check: Mutex::new(audit_check),
         renewing: Mutex::new(HashMap::new()),
+        last_renewal: Mutex::new(HashMap::new()),
         active: AtomicUsize::new(0),
     });
     let mut event = AuditEvent::new("daemon", "started");
@@ -820,7 +831,7 @@ impl Server {
         if let Some(refresher) = self.renewable(record) {
             let now = crate::now_unix();
             if refresher.due(record.expires_at, now) {
-                match self.renew_login(&id, record.version, "due, before a call") {
+                match self.renew_login(&id, record.version, "due, before a call", true) {
                     Ok(fresh) => doc = fresh,
                     Err(VaultError::CredentialRefused) => return refuse(VaultError::CredentialRefused, event, out),
                     // The token it has may still work; the upkeep pass tries again.
@@ -866,7 +877,7 @@ impl Server {
                     held.detail = Some("the upstream answered 401; renewing the login and trying once more".into());
                     self.audit(held);
                     renewed_after_401 = true;
-                    match self.renew_login(&id, record.version, "the upstream answered 401") {
+                    match self.renew_login(&id, record.version, "the upstream answered 401", false) {
                         Ok(fresh) => {
                             doc = fresh;
                             continue;
@@ -938,7 +949,11 @@ impl Server {
     /// The renewed tokens are written to the vault file (the rotated refresh token with them)
     /// before this returns, so before any call uses the new access token. No token is returned
     /// or logged; the audit log names the login only.
-    fn renew_login(&self, id: &str, seen: u64, why: &str) -> Result<Arc<VaultDoc>, VaultError> {
+    ///
+    /// Back-off: within `RENEW_RETRY` of a failed renewal nothing is sent (an error says so).
+    /// With `early` (the login is due, not because a call was refused), a login that is not
+    /// expired yet and was renewed within `RENEW_EARLY_GAP` isn't renewed again.
+    fn renew_login(&self, id: &str, seen: u64, why: &str, early: bool) -> Result<Arc<VaultDoc>, VaultError> {
         let lock = {
             let mut locks = self.renewing.lock().unwrap_or_else(|e| e.into_inner());
             Arc::clone(locks.entry(id.to_string()).or_default())
@@ -956,6 +971,18 @@ impl Server {
         let Some(refresher) = self.renewable(record) else {
             return Ok(Arc::clone(&doc));
         };
+        let last = self.last_renewal.lock().unwrap_or_else(|e| e.into_inner()).get(id).copied();
+        match last {
+            Some((at, false)) if at.elapsed() < RENEW_RETRY => {
+                return Err(VaultError::UpstreamFailed(
+                    "the login's last renewal failed under a minute ago; the vault tries again after that".into(),
+                ));
+            }
+            Some((at, true)) if early && at.elapsed() < RENEW_EARLY_GAP && record.expires_at.is_some_and(|exp| exp > crate::now_unix()) => {
+                return Ok(Arc::clone(&doc));
+            }
+            _ => {}
+        }
         let request = (refresher.call)(&record.value)?;
         let mut event = AuditEvent::named("renew", &record.name, "sending");
         event.secret_id = Some(record.id.clone());
@@ -967,6 +994,8 @@ impl Server {
             .refresh(&request)
             .and_then(|(status, body)| (refresher.parse)(&record.value, status, &body, crate::now_unix()));
         drop(request);
+        let worked = result.is_ok();
+        self.last_renewal.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), (std::time::Instant::now(), worked));
         match result {
             Ok((value, expires_at)) => {
                 match self.with_vault(|vault| vault.renew(id, seen, Renewed { value, expires_at })) {
@@ -1036,7 +1065,7 @@ impl Server {
             if !refresher.due(record.expires_at, now) {
                 continue;
             }
-            if let Err(error) = self.renew_login(&record.id, record.version, "due (upkeep)") {
+            if let Err(error) = self.renew_login(&record.id, record.version, "due (upkeep)", true) {
                 log(&format!("couldn't renew {}: {}", record.name, error.code()));
             }
         }
