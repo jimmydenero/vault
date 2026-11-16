@@ -689,6 +689,9 @@ pub struct OpenedStatus {
     pub intake_recipient: Option<String>,
     /// The audit log's line count when its chain is intact, or what is wrong with it.
     pub audit_lines: Option<usize>,
+    /// How many files the chain runs through: `audit.log` and the rotated `audit.log.<n>`.
+    #[serde(default)]
+    pub audit_files: Option<usize>,
     pub audit_problem: Option<String>,
     pub recent_changes: Vec<String>,
 }

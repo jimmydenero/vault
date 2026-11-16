@@ -42,7 +42,10 @@ pub enum VaultError {
     ReplyTooLarge,
     EchoBlocked,
     Busy,
-    AuditChainBroken(usize),
+    /// Where the chain breaks: a file and a line.
+    AuditChainBroken(String),
+    /// The chain doesn't hold the head the vault file recorded: lines were cut off its end.
+    AuditHeadMissing,
     AuditUnavailable,
     NotInstalled,
     DaemonNotRunning,
@@ -93,7 +96,7 @@ impl VaultError {
             ReplyTooLarge => "reply_too_large",
             EchoBlocked => "echo_blocked",
             Busy => "busy",
-            AuditChainBroken(_) => "audit_chain_broken",
+            AuditChainBroken(_) | AuditHeadMissing => "audit_chain_broken",
             AuditUnavailable => "audit_unavailable",
             NotInstalled => "not_installed",
             DaemonNotRunning => "daemon_not_running",
@@ -148,7 +151,11 @@ impl fmt::Display for VaultError {
             ReplyTooLarge => write!(f, "the API's reply is too large"),
             EchoBlocked => write!(f, "the API's reply contained the key, so the vault withheld it"),
             Busy => write!(f, "the vault is busy; try again"),
-            AuditChainBroken(line) => write!(f, "the audit log's hash chain breaks at line {line}"),
+            AuditChainBroken(place) => write!(f, "the audit log's hash chain breaks at {place}"),
+            AuditHeadMissing => write!(
+                f,
+                "the audit log's hash chain doesn't reach the head the vault file recorded: lines were cut off its end"
+            ),
             AuditUnavailable => write!(
                 f,
                 "the vault can't write its audit log, so it refuses every use until it can (R28)"

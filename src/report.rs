@@ -171,6 +171,8 @@ pub struct BootJson {
 pub struct AuditJson {
     pub intact: bool,
     pub lines: Option<usize>,
+    /// How many files the chain runs through: `audit.log` and the rotated `audit.log.<n>`.
+    pub files: Option<usize>,
     pub problem: Option<String>,
 }
 
@@ -507,6 +509,7 @@ pub fn gather_status(paths: &Paths) -> StatusJson {
     let audit = opened.map(|v| AuditJson {
         intact: v.audit_lines.is_some() && v.audit_problem.is_none(),
         lines: v.audit_lines,
+        files: v.audit_files,
         problem: v.audit_problem.clone(),
     });
 

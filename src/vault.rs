@@ -14,7 +14,7 @@ use crate::error::VaultError;
 use crate::keyprotect;
 use crate::kinds::{self, Renewed};
 use crate::model::{self, BackupStatus, Kind, Record, SecretRef, SecretSummary, VAULT_FORMAT, VaultDoc};
-use crate::protocol::{AuditReply, BackupCheck, OpenedStatus};
+use crate::protocol::{BackupCheck, OpenedStatus};
 use crate::rules::ProxyRule;
 use crate::secret::SecretValue;
 use crate::store::{self, Paths};
@@ -680,39 +680,28 @@ impl Vault {
         Ok(ResetOutcome { unused: true, newest_file: None, kit_path: self.doc.kit_path.clone() })
     }
 
-    /// What `vault status` shows about the open vault. Information only.
-    pub fn status(&self) -> OpenedStatus {
+    /// The head of the audit chain this vault file records (R29).
+    pub fn audit_head(&self) -> &str {
+        &self.doc.audit_head
+    }
+
+    /// What `vault status` shows about the open vault. Information only. `audit` is the chain
+    /// as the daemon's checkpoint last checked it (`audit::check`), or what is wrong with it.
+    pub fn status(&self, audit: Result<&audit::Checkpoint, String>) -> OpenedStatus {
         let doc = &self.doc;
         let mut by_kind = Vec::new();
         for kind in Kind::ALL {
             by_kind.push((kind, doc.records.iter().filter(|r| r.kind == kind).count()));
         }
-        let log = &self.paths.audit_log;
-        let chain = audit::read_and_verify(log).and_then(|(lines, _)| {
-            if audit::chain_contains(log, &doc.audit_head)? {
-                Ok(lines)
-            } else {
-                Err(VaultError::AuditChainBroken(0))
-            }
-        });
-        let (audit_lines, audit_problem, recent_changes) = match chain {
-            Ok(lines) => {
-                let recent = lines
-                    .iter()
-                    .rev()
-                    .filter(|l| {
-                        matches!(
-                            l.event.event.as_str(),
-                            "add" | "replace" | "import-plan" | "renew" | "delete" | "rename" | "restore" | "confirm-kit" | "init"
-                                | "reset" | "migrate"
-                        )
-                    })
-                    .take(5)
+        let (audit_lines, audit_files, audit_problem, recent_changes) = match audit {
+            Ok(checkpoint) => {
+                let recent = checkpoint
+                    .recent_changes()
                     .map(|l| format!("{}  {} {}", l.t, l.event.event, l.event.name.clone().unwrap_or_default()))
                     .collect();
-                (Some(lines.len()), None, recent)
+                (Some(checkpoint.lines()), Some(checkpoint.files()), None, recent)
             }
-            Err(error) => (None, Some(error.to_string()), Vec::new()),
+            Err(problem) => (None, None, Some(problem), Vec::new()),
         };
         OpenedStatus {
             vault_id: doc.vault_id.clone(),
@@ -729,6 +718,7 @@ impl Vault {
             last_backup: doc.last_backup.clone(),
             intake_recipient: doc.intake_identity.as_ref().and_then(crate::intake::public_of).map(|(public, _)| public),
             audit_lines,
+            audit_files,
             audit_problem,
             recent_changes,
         }
@@ -769,18 +759,6 @@ pub(crate) fn same_records(a: &[Record], b: &[Record]) -> bool {
                     && x.value.same_as(&y.value)
             })
         })
-}
-
-/// The audit log for `vault audit`, its chain checked (R29). Lines hold no values (R28).
-pub fn audit_report(paths: &Paths, all: bool) -> AuditReply {
-    match audit::read_and_verify(&paths.audit_log) {
-        Ok((lines, _)) => {
-            let total = lines.len();
-            let skip = if all { 0 } else { total.saturating_sub(25) };
-            AuditReply { ok: true, total, lines: lines.into_iter().skip(skip).collect(), problem: None }
-        }
-        Err(error) => AuditReply { ok: true, total: 0, lines: Vec::new(), problem: Some(error.to_string()) },
-    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

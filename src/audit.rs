@@ -1,12 +1,14 @@
 //! The audit log: one JSON line per request or command, denials included, never a value, a
 //! query string or a body (R28). Each line carries the hash of the line before it, so an
-//! edited or deleted line breaks the chain (R29).
+//! edited or deleted line breaks the chain (R29). Past `ROTATE_AT` the log moves to
+//! `audit.log.<n>` and the chain carries on in a new `audit.log`.
 
-use std::fs::{File, OpenOptions};
+use std::collections::VecDeque;
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -70,10 +72,75 @@ pub fn hash_line(line: &str) -> String {
     hex::encode(Sha256::digest(line.as_bytes()))
 }
 
+
+/// Past this size the log is rotated: `audit.log` is renamed `audit.log.<n>`, `n` one more than
+/// the newest rotated file's (so a rotation is a single rename), and a new `audit.log` begins
+/// whose first line's `prev` is the old file's head. Every file is kept: the chain runs from the
+/// genesis line in `audit.log.1` (or `audit.log`, before the first rotation) through
+/// `audit.log.2`, ... to `audit.log`, so it still proves every line and the head the vault file
+/// records (R29). 4 MiB is about 12,000 lines.
+pub const ROTATE_AT: u64 = 4 * 1024 * 1024;
+
+/// How many of the last lines the checkpoint keeps, for `vault audit`.
+const TAIL_LINES: usize = 25;
+/// How many of the last changes it keeps, for `vault status`.
+const RECENT_CHANGES: usize = 5;
+
+/// The events that change the vault, shown as `vault status`'s recent changes.
+pub fn is_change(event: &str) -> bool {
+    matches!(
+        event,
+        "add" | "replace" | "import-plan" | "renew" | "delete" | "rename" | "restore" | "confirm-kit" | "init" | "reset"
+            | "migrate"
+    )
+}
+
+fn file_name(log: &Path) -> String {
+    log.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "audit.log".into())
+}
+
+/// `audit.log.<n>`, beside the log.
+pub fn rotated_path(log: &Path, n: u64) -> PathBuf {
+    log.with_file_name(format!("{}.{n}", file_name(log)))
+}
+
+/// Every append takes this lock, not one on the log itself, because a rotation renames the log:
+/// a writer waiting on the old file's lock would otherwise append to the rotated file.
+fn lock_path(log: &Path) -> PathBuf {
+    log.with_file_name(format!("{}.lock", file_name(log)))
+}
+
+/// The numbers of the rotated files, oldest first.
+fn rotated_numbers(log: &Path) -> Result<Vec<u64>, VaultError> {
+    let prefix = format!("{}.", file_name(log));
+    let dir = match log.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut numbers = Vec::new();
+    for entry in entries {
+        let name = entry?.file_name();
+        let Some(digits) = name.to_str().and_then(|n| n.strip_prefix(&prefix)) else { continue };
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(n) = digits.parse::<u64>() {
+                if n > 0 {
+                    numbers.push(n);
+                }
+            }
+        }
+    }
+    numbers.sort_unstable();
+    Ok(numbers)
+}
+
 /// Appends an event, flushed to disk before it returns (R28: a use is on disk before it happens),
 /// and returns the new head of the chain. The daemon's threads (and `vault install`, before the
-/// daemon starts) append, so the file is locked while the last line is read and the new one
-/// written.
+/// daemon starts) append, so a lock is held while the last line is read and the new one written.
 pub fn append(log: &Path, event: AuditEvent) -> Result<String, VaultError> {
     append_line(log, event, true)
 }
@@ -86,22 +153,52 @@ pub fn append_unsynced(log: &Path, event: AuditEvent) -> Result<String, VaultErr
 }
 
 fn append_line(log: &Path, event: AuditEvent, sync: bool) -> Result<String, VaultError> {
-    let mut file = OpenOptions::new().read(true).append(true).create(true).mode(0o600).open(log)?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    let lock = OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(lock_path(log))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return Err(VaultError::Io("couldn't lock the audit log".into()));
     }
-    let prev = match last_line(&mut file)? {
-        Some(line) => hash_line(&line),
-        None => GENESIS.to_string(),
-    };
+    let mut file = OpenOptions::new().read(true).append(true).create(true).mode(0o600).open(log)?;
+    let mut prev = last_line(&mut file)?.map(|line| hash_line(&line));
+    if file.metadata()?.len() >= ROTATE_AT {
+        let next = rotated_numbers(log)?.last().copied().unwrap_or(0) + 1;
+        let rotated = rotated_path(log, next);
+        // `create_new` below would fail on a name in use; a rotated file is never overwritten.
+        if rotated.exists() {
+            return Err(VaultError::Io(format!("{} already exists", rotated.display())));
+        }
+        fs::rename(log, &rotated)?;
+        if sync {
+            if let Some(dir) = log.parent() {
+                let _ = File::open(dir).and_then(|dir| dir.sync_all());
+            }
+        }
+        file = OpenOptions::new().read(true).append(true).create_new(true).mode(0o600).open(log)?;
+    }
+    if prev.is_none() {
+        // A new `audit.log` (or one a crash left empty right after a rotation): the chain carries
+        // on from the newest rotated file.
+        prev = rotated_head(log)?;
+    }
+    let prev = prev.unwrap_or_else(|| GENESIS.to_string());
     let line = AuditLine { t: crate::now_rfc3339(), event, prev };
     let text = serde_json::to_string(&line).map_err(|_| VaultError::Io("audit encoding".into()))?;
     file.write_all(format!("{text}\n").as_bytes())?;
     if sync {
         file.sync_data()?;
     }
+    drop(lock);
     Ok(hash_line(&text))
-    // The lock is released when `file` closes.
+}
+
+/// The hash of the last line of the newest rotated file that has one.
+fn rotated_head(log: &Path) -> Result<Option<String>, VaultError> {
+    for n in rotated_numbers(log)?.into_iter().rev() {
+        let mut file = File::open(rotated_path(log, n))?;
+        if let Some(line) = last_line(&mut file)? {
+            return Ok(Some(hash_line(&line)));
+        }
+    }
+    Ok(None)
 }
 
 /// The last line, read from the end in growing windows (a line is a few hundred bytes; the log
@@ -126,40 +223,229 @@ fn last_line(file: &mut File) -> Result<Option<String>, VaultError> {
     }
 }
 
-/// Reads the whole log and checks the chain. Returns the lines and the head.
-pub fn read_and_verify(log: &Path) -> Result<(Vec<AuditLine>, String), VaultError> {
-    let file = match File::open(log) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), GENESIS.into())),
-        Err(error) => return Err(error.into()),
-    };
-    let mut lines = Vec::new();
-    let mut head = GENESIS.to_string();
-    for (index, text) in BufReader::new(file).lines().enumerate() {
-        let text = text?;
-        let line: AuditLine = serde_json::from_str(&text).map_err(|_| VaultError::AuditChainBroken(index + 1))?;
-        if line.prev != head {
-            return Err(VaultError::AuditChainBroken(index + 1));
-        }
-        head = hash_line(&text);
-        lines.push(line);
-    }
-    Ok((lines, head))
+/// Where a check of the chain stopped: a file, by device and inode (a rotation renames it, and
+/// it is found again under its new name), how far into it, and how many lines that was.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Position {
+    dev: u64,
+    ino: u64,
+    offset: u64,
+    line: usize,
 }
 
-/// Whether a head recorded in the vault file appears in the chain (true for the genesis head).
-pub fn chain_contains(log: &Path, recorded_head: &str) -> Result<bool, VaultError> {
-    if recorded_head == GENESIS {
-        return Ok(true);
-    }
-    let file = match File::open(log) {
-        Ok(file) => file,
-        Err(_) => return Ok(false),
-    };
-    for text in BufReader::new(file).lines() {
-        if hash_line(&text?) == recorded_head {
-            return Ok(true);
+/// How far the chain has been checked, kept in the daemon's memory so `vault status` and
+/// `vault audit` check only the lines written since the last check (R29). A full check, from the
+/// first file, runs at the daemon's start, for `vault audit --all`, and whenever the checkpoint
+/// can't be followed: its file is gone or shorter, a new line doesn't follow, or the head the
+/// vault file records isn't among the new lines.
+#[derive(Clone, Debug)]
+pub struct Checkpoint {
+    lines: usize,
+    files: usize,
+    head: String,
+    at: Option<Position>,
+    /// The last head the vault file recorded that was found in the chain.
+    found_head: Option<String>,
+    tail: VecDeque<AuditLine>,
+    recent: VecDeque<AuditLine>,
+}
+
+impl Default for Checkpoint {
+    fn default() -> Self {
+        Checkpoint {
+            lines: 0,
+            files: 0,
+            head: GENESIS.into(),
+            at: None,
+            found_head: None,
+            tail: VecDeque::new(),
+            recent: VecDeque::new(),
         }
     }
-    Ok(false)
+}
+
+impl Checkpoint {
+    /// Lines in the chain, across every file.
+    pub fn lines(&self) -> usize {
+        self.lines
+    }
+
+    /// Files the chain runs through (`audit.log` and the rotated ones).
+    pub fn files(&self) -> usize {
+        self.files
+    }
+
+    /// The last lines, oldest first.
+    pub fn tail(&self) -> Vec<AuditLine> {
+        self.tail.iter().cloned().collect()
+    }
+
+    /// The last changes to the vault, newest first.
+    pub fn recent_changes(&self) -> impl Iterator<Item = &AuditLine> {
+        self.recent.iter().rev()
+    }
+
+    fn holds(&self, recorded: Option<&str>) -> bool {
+        match recorded {
+            None => true,
+            Some(head) => head == GENESIS || self.found_head.as_deref() == Some(head),
+        }
+    }
+}
+
+/// One file of the chain, opened before it is read so a rotation can't swap it underneath.
+struct Segment {
+    name: String,
+    file: File,
+    dev: u64,
+    ino: u64,
+}
+
+/// The chain's files in order: the rotated ones by number, then `audit.log`. The log is opened
+/// first, so a rotation in between shows up as the same file under a number, which is skipped.
+fn open_segments(log: &Path) -> Result<Vec<Segment>, VaultError> {
+    let current = match File::open(log) {
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let current_id = match &current {
+        Some(file) => {
+            let meta = file.metadata()?;
+            Some((meta.dev(), meta.ino()))
+        }
+        None => None,
+    };
+    let mut segments = Vec::new();
+    for n in rotated_numbers(log)? {
+        let path = rotated_path(log, n);
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let meta = file.metadata()?;
+        if Some((meta.dev(), meta.ino())) == current_id {
+            continue;
+        }
+        segments.push(Segment { name: file_name(&path), file, dev: meta.dev(), ino: meta.ino() });
+    }
+    if let (Some(file), Some((dev, ino))) = (current, current_id) {
+        segments.push(Segment { name: file_name(log), file, dev, ino });
+    }
+    Ok(segments)
+}
+
+/// Why an incremental check gave up: the checkpoint's file is gone or shorter.
+struct LostPlace;
+
+/// Checks the lines after the checkpoint, moving it to the end of the chain. `visit` sees each
+/// line checked. A last line still being written (no newline yet) is left for the next check.
+fn walk(
+    log: &Path,
+    cp: &mut Checkpoint,
+    recorded: Option<&str>,
+    visit: &mut dyn FnMut(AuditLine),
+) -> Result<Result<(), LostPlace>, VaultError> {
+    let mut segments = open_segments(log)?;
+    let count = segments.len();
+    let (start, mut position) = match cp.at {
+        None => (0, None),
+        Some(at) => match segments.iter().position(|s| s.dev == at.dev && s.ino == at.ino) {
+            Some(index) => (index, Some(at)),
+            None => return Ok(Err(LostPlace)),
+        },
+    };
+    let mut buf = Vec::with_capacity(1024);
+    for (index, segment) in segments.iter_mut().enumerate().skip(start) {
+        let (mut offset, mut line_no) = match position.take() {
+            Some(at) => (at.offset, at.line),
+            None => (0, 0),
+        };
+        if segment.file.metadata()?.len() < offset {
+            return Ok(Err(LostPlace));
+        }
+        segment.file.seek(SeekFrom::Start(offset))?;
+        let last = index + 1 == count;
+        let mut reader = BufReader::with_capacity(256 * 1024, &segment.file);
+        loop {
+            buf.clear();
+            let n = reader.read_until(b'\n', &mut buf)?;
+            if n == 0 || (last && buf.last() != Some(&b'\n')) {
+                break;
+            }
+            line_no += 1;
+            let broken = || VaultError::AuditChainBroken(format!("{}, line {line_no}", segment.name));
+            let text = std::str::from_utf8(buf.strip_suffix(b"\n").unwrap_or(&buf)).map_err(|_| broken())?;
+            let line: AuditLine = serde_json::from_str(text).map_err(|_| broken())?;
+            if line.prev != cp.head {
+                return Err(broken());
+            }
+            cp.head = hash_line(text);
+            if recorded == Some(cp.head.as_str()) {
+                cp.found_head = Some(cp.head.clone());
+            }
+            cp.lines += 1;
+            offset += n as u64;
+            if is_change(&line.event.event) {
+                cp.recent.push_back(line.clone());
+                if cp.recent.len() > RECENT_CHANGES {
+                    cp.recent.pop_front();
+                }
+            }
+            cp.tail.push_back(line.clone());
+            if cp.tail.len() > TAIL_LINES {
+                cp.tail.pop_front();
+            }
+            visit(line);
+        }
+        cp.at = Some(Position { dev: segment.dev, ino: segment.ino, offset, line: line_no });
+    }
+    cp.files = count;
+    Ok(Ok(()))
+}
+
+/// Checks the whole chain from its first file, and that it holds `recorded`, the head the vault
+/// file records (R29). Returns a checkpoint at its end.
+fn full_check(log: &Path, recorded: Option<&str>, visit: &mut dyn FnMut(AuditLine)) -> Result<Checkpoint, VaultError> {
+    let mut cp = Checkpoint::default();
+    match walk(log, &mut cp, recorded, visit)? {
+        Ok(()) if cp.holds(recorded) => Ok(cp),
+        Ok(()) => Err(VaultError::AuditHeadMissing),
+        // A fresh walk starts at the first file, so it never loses its place.
+        Err(LostPlace) => Err(VaultError::AuditChainBroken("a file that vanished while it was read".into())),
+    }
+}
+
+/// Brings `cp` up to the end of the log, checking only the lines written since it was last
+/// brought up (the cost of `vault status`), and falls back to a full check when it can't follow
+/// them. On a broken chain `cp` starts over, so the next check is a full one again.
+pub fn check(log: &Path, cp: &mut Checkpoint, recorded: Option<&str>) -> Result<(), VaultError> {
+    if cp.at.is_some() {
+        let mut next = cp.clone();
+        if let Ok(Ok(())) = walk(log, &mut next, recorded, &mut |_| {}) {
+            if next.holds(recorded) {
+                *cp = next;
+                return Ok(());
+            }
+        }
+    }
+    match full_check(log, recorded, &mut |_| {}) {
+        Ok(fresh) => {
+            *cp = fresh;
+            Ok(())
+        }
+        Err(error) => {
+            *cp = Checkpoint::default();
+            Err(error)
+        }
+    }
+}
+
+/// Reads every line of every file and checks the whole chain and the recorded head (`vault audit
+/// --all`). Returns the lines and a checkpoint at their end.
+pub fn read_all(log: &Path, recorded: Option<&str>) -> Result<(Vec<AuditLine>, Checkpoint), VaultError> {
+    let mut lines = Vec::new();
+    let cp = full_check(log, recorded, &mut |line| lines.push(line))?;
+    Ok((lines, cp))
 }

@@ -141,7 +141,7 @@ The `vault` tool can't print a secret, so it is safe for any agent on the machin
 | `vault health` | For each Claude plan, by name: whether its token works, has expired or was refused, from the replies to its last calls. |
 | `vault status [--json]` | The program, the daemon, backups and the audit chain. `--json`: one JSON object for a program, with a `problems` list and the command for each ([docs/json.md](docs/json.md)); no secret names. |
 | `vault --version` | The version, the commit it was built from and the target. |
-| `vault audit [--all]` | The audit log, with its hash chain checked. |
+| `vault audit [--all]` | The audit log's last 25 lines (`--all`: every line), with its hash chain checked. Past 4 MiB `audit.log` moves to `audit.log.<n>` and the chain carries on in a new file; all are kept. `status` and `audit` check the lines written since the daemon last checked; `--all` and the daemon's start check every file from the first line. |
 | `vault verify-backup [--with-recovery-key]` | Checks the newest backup decrypts and matches the vault. |
 | `vault backup` | Writes (or re-checks) the current backup now. |
 | `vault confirm-kit` | Optional: paste the recovery key back; deletes the kit file. |

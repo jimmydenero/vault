@@ -495,7 +495,10 @@ fn status(paths: &Paths) -> Result<(), VaultError> {
     }
     println!("                     (reported by the mirror agent; any program running as you could send one)");
     match (&opened.audit_lines, &opened.audit_problem) {
-        (Some(lines), _) => println!("  audit log:         {lines} lines, hash chain intact"),
+        (Some(lines), _) => match opened.audit_files {
+            Some(files) if files > 1 => println!("  audit log:         {lines} lines in {files} files, hash chain intact"),
+            _ => println!("  audit log:         {lines} lines, hash chain intact"),
+        },
         (None, Some(problem)) => println!("  audit log:         PROBLEM: {problem}"),
         _ => {}
     }
