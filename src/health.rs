@@ -36,7 +36,15 @@ impl HealthBook {
 
     /// Records what a reply said about version `version` of secret `id`. Returns whether the
     /// state changed (the caller writes the book then).
+    ///
+    /// A refusal from the token server (`Refused`) stays for its version until a reply says the
+    /// token works: a later 401 at the same version (`Expired`) doesn't hide that the login is
+    /// gone, nor let the vault try its dead refresh token again.
     pub fn observe(&mut self, id: &str, version: u64, state: HealthState, status: Option<u16>, at: String) -> bool {
+        let refused = self.entries.get(id).is_some_and(|old| old.version == version && old.state == HealthState::Refused);
+        if refused && state != HealthState::Works {
+            return false;
+        }
         let entry = Entry { version, state, at, status };
         match self.entries.insert(id.to_string(), entry) {
             Some(old) => old.version != version || old.state != state,
