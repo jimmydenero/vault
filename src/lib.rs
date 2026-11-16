@@ -35,9 +35,11 @@ pub mod rules;
 pub mod scrub;
 pub mod secret;
 pub mod server;
+pub mod solana;
 pub mod store;
 pub mod stream;
 pub mod totp;
+pub mod tron;
 pub mod vault;
 pub mod wallet;
 
@@ -58,6 +60,14 @@ pub const VERSION_LINE: &str =
 pub fn now_rfc3339() -> String {
     let now = time::OffsetDateTime::now_utc().replace_nanosecond(0).unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     now.format(&time::format_description::well_known::Rfc3339).unwrap_or_else(|_| "unknown".into())
+}
+
+/// Now, in Unix milliseconds (a Tron transaction's times).
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Now, in Unix seconds.

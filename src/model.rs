@@ -124,13 +124,19 @@ pub struct SecretSummary {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WalletSummary {
     pub chain: crate::wallet::Chain,
-    /// Canonical (lower case); `checksummed` is the same address in EIP-55 mixed case.
+    /// Canonical: lower-case `0x` hex on Ethereum, base58 on Solana, `T...` on Tron.
     pub address: String,
+    /// The address to show a person: EIP-55 mixed case on Ethereum, `address` elsewhere.
     pub checksummed: String,
     pub caps: crate::wallet::Caps,
     /// What the last 24 hours' payments count against the caps.
     pub spent_today_micros: u64,
-    pub fees_today_wei: u64,
+    /// Their worst-case fees, in `fee_unit` (wei, lamports or sun).
+    pub fees_today: u64,
+    pub fee_unit: String,
+    /// Ethereum only: `fees_today`, under the name #7440 gave it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fees_today_wei: Option<u64>,
 }
 
 /// One stored secret.
@@ -214,15 +220,16 @@ impl Record {
             wallet: self.wallet.as_ref().map(|info| {
                 let now = crate::now_unix();
                 let (spent, fees) = info.spent(now);
+                let family = info.chain.family();
                 WalletSummary {
                     chain: info.chain,
                     address: info.address.clone(),
-                    checksummed: crate::evm::parse_address(&info.address)
-                        .map(|bytes| crate::evm::checksummed(&bytes))
-                        .unwrap_or_else(|_| info.address.clone()),
+                    checksummed: info.display_address(),
                     caps: info.caps,
                     spent_today_micros: spent,
-                    fees_today_wei: fees,
+                    fees_today: fees,
+                    fee_unit: family.fee_unit().to_string(),
+                    fees_today_wei: (family == crate::wallet::Family::Evm).then_some(fees),
                 }
             }),
         }
@@ -291,10 +298,12 @@ pub(crate) struct VaultDoc {
 /// - **5**: the `personal_details` kind and a record's `fields` (#7435).
 /// - **6**: the `app_secret` kind and a record's `app` and `leasable` (#7446).
 /// - **7**: the `wallet` kind and a record's `wallet` (#7440).
-pub(crate) const VAULT_FORMAT: u32 = 7;
+/// - **8**: Solana and Tron wallets, with their own fee caps, and a spend's `fee` (was `fee_wei`)
+///   and `identity` (#7490).
+pub(crate) const VAULT_FORMAT: u32 = 8;
 
 /// Every format this build reads. Older ones are migrated to `VAULT_FORMAT` when read.
-pub(crate) const READABLE_FORMATS: [u32; 7] = [1, 2, 3, 4, 5, 6, 7];
+pub(crate) const READABLE_FORMATS: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
 /// A secret as a request names it: by its name, or by its stable id.
 #[derive(Clone, Debug, PartialEq, Eq)]

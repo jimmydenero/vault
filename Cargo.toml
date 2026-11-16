@@ -27,6 +27,12 @@ hmac = "0.12"
 # A wallet's key (#7440): secp256k1 ECDSA with the recovery id, deterministic (RFC 6979), and
 # Keccak-256 for Ethereum addresses and transaction hashes. Both RustCrypto, like sha2 and hmac.
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+# Solana and Tron wallets (#7490): a Solana key is Ed25519 (RFC 8032, deterministic), and an
+# associated token account's address is checked to be off the curve (curve25519-dalek, which age
+# already brings in). Both chains write addresses in base58 (Tron with a checksum).
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize", "fast"] }
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc"] }
+bs58 = "0.5"
 libc = "0.2"
 memchr = "2"
 rpassword = "7"
