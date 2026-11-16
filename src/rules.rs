@@ -42,7 +42,7 @@ impl ProxyRule {
 const ALLOWED_METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
 
 /// Headers an agent may never send through the proxy (R9), besides the rule's own header.
-const REFUSED_HEADERS: &[&str] = &[
+pub const REFUSED_HEADERS: &[&str] = &[
     "authorization",
     "proxy-authorization",
     "proxy-connection",
@@ -226,6 +226,18 @@ pub fn check_agent_headers(
     rule: &ProxyRule,
     headers: &[(String, String)],
 ) -> Result<Vec<(String, String)>, VaultError> {
+    check_caller_headers(&[rule.header_name.as_str()], &[], headers)
+}
+
+/// Checks a caller's headers for a request the vault sends with a credential (R9, R39): valid
+/// names and values, none of the headers the vault sets (`set`), none of `extra_refused`, and
+/// none that could change how the request is sent or routed. Names come back lower-case, in the
+/// caller's order; a name may repeat.
+pub fn check_caller_headers(
+    set: &[&str],
+    extra_refused: &[&str],
+    headers: &[(String, String)],
+) -> Result<Vec<(String, String)>, VaultError> {
     if headers.len() > 64 {
         return Err(VaultError::BadRequest("too many headers".into()));
     }
@@ -235,7 +247,8 @@ pub fn check_agent_headers(
         if !is_token(&lower) {
             return Err(VaultError::BadRequest(format!("bad header name {name:?}")));
         }
-        if lower == rule.header_name
+        if set.contains(&lower.as_str())
+            || extra_refused.contains(&lower.as_str())
             || REFUSED_HEADERS.contains(&lower.as_str())
             || lower.starts_with("x-forwarded-")
             || lower.starts_with("proxy-")

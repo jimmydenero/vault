@@ -65,6 +65,8 @@ pub struct Paths {
     pub restore_point: PathBuf,
     pub restore_point_info: PathBuf,
     pub mirror_state: PathBuf,
+    /// What upstream replies said about each credential (`health`): ids, states and times only.
+    pub health_state: PathBuf,
     pub local_backups: PathBuf,
     pub socket_dir: PathBuf,
     pub socket: PathBuf,
@@ -113,6 +115,7 @@ impl Paths {
             restore_point: dir.join("restore-point.age"),
             restore_point_info: dir.join("restore-point.json"),
             mirror_state: dir.join("mirror.json"),
+            health_state: dir.join("health.json"),
             local_backups: base.join("vault-backups"),
             socket: socket_dir.join("vault.sock"),
             daemon_log: log_dir.join("vault.log"),
@@ -290,8 +293,9 @@ pub(crate) fn save(paths: &Paths, key: &SecretValue, doc: &VaultDoc) -> Result<(
 }
 
 /// Reads and decrypts the vault file. Any change to the file, including its id or its format
-/// byte, fails here. Reads every format this build knows (1 and 2); a format-1 document comes
-/// back as it is, and the caller migrates it (`model::migrate`) and writes it back in format 2.
+/// byte, fails here. Reads every format this build knows (1 to 3); an older document comes
+/// back as it is, and the caller migrates it (`model::migrate`, `model::ensure_intake`) and writes
+/// it back in the current format.
 /// A file from a newer build is refused with `NewerFormat`, never guessed at.
 pub(crate) fn load(paths: &Paths, key: &SecretValue) -> Result<VaultDoc, VaultError> {
     let mut data = Vec::new();

@@ -23,20 +23,25 @@ use crate::audit::{self, AuditEvent};
 use crate::backup;
 use crate::secret::WipingBuf;
 use crate::error::VaultError;
+use crate::health::HealthBook;
 use crate::keyprotect;
-use crate::model::{Kind, MirrorState, SecretRef, VaultDoc};
+use crate::kinds::{self, HealthState};
+use crate::model::{Kind, MirrorState, Record, SecretRef, VaultDoc};
 use crate::platform::{self, Peer};
 use crate::protocol::{
-    self, AddReply, BackupReply, ConfirmKitReply, Envelope, ErrorReply, Framed, ListReply, MirrorPlanReply, OkReply,
-    ProxyReplyOut, ReadBackupReply, RenameReply, Request, ResetReply, RestoreReply, StatusReply, TotpReply,
-    VerifyBackupReply,
+    self, AddReply, AddSealedReply, BackupReply, ConfirmKitReply, Envelope, ErrorReply, Framed, HealthReply,
+    ImportReply, ImportedPlan, ListReply, MirrorPlanReply, OkReply, ProxyReplyOut, ReadBackupReply, RenameReply,
+    Request, ResetReply, RestoreReply, StatusReply, TotpReply, VerifyBackupReply,
 };
 use crate::proxy::{self, ProxyRequest};
 use crate::rules;
 use crate::store::{self, OwnerPaths, Paths};
-use crate::vault::{self, NewSecret, Vault};
+use crate::stream::{self, Streamer};
+use crate::vault::{self, ImportOutcome, NewSecret, Vault};
+use crate::intake;
 
-const MAX_CONNECTIONS: usize = 16;
+/// Streamed model calls hold their connection for minutes, so there is room for many at once.
+const MAX_CONNECTIONS: usize = 128;
 
 struct Server {
     paths: Paths,
@@ -49,6 +54,10 @@ struct Server {
     /// A read-only copy for agents' requests (list, 2FA, proxy), replaced after every change.
     snapshot: RwLock<Option<Arc<VaultDoc>>>,
     client: reqwest::blocking::Client,
+    /// The async client and runtime for `stream` (R39).
+    streamer: Streamer,
+    /// What upstream replies said about each credential (`health`).
+    health: Mutex<HealthBook>,
     active: AtomicUsize,
 }
 
@@ -92,6 +101,8 @@ pub fn run() -> Result<(), VaultError> {
     let default_mirror_dir = OwnerPaths::for_uid(owner_uid)?.default_mirror_dir();
 
     let client = proxy::client()?;
+    let streamer = Streamer::new()?;
+    let health = fs::read(&paths.health_state).map(|bytes| HealthBook::from_json(&bytes)).unwrap_or_default();
     match fs::symlink_metadata(&paths.socket) {
         Ok(meta) if meta.file_type().is_socket() => fs::remove_file(&paths.socket)?,
         Ok(_) => {
@@ -118,6 +129,8 @@ pub fn run() -> Result<(), VaultError> {
         vault: Mutex::new(opened),
         snapshot: RwLock::new(snapshot),
         client,
+        streamer,
+        health: Mutex::new(health),
         active: AtomicUsize::new(0),
     });
     let mut event = AuditEvent::new("daemon", "started");
@@ -138,6 +151,17 @@ pub fn run() -> Result<(), VaultError> {
         }
         Ok(())
     });
+
+    // Token upkeep (R39): only kinds with a refresher need it, and a Claude plan has none.
+    if kinds::any_refresher() {
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || {
+            loop {
+                server.upkeep();
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        });
+    }
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -191,24 +215,26 @@ fn read_request_line(stream: &mut UnixStream) -> Result<(WipingBuf, Vec<u8>), Va
     }
 }
 
-/// Reads the backup file that follows a `restore` request line: exactly `len` bytes, at most
-/// `backup::MAX_BACKUP_BYTES`. Ciphertext, so an ordinary buffer is fine.
-fn read_payload(stream: &mut UnixStream, mut data: Vec<u8>, len: usize) -> Result<Vec<u8>, VaultError> {
-    if len > backup::MAX_BACKUP_BYTES {
-        return Err(VaultError::BadRequest(format!(
-            "the backup is over {} MiB, larger than any backup the vault writes",
-            backup::MAX_BACKUP_BYTES / (1024 * 1024)
-        )));
+/// Reads the bytes that follow a request line: a `restore`'s backup file (ciphertext, at most
+/// `backup::MAX_BACKUP_BYTES`) or a `stream`'s request body (at most `stream::MAX_BODY`):
+/// exactly `len` bytes. Neither holds a stored value, so an ordinary buffer is fine.
+fn read_payload(stream: &mut UnixStream, mut data: Vec<u8>, len: usize, max: usize) -> Result<Vec<u8>, VaultError> {
+    if len > max {
+        return Err(VaultError::BadRequest(if max == backup::MAX_BACKUP_BYTES {
+            format!("the backup is over {} MiB, larger than any backup the vault writes", max / (1024 * 1024))
+        } else {
+            format!("the body is over {} MiB", max / (1024 * 1024))
+        }));
     }
     if data.len() > len {
-        return Err(VaultError::BadRequest("more bytes than backup_len".into()));
+        data.truncate(len);
     }
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let have = data.len();
     data.resize(len, 0);
     stream
         .read_exact(&mut data[have..])
-        .map_err(|_| VaultError::BadRequest("the backup ended before backup_len bytes".into()))?;
+        .map_err(|_| VaultError::BadRequest("the bytes after the request line ended early".into()))?;
     Ok(data)
 }
 
@@ -224,6 +250,17 @@ fn reply<T: serde::Serialize>(stream: &mut UnixStream, envelope: &Envelope, valu
 
 /// Who sent a request: the peer (R22, R23) and the request's envelope (its protocol version and
 /// request id).
+/// A `stream` request, read.
+struct StreamCall {
+    secret: SecretRef,
+    host: Option<String>,
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    idle: u64,
+}
+
 struct Caller {
     peer: Peer,
     envelope: Envelope,
@@ -262,9 +299,11 @@ impl Server {
         }
     }
 
-    /// Best effort, for refusals and for lines after a use that is already recorded.
+    /// Best effort, for refusals and for lines after a use that is already recorded: not waited
+    /// onto the disk, so a call's outcome line doesn't hold up the next call's line (R28 needs
+    /// the line before a use on disk, which `record` flushes).
     fn audit(&self, event: AuditEvent) {
-        if let Err(error) = audit::append(&self.paths.audit_log, event) {
+        if let Err(error) = audit::append_unsynced(&self.paths.audit_log, event) {
             log(&format!("couldn't write the audit log: {}", error.code()));
         }
     }
@@ -341,16 +380,21 @@ impl Server {
         };
         drop(line);
         // `restore FILE` sends the backup's bytes after the line (ciphertext only).
-        let payload = match &request {
-            Request::Restore { backup_len: Some(len), .. } => match read_payload(&mut stream, rest, *len) {
+        let following = match &request {
+            Request::Restore { backup_len: Some(len), .. } => Some(("restore", *len, backup::MAX_BACKUP_BYTES)),
+            Request::Stream { body_len, .. } if *body_len > 0 => Some(("stream", *body_len, stream::MAX_BODY)),
+            _ => None,
+        };
+        let payload = match following {
+            Some((op, len, max)) => match read_payload(&mut stream, rest, len, max) {
                 Ok(data) => Some(data),
                 Err(error) => {
-                    self.audit(with_peer(AuditEvent::new("restore", &format!("denied: {}", error.code())), &peer));
+                    self.audit(with_peer(AuditEvent::new(op, &format!("denied: {}", error.code())), &peer));
                     let _ = error_reply(&mut stream, &peer, &error);
                     return;
                 }
             },
-            _ => None,
+            None => None,
         };
         let _ = self.dispatch(&mut stream, &peer, request, payload);
     }
@@ -394,6 +438,92 @@ impl Server {
                     },
                     Err(error) => self.finish::<OkReply>(stream, peer, "proxy", Some(&secret.label()), Err(error)),
                 }
+            }
+            Request::Stream { secret, host, method, path, headers, body_len: _, idle_timeout_secs } => {
+                let idle = idle_timeout_secs.unwrap_or(stream::DEFAULT_IDLE_SECS).clamp(1, stream::MAX_IDLE_SECS);
+                let call = StreamCall { secret, host, method, path, headers, body: payload.unwrap_or_default(), idle };
+                self.stream(stream, peer, call)
+            }
+            Request::Health => {
+                let result = self.snapshot().and_then(|doc| {
+                    self.record(with_peer(AuditEvent::new("health", "ok"), peer))?;
+                    let book = self.health.lock().unwrap_or_else(|e| e.into_inner());
+                    Ok(HealthReply { ok: true, credentials: book.report(&doc) })
+                });
+                self.finish(stream, peer, "health", None, result)
+            }
+            Request::AddSealed { name, kind, sealed_base64, replace } => {
+                let result = (|| {
+                    // R40: a sealed value may replace a stored one only for a kind whose hosts and
+                    // headers the kind table fixes (`claude_plan`). Anyone can seal to the intake
+                    // key, so replacing an API key's value would also replace its rule and could
+                    // send that name's agent traffic to another host.
+                    if replace && kinds::spec(kind).is_none() {
+                        return Err(VaultError::SealedInvalid(format!(
+                            "a sealed value can't replace a stored {}; only a kind with fixed hosts (claude_plan) can be replaced this way",
+                            kind.label()
+                        )));
+                    }
+                    let doc = self.snapshot()?;
+                    let identity = doc
+                        .intake_identity
+                        .as_ref()
+                        .ok_or_else(|| VaultError::SealedInvalid("this vault has no intake key".into()))?;
+                    let sealed = intake::open(identity, &sealed_base64, &name, kind)?;
+                    drop(doc);
+                    let rule = match (kind, &sealed.rule) {
+                        (Kind::ApiKey, Some(input)) => Some(rules::parse_rule(
+                            &input.host,
+                            input.port,
+                            &input.methods,
+                            &input.path,
+                            &input.header,
+                        )?),
+                        (Kind::ApiKey, None) => return Err(VaultError::InvalidRule("an API key needs a rule".into())),
+                        _ => None,
+                    };
+                    let site = match (sealed.site, &rule) {
+                        (Some(site), _) => site,
+                        (None, Some(rule)) => rule.host.clone(),
+                        (None, None) => String::new(),
+                    };
+                    let new = NewSecret { name: sealed.name, kind, site, rule, username: sealed.username, value: sealed.value };
+                    self.with_vault(|vault| vault.put(new, replace))
+                        .map(|(secret, backup, replaced)| AddSealedReply { ok: true, secret, replaced, backup })
+                })();
+                self.finish(stream, peer, "add_sealed", Some(&name), result)
+            }
+            Request::ImportPlan { plans } => {
+                let result = self.with_vault(|vault| vault.import_plans(plans)).map(|(results, backup)| {
+                    let plans = results
+                        .into_iter()
+                        .map(|(name, outcome)| match outcome {
+                            ImportOutcome::Done(version) => ImportedPlan {
+                                name,
+                                result: "done".into(),
+                                version: Some(version),
+                                error: None,
+                                message: None,
+                            },
+                            ImportOutcome::Unchanged(version) => ImportedPlan {
+                                name,
+                                result: "unchanged".into(),
+                                version: Some(version),
+                                error: None,
+                                message: None,
+                            },
+                            ImportOutcome::Failed(error) => ImportedPlan {
+                                name,
+                                result: "failed".into(),
+                                version: None,
+                                error: Some(error.code().into()),
+                                message: Some(error.to_string()),
+                            },
+                        })
+                        .collect();
+                    ImportReply { ok: true, plans, backup }
+                });
+                self.finish(stream, peer, "import_plan", None, result)
             }
             Request::Status => {
                 let guard = self.vault.lock().unwrap_or_else(|e| e.into_inner());
@@ -567,6 +697,121 @@ impl Server {
                     Ok(OkReply { ok: true })
                 });
                 self.finish(stream, peer, "mirror-report", None, result)
+            }
+        }
+    }
+
+    /// `stream` (R39): checks, the audit line before the credential leaves the vault (R28), the
+    /// call, and the line after it with what happened.
+    fn stream(&self, out: &mut UnixStream, peer: &Caller, call: StreamCall) -> std::io::Result<()> {
+        let doc = match self.snapshot() {
+            Ok(doc) => doc,
+            Err(error) => return self.finish::<OkReply>(out, peer, "stream", Some(&call.secret.label()), Err(error)),
+        };
+        let logged_path: String = call.path.split(['?', '#']).next().unwrap_or("").chars().take(200).collect();
+        let record = doc.find_ref(&call.secret);
+        let mut event = AuditEvent::named("stream", &record.map_or_else(|| call.secret.label(), |r| r.name.clone()), "");
+        event.secret_id = record.map(|r| r.id.clone());
+        event.method = Some(call.method.chars().take(16).collect());
+        event.path = Some(logged_path);
+        let mut event = with_peer(event, peer);
+        let refuse = |error: VaultError, mut event: AuditEvent, out: &mut UnixStream| {
+            event.outcome = format!("denied: {}", error.code());
+            if let VaultError::RuleMismatch(why) | VaultError::BadRequest(why) = &error {
+                event.detail = Some(why.clone());
+            }
+            self.audit(event);
+            error_reply(out, peer, &error)
+        };
+        let Some(record) = record else {
+            return refuse(call.secret.not_found(), event, out);
+        };
+        let plan = match stream::plan(record, call.host.as_deref(), &call.method, &call.path, &call.headers) {
+            Ok(plan) => plan,
+            Err(error) => return refuse(error, event, out),
+        };
+        event.host = Some(plan.host.clone());
+        // R28: the use is on disk before the credential leaves the vault. No line, no request.
+        let mut attempt = event.clone();
+        attempt.outcome = "sending".into();
+        if let Err(error) = self.record(attempt) {
+            return error_reply(out, peer, &error);
+        }
+        let outcome = self.streamer.run(&plan, &record.value, call.body, Duration::from_secs(call.idle), out, &peer.envelope);
+        event.status = outcome.status;
+        event.outcome = match (&outcome.error, outcome.head_sent, outcome.end) {
+            (_, true, "complete") => "ok".into(),
+            (_, true, end) => format!("ended: {end}"),
+            (Some(error), false, _) => format!("denied: {}", error.code()),
+            (None, false, end) => format!("ended: {end}"),
+        };
+        event.detail = Some(format!(
+            "{} body bytes, head after {}, {} ms in all{}",
+            outcome.bytes,
+            outcome.head_after.map_or("none".into(), |d| format!("{} ms", d.as_millis())),
+            outcome.took.as_millis(),
+            match &outcome.error {
+                Some(VaultError::UpstreamFailed(why)) => format!("; {why}"),
+                _ => String::new(),
+            }
+        ));
+        self.audit(event);
+        if let Some(state) = outcome.health {
+            self.observe(record, state, outcome.status);
+        }
+        match (outcome.head_sent, &outcome.error) {
+            (false, Some(error)) if outcome.end != "cancelled" => error_reply(out, peer, error),
+            _ => Ok(()),
+        }
+    }
+
+    /// Records what a reply said about a credential, and writes the book when the state changed.
+    fn observe(&self, record: &Record, state: HealthState, status: Option<u16>) {
+        let mut book = self.health.lock().unwrap_or_else(|e| e.into_inner());
+        if book.observe(&record.id, record.version, state, status, crate::now_rfc3339()) {
+            if let Ok(doc) = self.snapshot() {
+                book.prune(&doc);
+            }
+            if let Err(error) = store::write_atomic(&self.paths.health_state, &book.to_json()) {
+                log(&format!("couldn't write the health book: {}", error.code()));
+            }
+            log(&format!("credential {} is now {}", record.name, state.label()));
+        }
+    }
+
+    /// Token upkeep (R39): renews every credential whose kind's refresher says it is due, and
+    /// stores the result as a new version. A refusal marks it refused, for the person to sign in
+    /// again; any other failure is tried again at the next pass.
+    fn upkeep(&self) {
+        let Ok(doc) = self.snapshot() else { return };
+        let now = crate::now_unix();
+        for record in &doc.records {
+            let Some(refresher) = kinds::spec(record.kind).and_then(|spec| spec.refresher) else { continue };
+            if !(refresher.due)(record.expires_at, now) {
+                continue;
+            }
+            let mut event = AuditEvent::named("renew", &record.name, "sending");
+            event.secret_id = Some(record.id.clone());
+            if self.record(event.clone()).is_err() {
+                return;
+            }
+            match (refresher.renew)(&self.client, &record.value) {
+                Ok(renewed) => match self.with_vault(|vault| vault.renew(&record.id, renewed)) {
+                    Ok((summary, _)) => {
+                        let mut book = self.health.lock().unwrap_or_else(|e| e.into_inner());
+                        book.observe(&summary.id, summary.version, HealthState::Works, None, crate::now_rfc3339());
+                    }
+                    Err(error) => log(&format!("couldn't store the renewed {}: {}", record.name, error.code())),
+                },
+                Err(VaultError::CredentialRefused) => {
+                    event.outcome = "denied: credential_refused".into();
+                    self.audit(event);
+                    self.observe(record, HealthState::Refused, None);
+                }
+                Err(error) => {
+                    event.outcome = format!("failed: {}", error.code());
+                    self.audit(event);
+                }
             }
         }
     }

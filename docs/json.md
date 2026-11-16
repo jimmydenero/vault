@@ -15,6 +15,11 @@ changes, which name secrets, are left out. The types are in `src/report.rs`.
   standard error too). A daemon that couldn't be started because there is no systemd is not an
   error: `ok` is true and `problems` says so.
 
+**`intake`** (added 2026-11-16, work item #7368) is how Volgenic's app learns the key to seal a
+value to: it reaches the app through Volgenic's server in this phase, so the server is trusted
+not to swap it (an accepted gap in the threat model until pairing). A restore makes a new
+intake key.
+
 ## `problems`
 
 A list of `{code, severity, sentence, how}`, errors first:
@@ -67,7 +72,7 @@ A list of `{code, severity, sentence, how}`, errors first:
     "running": true,                   // answered on its socket, as your own user (R22)
     "pid": 21052,
     "version": "0.2.0",                // the daemon's build
-    "format": 2,                       // the vault-file format it writes
+    "format": 3,                       // the vault-file format it writes
     "socket": "/home/node/.local/share/volgenic/socket/vault.sock",
     "service_file": "/home/node/.config/systemd/user/volgenic-vault.service",
     "service_file_present": true,
@@ -79,7 +84,7 @@ A list of `{code, severity, sentence, how}`, errors first:
     "identity": "1a04647e8803342eefe9d28e5598e3b7",   // stable through restores
     "vault_id": "59b9e611b6368d65e000249e1077c993",   // this copy
     "recovery_fingerprint": "1a04-647e-8803",
-    "format": 2,
+    "format": 3,
     "created_at": "2026-11-16T05:00:19Z",
     "generation": 2,
     "secrets": 1,                      // a count, never names
@@ -114,6 +119,10 @@ A list of `{code, severity, sentence, how}`, errors first:
     "launch_agent_loaded": null        // macOS only (launchctl print), else null
   },
   "audit": { "intact": true, "lines": 12, "problem": null },   // null unless the daemon answered with a vault
+  "intake": {                          // the vault's intake key (sealed intake, `add_sealed`); null unless the daemon answered with a vault
+    "public_key": "age1qmgamyp4yjfrk0f0nc0hh3pw03zf76y7kr2j20m52wc80f6lc57s55uukl",   // an age X25519 recipient
+    "fingerprint": "732e-1fdf-6b84"    // first 12 hex digits of its SHA-256, the recovery key's form
+  },
   "problems": [
     { "code": "recovery_kit_pending", "severity": "warning",
       "sentence": "The Recovery Kit (/home/node/Volgenic Vault Recovery Kit.txt) isn't confirmed yet: keep a copy off this machine, then confirm it, which deletes the file.",

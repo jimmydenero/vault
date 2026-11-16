@@ -149,7 +149,7 @@ fn build_header(rule: &ProxyRule, key: &SecretValue) -> Result<HeaderValue, Vaul
 
 /// A short reason with no URL or header in it: the HTTP library's own messages include the URL,
 /// which carries the agent's query string.
-fn describe_send_error(error: &reqwest::Error) -> String {
+pub(crate) fn describe_send_error(error: &reqwest::Error) -> String {
     if error.is_timeout() {
         "timed out after 30 seconds".into()
     } else if error.is_connect() {

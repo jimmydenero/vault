@@ -87,6 +87,8 @@ enum Command {
     Rename { name: String, new_name: String },
     /// List secrets: ids, names, kinds, sites and versions only.
     List,
+    /// Whether each Claude plan's token works, has expired or was refused, by name only.
+    Health,
     /// Show the vault's state. Information only; never a value.
     Status {
         /// Print one JSON object for a program (no secret names, no values).
@@ -127,6 +129,8 @@ enum KindArg {
     Login,
     #[value(name = "2fa")]
     TwoFactor,
+    #[value(name = "claude_plan", alias = "claude-plan")]
+    ClaudePlan,
 }
 
 fn main() -> ExitCode {
@@ -143,6 +147,7 @@ fn main() -> ExitCode {
         Command::Delete { name, yes } => delete(&paths, &name, yes),
         Command::Rename { name, new_name } => rename(&paths, &name, &new_name),
         Command::List => list(&paths),
+        Command::Health => health(&paths),
         Command::Status { json: true } => status_json(&paths),
         Command::Status { json: false } => status(&paths),
         Command::Audit { all } => show_audit(&paths, all),
@@ -248,6 +253,7 @@ fn add(
         KindArg::ApiKey => Kind::ApiKey,
         KindArg::Login => Kind::Login,
         KindArg::TwoFactor => Kind::TwoFactor,
+        KindArg::ClaudePlan => Kind::ClaudePlan,
     };
     // The rule is checked here for the person to read, and again by the daemon, which never
     // takes a ready-made rule (R7).
@@ -263,10 +269,11 @@ fn add(
         Some(input) => Some(vault::rules::parse_rule(&input.host, input.port, &input.methods, &input.path, &input.header)?),
         None => None,
     };
-    let site = match (&site, &rule) {
-        (Some(site), _) => site.clone(),
-        (None, Some(rule)) => rule.host.clone(),
-        (None, None) => return Err(VaultError::InvalidSecret("give --site".into())),
+    let site = match (&site, &rule, vault::kinds::spec(kind)) {
+        (Some(site), _, _) => site.clone(),
+        (None, Some(rule), _) => rule.host.clone(),
+        (None, None, Some(spec)) => spec.default_site.to_string(),
+        (None, None, None) => return Err(VaultError::InvalidSecret("give --site".into())),
     };
 
     println!("Adding {} {name:?} for {site}", kind.label());
@@ -276,6 +283,15 @@ fn add(
     }
     if let Some(username) = &username {
         println!("  username: {username}");
+    }
+    if let Some(spec) = vault::kinds::spec(kind) {
+        println!(
+            "  used only by `stream`: {} https://{}{} (and below), the token in `{}`",
+            spec.methods.join(","),
+            spec.hosts.join(", "),
+            spec.path_prefixes.join(", "),
+            spec.set_headers.iter().map(|h| h.name).collect::<Vec<_>>().join(", ")
+        );
     }
     let stdin_value = !std::io::stdin().is_terminal();
     if stdin_value && !yes {
@@ -289,6 +305,7 @@ fn add(
         Kind::ApiKey => "API key (hidden): ",
         Kind::Login => "Password (hidden): ",
         Kind::TwoFactor => "2FA seed, base32 or otpauth:// link (hidden): ",
+        Kind::ClaudePlan => "Claude plan token, from `claude setup-token` (hidden): ",
     };
     let value = read_hidden(prompt)?;
     // R27: sent only to a daemon verified as your own user's.
@@ -326,15 +343,37 @@ fn list(paths: &Paths) -> Result<(), VaultError> {
         println!("No secrets yet.");
         return Ok(());
     }
-    println!("{:<32}  {:<24} {:<8} {:>3}  SITE", "ID", "NAME", "KIND", "VER");
+    println!("{:<32}  {:<24} {:<11} {:>3}  SITE", "ID", "NAME", "KIND", "VER");
     for secret in reply.secrets {
         println!(
-            "{:<32}  {:<24} {:<8} {:>3}  {}",
+            "{:<32}  {:<24} {:<11} {:>3}  {}",
             secret.id,
             secret.name,
             secret.kind.label(),
             secret.version,
             secret.site
+        );
+    }
+    Ok(())
+}
+
+fn health(paths: &Paths) -> Result<(), VaultError> {
+    let reply = client::health(paths)?;
+    if reply.credentials.is_empty() {
+        println!("No Claude plans in the vault.");
+        return Ok(());
+    }
+    println!("{:<24} {:<12} {:>3}  {:<8} {:<6} {:<21} RENEWED", "NAME", "KIND", "VER", "TOKEN", "STATUS", "SEEN");
+    for c in reply.credentials {
+        println!(
+            "{:<24} {:<12} {:>3}  {:<8} {:<6} {:<21} {}",
+            c.name,
+            c.kind.label(),
+            c.version,
+            c.state.label(),
+            c.status.map_or("-".into(), |s| s.to_string()),
+            c.checked_at.unwrap_or_else(|| "-".into()),
+            if c.refresh == "never" { "never (a new sign-in replaces it)" } else { "by the vault" }
         );
     }
     Ok(())
@@ -412,6 +451,13 @@ fn status(paths: &Paths) -> Result<(), VaultError> {
     println!("  file format:       {}", opened.format);
     println!("  created:           {}", opened.created_at);
     println!("  recovery key:      fingerprint {}", opened.recovery_fingerprint);
+    match &opened.intake_recipient {
+        Some(public) => println!(
+            "  intake key:        {public} (fingerprint {}; Volgenic's app seals values to it)",
+            vault::backup::fingerprint(public)
+        ),
+        None => println!("  intake key:        none yet (the daemon makes one when it next starts)"),
+    }
     println!(
         "  Recovery Kit:      {}",
         if opened.kit_confirmed { "confirmed" } else { "not confirmed yet (optional: `vault confirm-kit`)" }

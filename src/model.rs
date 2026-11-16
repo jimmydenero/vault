@@ -13,7 +13,8 @@ use crate::rules::ProxyRule;
 use crate::secret::SecretValue;
 use crate::totp::TotpParams;
 
-/// The three kinds of secret. Each has exactly one use (R5).
+/// The kinds of secret. Each has exactly one use (R5). The kinds that make HTTPS calls for a
+/// caller with a credential of their own (a Claude plan today) are described in `kinds`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// Used only by the proxy, in the auth header its rule names.
@@ -25,6 +26,10 @@ pub enum Kind {
     /// A 2FA (TOTP) seed: used only to make the current code.
     #[serde(rename = "2fa")]
     TwoFactor,
+    /// One Claude plan's token (a `claude setup-token` token): used only by `stream`, only to the
+    /// hosts, methods and paths `kinds::CLAUDE_PLAN` allows, in the header it names.
+    #[serde(rename = "claude_plan", alias = "claude-plan")]
+    ClaudePlan,
 }
 
 impl Kind {
@@ -33,8 +38,12 @@ impl Kind {
             Kind::ApiKey => "api-key",
             Kind::Login => "login",
             Kind::TwoFactor => "2fa",
+            Kind::ClaudePlan => "claude_plan",
         }
     }
+
+    /// Every kind, in the order listings count them.
+    pub const ALL: [Kind; 4] = [Kind::ApiKey, Kind::Login, Kind::TwoFactor, Kind::ClaudePlan];
 }
 
 /// What a listing shows: the secret's stable id and version, name, kind and site, nothing else.
@@ -75,6 +84,10 @@ pub(crate) struct Record {
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub totp: Option<TotpParams>,
+    /// When the stored credential stops working, in Unix seconds, for a kind whose refresher
+    /// renews it before then (`kinds::Refresher`). None for a kind without one (a Claude plan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
     #[serde(with = "secret_bytes")]
     pub value: SecretValue,
 }
@@ -121,6 +134,13 @@ pub(crate) struct VaultDoc {
     /// recipient, so the vault can decrypt each backup right after writing it (R18, R19).
     #[serde(with = "secret_bytes")]
     pub check_identity: SecretValue,
+    /// The intake key: an age X25519 identity whose public half `vault status --json` shows, so a
+    /// value typed in Volgenic's app can be sealed to this vault and carried by Volgenic's server
+    /// without the server being able to read it (`add_sealed`, `intake`). Made at init, at a
+    /// restore and when a format-2 vault is migrated; backups don't carry it, so a restored vault
+    /// gets a new one. None only while a format-2 document is being migrated.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "secret_bytes_opt")]
+    pub intake_identity: Option<SecretValue>,
     /// The audit chain's head at the last change (R29).
     pub audit_head: String,
     /// Increments on every change; numbers the backups.
@@ -134,10 +154,13 @@ pub(crate) struct VaultDoc {
 ///
 /// - **1** (pull requests #2 to #4): records keyed by name only.
 /// - **2**: every record has a random `id`, a `version` and an `updated_at`.
-pub(crate) const VAULT_FORMAT: u32 = 2;
+/// - **3**: the `claude_plan` kind, a record's `expires_at`, and the vault's intake key. An older
+///   build can't read a Claude plan, so the format number tells it this file is newer instead
+///   of letting it call the file damaged (R36).
+pub(crate) const VAULT_FORMAT: u32 = 3;
 
 /// Every format this build reads. Older ones are migrated to `VAULT_FORMAT` when read.
-pub(crate) const READABLE_FORMATS: [u32; 2] = [1, 2];
+pub(crate) const READABLE_FORMATS: [u32; 3] = [1, 2, 3];
 
 /// A secret as a request names it: by its name, or by its stable id.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,6 +263,17 @@ pub(crate) fn check_ids(records: &[Record], format: u32) -> Result<(), VaultErro
     Ok(())
 }
 
+/// Gives a document without an intake key one (a format-2 vault being migrated). Returns whether
+/// it made one. The caller writes the result back as a change of its own.
+pub(crate) fn ensure_intake(doc: &mut VaultDoc) -> bool {
+    if doc.intake_identity.is_some() {
+        return false;
+    }
+    let (identity, _public) = crate::backup::new_identity();
+    doc.intake_identity = Some(identity);
+    true
+}
+
 /// Ids are 32 lower-case hex digits; anything else can't name a secret.
 pub fn validate_id(id: &str) -> Result<(), VaultError> {
     let ok = id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
@@ -303,6 +337,21 @@ pub fn validate_username(username: &str) -> Result<(), VaultError> {
         Ok(())
     } else {
         Err(VaultError::InvalidSecret("the username must be 1 to 256 printable characters".into()))
+    }
+}
+
+/// `secret_bytes` for an optional value inside the vault file (the intake key).
+pub(crate) mod secret_bytes_opt {
+    use serde::{Deserializer, Serializer};
+
+    use crate::secret::SecretValue;
+
+    pub fn serialize<S: Serializer>(value: &Option<SecretValue>, serializer: S) -> Result<S::Ok, S::Error> {
+        super::secret_bytes::serialize_opt_ref(&value.as_ref(), serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<SecretValue>, D::Error> {
+        super::secret_bytes::deserialize_opt(deserializer)
     }
 }
 

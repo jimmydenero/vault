@@ -174,6 +174,16 @@ pub struct AuditJson {
     pub problem: Option<String>,
 }
 
+/// The vault's intake key (R40): Volgenic's app seals a value to it, so Volgenic's server can carry
+/// the value to this vault without being able to read it.
+#[derive(Serialize, Clone, Debug)]
+pub struct IntakeJson {
+    /// An age X25519 recipient, `age1...`.
+    pub public_key: String,
+    /// The first 12 hex digits of its SHA-256, as `abcd-ef01-2345` (the recovery key's form).
+    pub fingerprint: String,
+}
+
 /// `vault status --json`.
 #[derive(Serialize, Clone, Debug)]
 pub struct StatusJson {
@@ -193,6 +203,8 @@ pub struct StatusJson {
     pub boot: BootJson,
     /// Null unless the daemon answered with a vault.
     pub audit: Option<AuditJson>,
+    /// The intake key; null unless the daemon answered with a vault that has one.
+    pub intake: Option<IntakeJson>,
     pub problems: Vec<Problem>,
 }
 
@@ -498,6 +510,11 @@ pub fn gather_status(paths: &Paths) -> StatusJson {
         problem: v.audit_problem.clone(),
     });
 
+    let intake = opened.and_then(|v| v.intake_recipient.as_ref()).map(|public| IntakeJson {
+        public_key: public.clone(),
+        fingerprint: crate::backup::fingerprint(public),
+    });
+
     let mut status = StatusJson {
         schema: SCHEMA,
         healthy: true,
@@ -512,6 +529,7 @@ pub fn gather_status(paths: &Paths) -> StatusJson {
         backup,
         boot: install::boot_state(paths, uid, owner.as_ref().map(|o| o.name.as_str())),
         audit,
+        intake,
         problems: Vec::new(),
     };
     status.problems = diagnose(&status, uid);
