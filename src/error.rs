@@ -59,6 +59,13 @@ pub enum VaultError {
     SealedInvalid(String),
     /// The provider refused the credential: the person signs in again.
     CredentialRefused,
+    /// The secret is at another version than the request named (the version it has now).
+    VersionMismatch(u64),
+    /// An import of a login the vault already renews (its name).
+    LoginClaimed(String),
+    /// The upstream refused an imported login's access token, and the vault may not renew it
+    /// until the host's daemon claims it (`claim_refresh`).
+    LoginAwaitingClaim,
     /// The upstream sent nothing for the idle timeout.
     IdleTimeout(u64),
 }
@@ -108,6 +115,9 @@ impl VaultError {
             ReplyMismatch(_) => "reply_mismatch",
             SealedInvalid(_) => "sealed_invalid",
             CredentialRefused => "credential_refused",
+            VersionMismatch(_) => "version_mismatch",
+            LoginClaimed(_) => "login_claimed",
+            LoginAwaitingClaim => "login_awaiting_claim",
             IdleTimeout(_) => "idle_timeout",
         }
     }
@@ -177,6 +187,18 @@ impl fmt::Display for VaultError {
             ReplyMismatch(why) => write!(f, "the daemon's reply doesn't belong to this request: {why}"),
             SealedInvalid(why) => write!(f, "sealed value refused: {why}"),
             CredentialRefused => write!(f, "the provider refused the credential; sign in again"),
+            VersionMismatch(have) => write!(
+                f,
+                "the secret is at version {have} now, not the one named: it changed meanwhile (import it again, then claim that version)"
+            ),
+            LoginAwaitingClaim => write!(
+                f,
+                "the provider refused the login's access token, and the vault may not renew it until the host's daemon claims it (claim_refresh)"
+            ),
+            LoginClaimed(name) => write!(
+                f,
+                "the vault already renews {name:?}, so a file's tokens are older than the vault's and may be dead; only a new sign-in (add_sealed with replace) replaces it"
+            ),
             IdleTimeout(seconds) => write!(f, "the API sent nothing for {seconds} seconds"),
         }
     }

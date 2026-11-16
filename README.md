@@ -118,11 +118,12 @@ Or restore a backup: `vault install --for-restore`, then `vault restore FILE`.
   recovery key does, and never names a machine. Its first 12 digits are the recovery-key
   fingerprint on the kit. The `vault_id` is the copy: new at every restore, and the prefix of
   the backup files' names.
-- **The vault file and backups are format 3** (format 2 plus the `claude_plan` kind and the
-  intake key). An older vault file is migrated at the daemon's first start, as a change of its
-  own (audited and backed up): a format-1 file's secrets get their ids, and a format-2 file gets
-  its intake key. Format-1 and format-2 backups restore too. A format-2 build refuses a format-3
-  file or backup as newer (`newer_format`); don't go back to an older build after upgrading.
+- **The vault file and backups are format 4** (format 2 plus the `claude_plan` kind and the
+  intake key in format 3, and the `codex_login` and `grok_login` kinds and a login's handover
+  state in format 4). An older vault file is migrated at the daemon's first start, as a change of
+  its own (audited and backed up): a format-1 file's secrets get their ids, and a format-2 file
+  gets its intake key. Older backups restore too. An older build refuses a newer file or backup
+  as newer (`newer_format`); don't go back to an older build after upgrading.
 
 ## Commands
 
@@ -135,10 +136,11 @@ The `vault` tool can't print a secret, so it is safe for any agent on the machin
 | `vault add NAME --kind login --site SITE --username USER` | Adds a login. Stored and listed only, for now. |
 | `vault add NAME --kind 2fa --site SITE` | Adds a 2FA seed: base32, or an `otpauth://` link. |
 | `vault add NAME --kind claude_plan` | Adds a Claude plan's token (from `claude setup-token`). Used only by `stream`, only to `api.anthropic.com`. The host's daemon normally stores plans itself (`import_plan`, `add_sealed`). |
+| `vault add NAME --kind codex_login --yes < auth.json` | Adds a Codex login (its `auth.json`, whole), which the vault alone renews from then on. Used only by `stream`, only to `chatgpt.com`. `grok_login` likewise for Grok Build, to `cli-chat-proxy.grok.com`. The host's daemon normally hands logins over itself (`import_login` and `claim_refresh`, or `add_sealed`). |
 | `vault delete NAME` | Deletes a secret. Earlier backups keep it. |
 | `vault rename NAME NEW` | Renames a secret; its id, rule and value stay, its version goes up. |
 | `vault list` | Ids, names, kinds, versions and sites. |
-| `vault health` | For each Claude plan, by name: whether its token works, has expired or was refused, from the replies to its last calls. |
+| `vault health` | For each Claude plan, Codex login and Grok login, by name: whether it works, has expired or was refused (sign in again), and who renews it. |
 | `vault status [--json]` | The program, the daemon, backups and the audit chain. `--json`: one JSON object for a program, with a `problems` list and the command for each ([docs/json.md](docs/json.md)); no secret names. |
 | `vault --version` | The version, the commit it was built from and the target. |
 | `vault audit [--all]` | The audit log's last 25 lines (`--all`: every line), with its hash chain checked. Past 4 MiB `audit.log` moves to `audit.log.<n>` and the chain carries on in a new file; all are kept. `status` and `audit` check the lines written since the daemon last checked; `--all` and the daemon's start check every file from the first line. |
@@ -174,9 +176,20 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   Redirects come back to you unfollowed. A reply that contains the key is withheld
   (`echo_blocked`).
 - **`stream`** is the streaming proxy, for model calls (the host's model proxy sends it). It
-  names a secret whose kind (`claude_plan`; the table is `src/kinds.rs`) or rule (an API key)
-  decides the upstream host, methods and paths, and which headers the vault sets: you never
-  choose those. The request line is followed by exactly `body_len` raw body bytes (up to 32 MiB):
+  names a secret whose kind (`claude_plan`, `codex_login`, `grok_login`; the table is
+  `src/kinds.rs`) or rule (an API key) decides the upstream host, methods and paths, and which
+  headers the vault sets: you never choose those. A Codex login goes to `chatgpt.com` under
+  `/backend-api/codex` (and `/backend-api/wham/usage`) with `authorization: Bearer <access token>`
+  and `chatgpt-account-id`; a Grok login to `cli-chat-proxy.grok.com` under `/v1` with
+  `authorization: Bearer <access token>` (your `x-xai-token-auth` and `x-grok-*` headers pass
+  through). For a login the vault renews, a call that finds it due renews it first, and a 401
+  from the upstream is held back: the vault renews the login and makes the call once more, so
+  you see the second reply only. **A login's 401 never reaches you as a 401** (Codex fails the
+  turn on one, Grok retries it four times): when no renewal can fix it, the call ends with one
+  error line instead, `credential_refused` (the provider refused the renewal, the login was
+  refused already, or a fresh token got a 401 too: sign in again) or `login_awaiting_claim` (an
+  imported login the host's daemon hasn't claimed yet, which the vault may not renew). The
+  host's proxy answers either as 503, never 401. The request line is followed by exactly `body_len` raw body bytes (up to 32 MiB):
 
   ```json
   {"op":"stream","name":"main","method":"POST","path":"/v1/messages?beta=true",
@@ -195,33 +208,76 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   `authorization`, `x-api-key`, `accept-encoding`, `host`, `content-length` or hop-by-hop
   headers: they are refused (`header_not_allowed`). The reply is unencoded (the vault asks for
   `identity`), and a reply that would carry the token is stopped before it does (`echo_blocked`).
-- **`health`** returns `{"ok":true,"credentials":[{"id","name","kind","version","state","checked_at","status","refresh"}]}`
-  for every Claude plan: `state` is `works`, `expired`, `refused` or `unknown` (not used since it
-  was stored), from the last reply that said; `refresh` is `never` (a plan's token lasts a year,
-  and a new sign-in replaces it).
+- **`health`** returns `{"ok":true,"credentials":[{"id","name","kind","version","state","checked_at","status","refresh","expires_at"}]}`
+  for every Claude plan, Codex login and Grok login, by name only: `state` is `works`, `expired`
+  (also: past its expiry and not renewed), `refused` (sign in again) or `unknown` (not used since
+  it was stored), from the last reply that said; `refresh` is `never` (a plan's token lasts a year,
+  and a new sign-in replaces it), `by_vault` (the vault alone renews it) or `awaiting_claim` (an
+  imported login the host's daemon hasn't handed over yet; the vault uses it but doesn't renew it).
 - **`add_sealed`** stores a value that reached this machine sealed to the vault's intake key (in
   `vault status --json`, `intake`), so Volgenic's server could carry it without reading it:
   `{"op":"add_sealed","name":"main","kind":"claude_plan","sealed_base64":"<base64 of an age file>","replace":true}`.
   What is sealed is `{"v":1,"name","kind","site"?,"rule"?,"username"?,"value"}`; `name` and `kind`
   must match the request's, and the rule is read only from inside it. `replace` replaces a stored
-  secret of that name and kind (same id, version up), for a `claude_plan` only, whose hosts the
-  vault fixes; a sealed API key can only be added under a new name, never replace a stored one
+  secret of that name and kind (same id, version up), for a `claude_plan`, `codex_login` or
+  `grok_login` only, whose hosts the vault fixes; a sealed login's `value` is its `auth.json`,
+  whole, and it is the vault's alone to renew from the start (a new sign-in); a sealed API key can only be added under a new name, never replace a stored one
   (`sealed_invalid`), since that would let whoever sealed it change where the key is sent. Delete with `delete` by name, as for any secret.
 - **`import_plan`** is the upgrade's move of the host's existing plan tokens into the vault:
   `{"op":"import_plan","plans":[{"name":"main","value":"sk-ant-oat01-..."}]}` returns each plan's
   `result` by name: `done` (added, or a different value replaced, version up), `unchanged` (already
   there with that value) or `failed` (with `error`). Safe to repeat. The host reads its own token
   files and Keychain items and hands them over; the vault never reads the Keychain.
+- **`import_login`** and **`claim_refresh`** hand the host's existing Codex and Grok logins to the
+  vault, in the order below ("Handing over a Codex or Grok login").
+  `{"op":"import_login","logins":[{"name":"codex","kind":"codex_login","auth_json":"<the file's text>"}]}`
+  returns each login's `result` by name (`done`, `unchanged` or `failed` with `error`), its
+  `version` and whether it is `claimed`; `{"op":"claim_refresh","name":"codex","version":1}`
+  returns `{"ok":true,"secret":{...},"claimed":true,"already":false}`.
 - The other requests (`status`, `audit`, `add`, `delete`, `rename`, `confirm-kit`, `reset`, `restore`,
   `backup`, `verify-backup`, `read-backup`, `mirror-plan`, `mirror-report`) are what the
   command-line tool and the mirror send; `src/protocol.rs` lists them.
 - Errors are `{"ok":false,"error":"rule_mismatch","message":"..."}`.
 
+## Handing over a Codex or Grok login
+
+Codex and Grok both rotate the refresh token at every renewal, and the old one is dead from then
+on. So exactly one party may renew a login at any moment: the host's daemon until it hands the
+login over, the vault after. The vault never renews an imported login until the daemon says it
+has stopped. For each login (`~/.codex/auth.json`, each account's `CODEX_HOME`, `~/.grok/auth.json`):
+
+0. **On every start, before renewing anything**, the daemon asks `health`. A login listed with
+   `refresh: "by_vault"` is the vault's: the daemon never renews it again and never hands its
+   file's refresh token to anyone. One with `awaiting_claim` is part way through: carry on at 2.
+1. **Stop renewing it**, and record that durably (a marker the daemon reads at start), then wait
+   for a renewal already running to finish (the keeper's `exclusive` chain; Grok's own lock).
+2. **Read the file whole** (`readWholeLogin`) and send it: `import_login`. Take the reply's
+   `version`. `failed`: the login stays the daemon's; nothing about it changed in the vault.
+   `unchanged` with `claimed: true`: it was handed over already; you're done.
+3. **Claim it**: `claim_refresh` with that name and `version`. From the reply on, only the vault
+   renews it. `version_mismatch` means the vault holds another import of it than yours: go back
+   to 2.
+4. **Record the claim** with the marker, and don't let anything renew the file again: its refresh
+   token is the vault's to spend. Model traffic goes through `stream`; a container gets the
+   placeholder `auth.json` (no real token), as the scout page on pointing Codex and Grok at the
+   proxy describes. A Codex or Grok run on the host itself with the original file would renew it
+   and retire the vault's token, so blank the file's refresh token (or move the file aside).
+
+A crash anywhere is safe: before 3 the vault hasn't renewed anything, and importing the same file
+again changes nothing (`unchanged`, same version); after 3, step 0 finds `by_vault`. Importing a
+different file for a claimed login fails with `login_claimed` and changes nothing: only a new
+sign-in replaces it, sealed (`add_sealed` with `replace`, whose `value` is the new `auth.json`).
+A renewal stores the new tokens, the rotated refresh token with them, in the vault file before any
+call uses the new access token. Two calls that find a login due at once wait for one renewal
+between them, so the same refresh token is never sent twice. Renewals go to `auth.openai.com`
+and `auth.x.ai` only, which no caller can reach through `stream`.
+
 ## Build
 
 A Rust (Cargo) project with no native shim: `cargo build` is the gate, on macOS or Linux.
 `cargo build --features test-upstream` is for local evidence only and never released: its
-daemon sends `api.anthropic.com` to `127.0.0.1:$VAULT_TEST_UPSTREAM_PORT` and also trusts the CA in
+daemon sends every kind's hosts and token servers (`api.anthropic.com`, `chatgpt.com`,
+`auth.openai.com`, `cli-chat-proxy.grok.com`, `auth.x.ai`) to `127.0.0.1:$VAULT_TEST_UPSTREAM_PORT` and also trusts the CA in
 `$VAULT_TEST_CA`, so a local test server can stand in for Anthropic over real TLS.
 Release builds (static Linux, and macOS on a Mac): `scripts/release.sh`, described in
 [docs/releasing.md](docs/releasing.md).

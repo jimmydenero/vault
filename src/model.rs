@@ -30,6 +30,14 @@ pub enum Kind {
     /// hosts, methods and paths `kinds::CLAUDE_PLAN` allows, in the header it names.
     #[serde(rename = "claude_plan", alias = "claude-plan")]
     ClaudePlan,
+    /// A Codex login (a ChatGPT sign-in: access, refresh and id tokens and the account id), used
+    /// only by `stream` as `kinds::CODEX_LOGIN` allows, and renewed only by the vault (#7380).
+    #[serde(rename = "codex_login")]
+    CodexLogin,
+    /// A Grok Build login (a grok.com sign-in), as `kinds::GROK_LOGIN` allows, renewed only by
+    /// the vault.
+    #[serde(rename = "grok_login")]
+    GrokLogin,
 }
 
 impl Kind {
@@ -39,11 +47,14 @@ impl Kind {
             Kind::Login => "login",
             Kind::TwoFactor => "2fa",
             Kind::ClaudePlan => "claude_plan",
+            Kind::CodexLogin => "codex_login",
+            Kind::GrokLogin => "grok_login",
         }
     }
 
     /// Every kind, in the order listings count them.
-    pub const ALL: [Kind; 4] = [Kind::ApiKey, Kind::Login, Kind::TwoFactor, Kind::ClaudePlan];
+    pub const ALL: [Kind; 6] =
+        [Kind::ApiKey, Kind::Login, Kind::TwoFactor, Kind::ClaudePlan, Kind::CodexLogin, Kind::GrokLogin];
 }
 
 /// What a listing shows: the secret's stable id and version, name, kind and site, nothing else.
@@ -88,8 +99,29 @@ pub(crate) struct Record {
     /// renews it before then (`kinds::Refresher`). None for a kind without one (a Claude plan).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
+    /// For a kind the vault renews (a Codex or Grok login): whose it is to renew (#7380).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handover: Option<Handover>,
     #[serde(with = "secret_bytes")]
     pub value: SecretValue,
+}
+
+/// Who renews a login the vault holds. A login imported from the host's `auth.json` stays the
+/// host daemon's to renew until the daemon says it has stopped (`claim_refresh`): until then the
+/// vault never renews it, since renewing retires the refresh token the daemon still holds. A login
+/// that arrives any other way (a new sign-in, sealed) is the vault's from the start.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Handover {
+    /// The vault renews it; nothing else may.
+    pub claimed: bool,
+    /// When it was claimed, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at: Option<String>,
+    /// `logins::digest` of the login as the last import stored it, so the same `auth.json`
+    /// imported again changes nothing, even after the vault renewed it. Inside the vault file
+    /// only; never in a reply or the audit log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported: Option<String>,
 }
 
 impl Record {
@@ -157,10 +189,11 @@ pub(crate) struct VaultDoc {
 /// - **3**: the `claude_plan` kind, a record's `expires_at`, and the vault's intake key. An older
 ///   build can't read a Claude plan, so the format number tells it this file is newer instead
 ///   of letting it call the file damaged (R36).
-pub(crate) const VAULT_FORMAT: u32 = 3;
+/// - **4**: the `codex_login` and `grok_login` kinds and a record's `handover` (#7380).
+pub(crate) const VAULT_FORMAT: u32 = 4;
 
 /// Every format this build reads. Older ones are migrated to `VAULT_FORMAT` when read.
-pub(crate) const READABLE_FORMATS: [u32; 3] = [1, 2, 3];
+pub(crate) const READABLE_FORMATS: [u32; 4] = [1, 2, 3, 4];
 
 /// A secret as a request names it: by its name, or by its stable id.
 #[derive(Clone, Debug, PartialEq, Eq)]

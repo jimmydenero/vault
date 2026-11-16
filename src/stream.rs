@@ -59,8 +59,9 @@ pub struct UpstreamPlan {
     pub path_and_query: String,
     /// The caller's headers, checked (R9).
     pub headers: Vec<(String, String)>,
-    /// The headers that carry the credential: name, text before it, text after it.
-    pub set: Vec<(String, String, String)>,
+    /// The headers that carry the credential: name, text before it, text after it, and which of
+    /// the credential's values goes there.
+    pub set: Vec<(String, String, String, HeaderSource)>,
     /// How a reply says the credential works, for kinds with an entry.
     pub classify: Option<fn(u16, &[u8]) -> Option<HealthState>>,
 }
@@ -91,7 +92,7 @@ pub(crate) fn plan(
             method,
             path_and_query,
             headers: rules::check_agent_headers(rule, headers)?,
-            set: vec![(rule.header_name.clone(), rule.header_prefix.clone(), rule.header_suffix.clone())],
+            set: vec![(rule.header_name.clone(), rule.header_prefix.clone(), rule.header_suffix.clone(), HeaderSource::Token)],
             classify: None,
         });
     }
@@ -116,9 +117,7 @@ pub(crate) fn plan(
     let set = spec
         .set_headers
         .iter()
-        .map(|header| match header.source {
-            HeaderSource::Token => (header.name.to_string(), header.prefix.to_string(), header.suffix.to_string()),
-        })
+        .map(|header| (header.name.to_string(), header.prefix.to_string(), header.suffix.to_string(), header.source))
         .collect();
     Ok(UpstreamPlan {
         host: host.to_string(),
@@ -131,6 +130,47 @@ pub(crate) fn plan(
     })
 }
 
+/// A value the credential's headers carry: the stored value itself, or one read out of it.
+pub(crate) enum Held<'a> {
+    Borrowed(&'a SecretValue),
+    Owned(SecretValue),
+}
+
+impl Held<'_> {
+    pub(crate) fn get(&self) -> &SecretValue {
+        match self {
+            Held::Borrowed(value) => value,
+            Held::Owned(value) => value,
+        }
+    }
+}
+
+/// What a call sends upstream: the token, a Codex login's account id, and every value the scrub
+/// watches for in the reply (R12): the token, and a login's refresh token too.
+pub(crate) struct Credential<'a> {
+    pub token: Held<'a>,
+    pub account_id: Option<String>,
+    pub also_watch: Vec<SecretValue>,
+}
+
+impl<'a> Credential<'a> {
+    /// The credential of a stored record: an API key's or a plan's value as it is, or a login's
+    /// access token, refresh token and account id read out of its stored form.
+    pub(crate) fn of(record: &'a Record) -> Result<Credential<'a>, VaultError> {
+        match record.kind {
+            Kind::CodexLogin | Kind::GrokLogin => {
+                let (access, refresh, account_id) = crate::logins::access(record.kind, &record.value)?;
+                Ok(Credential { token: Held::Owned(access), account_id, also_watch: vec![refresh] })
+            }
+            _ => Ok(Credential { token: Held::Borrowed(&record.value), account_id: None, also_watch: Vec::new() }),
+        }
+    }
+
+    fn watched(&self) -> Vec<&SecretValue> {
+        std::iter::once(self.token.get()).chain(self.also_watch.iter()).collect()
+    }
+}
+
 /// How a call went, for the audit line and the health book.
 pub struct Outcome {
     /// The reply's head reached the caller; after that only a trailer can say what went wrong.
@@ -138,7 +178,9 @@ pub struct Outcome {
     pub status: Option<u16>,
     /// Body bytes sent to the caller.
     pub bytes: u64,
-    /// `complete`, `idle_timeout`, `upstream_failed`, `echo_blocked` or `cancelled`.
+    /// `complete`, `idle_timeout`, `upstream_failed`, `echo_blocked` or `cancelled`; or
+    /// `auth_error` when the call held back a 401 for the vault to renew the login and try again
+    /// (nothing reached the caller).
     pub end: &'static str,
     /// What went wrong before the head (for the error line) or after it.
     pub error: Option<VaultError>,
@@ -185,26 +227,78 @@ impl Streamer {
     /// Makes the call and streams the reply to `caller`. Every byte the caller gets has passed the
     /// scrub (R12). A failure before the head is returned for the caller's error line; the
     /// trailer reports one after it.
-    pub fn run(
+    ///
+    /// With `hold_auth_error`, a 401 reply isn't passed on: the call ends with `auth_error` and
+    /// nothing sent to the caller, so the vault can renew the login and try once more.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run(
         &self,
         plan: &UpstreamPlan,
-        key: &SecretValue,
-        body: Vec<u8>,
+        credential: &Credential<'_>,
+        body: &[u8],
         idle: Duration,
         caller: &mut UnixStream,
         envelope: &Envelope,
+        hold_auth_error: bool,
     ) -> Outcome {
-        self.runtime.block_on(self.call(plan, key, body, idle, caller, envelope))
+        self.runtime.block_on(self.call(plan, credential, body, idle, caller, envelope, hold_auth_error))
     }
 
+    /// One renewal request to a kind's token server (`kinds::Refresher`), never to a host a
+    /// caller named: its status and its body (at most `logins::MAX_REFRESH_REPLY`, in a wiped
+    /// buffer). 30 seconds at most.
+    pub(crate) fn refresh(&self, call: &crate::logins::RefreshCall) -> Result<(u16, Zeroizing<Vec<u8>>), VaultError> {
+        self.runtime.block_on(async {
+            let port = self.test_port.map_or(String::new(), |port| format!(":{port}"));
+            let url = reqwest::Url::parse(&format!("https://{}{}{}", call.host, port, call.path))
+                .map_err(|_| VaultError::UpstreamFailed("bad token server address".into()))?;
+            let mut request = reqwest::Request::new(reqwest::Method::POST, url);
+            let headers = request.headers_mut();
+            headers.insert(reqwest::header::CONTENT_TYPE, HeaderValue::from_static(call.content_type));
+            headers.insert(reqwest::header::ACCEPT, HeaderValue::from_static("application/json"));
+            headers.insert(reqwest::header::ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+            *request.body_mut() = Some(reqwest::Body::from(call.body.to_vec()));
+            let work = async {
+                let mut response = self
+                    .client
+                    .execute(request)
+                    .await
+                    .map_err(|error| VaultError::UpstreamFailed(crate::proxy::describe_send_error(&error)))?;
+                let status = response.status().as_u16();
+                let mut body = Zeroizing::new(Vec::with_capacity(4096));
+                while let Some(piece) = response
+                    .chunk()
+                    .await
+                    .map_err(|_| VaultError::UpstreamFailed("the token server's reply was cut off".into()))?
+                {
+                    if body.len() + piece.len() > crate::logins::MAX_REFRESH_REPLY {
+                        return Err(VaultError::UpstreamFailed("the token server's reply is too large".into()));
+                    }
+                    if body.len() + piece.len() > body.capacity() {
+                        let mut grown = Zeroizing::new(Vec::with_capacity((body.len() + piece.len()).max(body.capacity() * 2)));
+                        grown.extend_from_slice(&body);
+                        body = grown;
+                    }
+                    body.extend_from_slice(&piece);
+                }
+                Ok((status, body))
+            };
+            tokio::time::timeout(Duration::from_secs(30), work)
+                .await
+                .map_err(|_| VaultError::UpstreamFailed("the token server didn't answer in 30 seconds".into()))?
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn call(
         &self,
         plan: &UpstreamPlan,
-        key: &SecretValue,
-        body: Vec<u8>,
+        credential: &Credential<'_>,
+        body: &[u8],
         idle: Duration,
         caller: &mut UnixStream,
         envelope: &Envelope,
+        hold_auth_error: bool,
     ) -> Outcome {
         let started = Instant::now();
         let mut outcome = Outcome {
@@ -223,7 +317,7 @@ impl Streamer {
             outcome.took = started.elapsed();
             outcome
         };
-        let request = match self.request(plan, key, body) {
+        let request = match self.request(plan, credential, body) {
             Ok(request) => request,
             Err(error) => return fail(outcome, "refused", error),
         };
@@ -240,8 +334,15 @@ impl Streamer {
         let status = response.status().as_u16();
         outcome.status = Some(status);
         outcome.head_after = Some(started.elapsed());
+        if hold_auth_error && status == 401 {
+            drop(response);
+            outcome.end = "auth_error";
+            outcome.took = started.elapsed();
+            return outcome;
+        }
 
-        let forms = scrub::needles(key);
+        let watched = credential.watched();
+        let forms = scrub::needles_of(&watched);
         let mut headers = Vec::new();
         for (name, value) in response.headers() {
             let text = String::from_utf8_lossy(value.as_bytes()).into_owned();
@@ -262,7 +363,7 @@ impl Streamer {
         }
         outcome.head_sent = true;
 
-        let mut scrubber = StreamScrub::new(key);
+        let mut scrubber = StreamScrub::new(&watched);
         let mut sample = Vec::new();
         let mut frame = Vec::with_capacity(64 * 1024);
         let end: Result<(), (&'static str, VaultError)> = loop {
@@ -324,7 +425,7 @@ impl Streamer {
 
     /// The upstream request: the caller's checked headers, then the credential in the headers
     /// the plan names, marked sensitive so the HTTP library never prints them.
-    fn request(&self, plan: &UpstreamPlan, key: &SecretValue, body: Vec<u8>) -> Result<reqwest::Request, VaultError> {
+    fn request(&self, plan: &UpstreamPlan, credential: &Credential<'_>, body: &[u8]) -> Result<reqwest::Request, VaultError> {
         let port = self.test_port.unwrap_or(plan.port);
         let port = if port == 443 { String::new() } else { format!(":{port}") };
         let url = reqwest::Url::parse(&format!("https://{}{}{}", plan.host, port, plan.path_and_query))
@@ -341,14 +442,25 @@ impl Streamer {
         }
         // R12: an unencoded reply, so the scrub sees the bytes the caller will.
         headers.insert(reqwest::header::ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-        for (name, prefix, suffix) in &plan.set {
+        for (name, prefix, suffix, source) in &plan.set {
             let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| VaultError::InvalidRule("bad header name".into()))?;
-            headers.insert(name, credential_header(prefix, key, suffix)?);
+            let value = match source {
+                HeaderSource::Token => credential_header(prefix, credential.token.get(), suffix)?,
+                HeaderSource::AccountId => {
+                    let id = credential
+                        .account_id
+                        .as_deref()
+                        .ok_or_else(|| VaultError::InvalidSecret("the login has no account id".into()))?;
+                    HeaderValue::from_str(&format!("{prefix}{id}{suffix}"))
+                        .map_err(|_| VaultError::InvalidSecret("the account id can't go into an HTTP header".into()))?
+                }
+            };
+            headers.insert(name, value);
         }
         let mut request = reqwest::Request::new(method, url);
         *request.headers_mut() = headers;
         if !body.is_empty() {
-            *request.body_mut() = Some(reqwest::Body::from(body));
+            *request.body_mut() = Some(reqwest::Body::from(body.to_vec()));
         }
         Ok(request)
     }
@@ -405,7 +517,7 @@ fn test_upstream(builder: reqwest::ClientBuilder) -> (reqwest::ClientBuilder, Op
 }
 
 /// `test-upstream` builds only (never a release): `VAULT_TEST_UPSTREAM_PORT` sends every kind's
-/// hosts to that port on 127.0.0.1, and `VAULT_TEST_CA` (a PEM file) is trusted besides the
+/// hosts and token servers to that port on 127.0.0.1, and `VAULT_TEST_CA` (a PEM file) is trusted besides the
 /// system's roots, so a local test server can stand in for api.anthropic.com over real TLS.
 #[cfg(feature = "test-upstream")]
 fn test_upstream(builder: reqwest::ClientBuilder) -> (reqwest::ClientBuilder, Option<u16>) {
@@ -414,7 +526,7 @@ fn test_upstream(builder: reqwest::ClientBuilder) -> (reqwest::ClientBuilder, Op
     };
     let mut builder = builder;
     for spec in kinds::TABLE {
-        for host in spec.hosts {
+        for host in spec.hosts.iter().chain(spec.refresher.as_ref().map(|refresher| &refresher.host)) {
             builder = builder.resolve(host, std::net::SocketAddr::from(([127, 0, 0, 1], port)));
         }
     }

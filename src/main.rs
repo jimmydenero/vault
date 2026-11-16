@@ -131,6 +131,12 @@ enum KindArg {
     TwoFactor,
     #[value(name = "claude_plan", alias = "claude-plan")]
     ClaudePlan,
+    /// A Codex login: its auth.json, read whole from standard input with --yes.
+    #[value(name = "codex_login")]
+    CodexLogin,
+    /// A Grok Build login: its auth.json, read whole from standard input with --yes.
+    #[value(name = "grok_login")]
+    GrokLogin,
 }
 
 fn main() -> ExitCode {
@@ -254,6 +260,8 @@ fn add(
         KindArg::Login => Kind::Login,
         KindArg::TwoFactor => Kind::TwoFactor,
         KindArg::ClaudePlan => Kind::ClaudePlan,
+        KindArg::CodexLogin => Kind::CodexLogin,
+        KindArg::GrokLogin => Kind::GrokLogin,
     };
     // The rule is checked here for the person to read, and again by the daemon, which never
     // takes a ready-made rule (R7).
@@ -292,6 +300,10 @@ fn add(
             spec.path_prefixes.join(", "),
             spec.set_headers.iter().map(|h| h.name).collect::<Vec<_>>().join(", ")
         );
+        if let Some(refresher) = spec.refresher {
+            println!("  renewed by the vault alone, at {}: nothing else may renew this login from now on", refresher.host);
+            println!("  (the auth.json you give stops being renewable once the vault renews it)");
+        }
     }
     let stdin_value = !std::io::stdin().is_terminal();
     if stdin_value && !yes {
@@ -306,6 +318,8 @@ fn add(
         Kind::Login => "Password (hidden): ",
         Kind::TwoFactor => "2FA seed, base32 or otpauth:// link (hidden): ",
         Kind::ClaudePlan => "Claude plan token, from `claude setup-token` (hidden): ",
+        Kind::CodexLogin => "Codex auth.json, whole (hidden; or pipe the file in with --yes): ",
+        Kind::GrokLogin => "Grok auth.json, whole (hidden; or pipe the file in with --yes): ",
     };
     let value = read_hidden(prompt)?;
     // R27: sent only to a daemon verified as your own user's.
@@ -360,7 +374,7 @@ fn list(paths: &Paths) -> Result<(), VaultError> {
 fn health(paths: &Paths) -> Result<(), VaultError> {
     let reply = client::health(paths)?;
     if reply.credentials.is_empty() {
-        println!("No Claude plans in the vault.");
+        println!("No Claude plans, Codex logins or Grok logins in the vault.");
         return Ok(());
     }
     println!("{:<24} {:<12} {:>3}  {:<8} {:<6} {:<21} RENEWED", "NAME", "KIND", "VER", "TOKEN", "STATUS", "SEEN");
@@ -373,7 +387,11 @@ fn health(paths: &Paths) -> Result<(), VaultError> {
             c.state.label(),
             c.status.map_or("-".into(), |s| s.to_string()),
             c.checked_at.unwrap_or_else(|| "-".into()),
-            if c.refresh == "never" { "never (a new sign-in replaces it)" } else { "by the vault" }
+            match c.refresh.as_str() {
+                "never" => "never (a new sign-in replaces it)",
+                "awaiting_claim" => "not yet: imported, waiting for the host's claim_refresh",
+                _ => "by the vault",
+            }
         );
     }
     Ok(())

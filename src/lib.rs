@@ -21,6 +21,7 @@ pub mod install;
 pub mod intake;
 pub mod keyprotect;
 pub mod kinds;
+pub mod logins;
 pub mod mirror;
 pub mod model;
 pub mod platform;
