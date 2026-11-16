@@ -19,12 +19,11 @@
 //!   {"op":"totp","name":"github-2fa"}                  (or "id":"<32 hex digits>")
 //!   {"op":"proxy","name":"openai","method":"GET","path":"/v1/models",
 //!    "headers":{"accept":"application/json"},"body":"..."}            (or "body_base64")
+//!   {"op":"proxy","name":"openai","host":"api.openai.com","port":443,"method":"GET",
+//!    "path":"/v1/models"}                       (host and port optional; see below)
 //!   {"op":"stream","name":"main","method":"POST","path":"/v1/messages?beta=true",
 //!    "headers":[["anthropic-version","2023-06-01"]],"body_len":1234}  then 1234 body bytes
 //!   {"op":"health"}
-//!
-//!   {"op":"proxy","name":"openai","host":"api.openai.com","port":443,"method":"GET",
-//!    "path":"/v1/models"}                       (host and port optional; see below)
 //!
 //! **`proxy`'s destination.** The key's rule alone decides where a `proxy` call goes. A caller
 //! may name the destination it meant, `host` (compared case-insensitively) and `port` (a number
