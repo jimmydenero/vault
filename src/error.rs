@@ -68,6 +68,9 @@ pub enum VaultError {
     LoginAwaitingClaim,
     /// The upstream sent nothing for the idle timeout.
     IdleTimeout(u64),
+    /// `lease` named secrets that may not be leased to a build (their names): not app secrets, or
+    /// app secrets not added as leasable.
+    NotLeasable(Vec<String>),
 }
 
 impl VaultError {
@@ -119,6 +122,7 @@ impl VaultError {
             LoginClaimed(_) => "login_claimed",
             LoginAwaitingClaim => "login_awaiting_claim",
             IdleTimeout(_) => "idle_timeout",
+            NotLeasable(_) => "not_leasable",
         }
     }
 }
@@ -200,6 +204,11 @@ impl fmt::Display for VaultError {
                 "the vault already renews {name:?}, so a file's tokens are older than the vault's and may be dead; only a new sign-in (add_sealed with replace) replaces it"
             ),
             IdleTimeout(seconds) => write!(f, "the API sent nothing for {seconds} seconds"),
+            NotLeasable(names) => write!(
+                f,
+                "not leased: {} may not be leased to builds (only an app_secret added as leasable may be); nothing was sealed",
+                names.iter().map(|name| format!("{name:?}")).collect::<Vec<_>>().join(", ")
+            ),
         }
     }
 }

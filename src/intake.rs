@@ -12,7 +12,14 @@
 //!  "path":"/v1","header":"Authorization: Bearer {key}"},"value":"sk-..."}
 //! {"v":1,"name":"v1-details","kind":"personal_details",
 //!  "value":"{\"name\":\"Ada Lovelace\",\"address\":\"...\",\"birthday\":\"\",\"phone\":\"\"}"}
+//! {"v":1,"name":"shop-npm-token","kind":"app_secret","app":"shop","leasable":true,"value":"npm_..."}
 //! ```
+//!
+//! An app secret (#7446) names its `app`, and may be leased to builds only when its sealed object
+//! says `"leasable":true` (`lease`). Both are read only from inside the ciphertext, and only an
+//! app secret may carry them. A sealed app secret is added under a new name only: like an API
+//! key, it can't replace a stored one (R40), since anyone can seal to the intake key and a build
+//! would then run with the sealer's value.
 //!
 //! A value whose kind has a stored form of its own (a login's `auth.json`, personal details'
 //! object) is carried as a string and read into that form when it is stored (`kinds`, `details`).
@@ -46,6 +53,8 @@ pub struct Sealed {
     pub site: Option<String>,
     pub rule: Option<RuleInput>,
     pub username: Option<String>,
+    pub app: Option<String>,
+    pub leasable: bool,
     pub value: SecretValue,
 }
 
@@ -62,6 +71,10 @@ struct SealedWire {
     rule: Option<RuleInput>,
     #[serde(default)]
     username: Option<String>,
+    #[serde(default)]
+    app: Option<String>,
+    #[serde(default)]
+    leasable: bool,
     /// A JSON string or an array of bytes; read straight into a wiping buffer (R1).
     #[serde(deserialize_with = "secret_bytes::deserialize")]
     value: SecretValue,
@@ -106,6 +119,8 @@ pub fn open(identity: &SecretValue, sealed_base64: &str, name: &str, kind: Kind)
         site: wire.site,
         rule: wire.rule,
         username: wire.username,
+        app: wire.app,
+        leasable: wire.leasable,
         value: wire.value,
     })
 }

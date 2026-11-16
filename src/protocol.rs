@@ -28,6 +28,14 @@
 //!   {"op":"import_plan","plans":[{"name":"main","value":"sk-ant-oat01-..."}]}
 //!   {"op":"import_login","logins":[{"name":"codex","kind":"codex_login","auth_json":"{...}"}]}
 //!   {"op":"claim_refresh","name":"codex","version":1}                (or "id")
+//!   {"op":"lease","job":"build:4812","recipient":"age1...","names":["NPM_TOKEN"],"ttl_seconds":3600}
+//!                                                                      (and/or "ids")
+//!
+//! **`lease`** (#7446) seals each named app secret's value to the job's own age key, with the job
+//! and an expiry inside (`lease`), and answers only ciphertext:
+//! `{"ok":true,"sealed":[{"name","id","sealed_base64"}],"missing":[...],"expires_at","job"}`. A
+//! secret it holds that may not be leased refuses the whole request:
+//! `{"ok":false,"error":"not_leasable","message","names":[...]}`.
 //!
 //! **`stream`** (R39) sends one request with a credential whose kind (`kinds`) or rule (an API key)
 //! decides the host, the methods, the paths and the headers the vault sets, and streams the reply
@@ -223,6 +231,13 @@ pub enum Request {
         /// The version `import_login` gave the login.
         version: u64,
     },
+    Lease {
+        job: String,
+        recipient: String,
+        /// The names, then the ids, as given.
+        secrets: Vec<SecretRef>,
+        ttl_seconds: u64,
+    },
     Status,
     Audit {
         all: bool,
@@ -233,6 +248,8 @@ pub enum Request {
         site: String,
         rule: Option<RuleInput>,
         username: Option<String>,
+        app: Option<String>,
+        leasable: bool,
         value: SecretValue,
     },
     Delete {
@@ -376,6 +393,17 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
     }
 
     #[derive(Deserialize)]
+    struct LeaseWire {
+        job: String,
+        recipient: String,
+        #[serde(default)]
+        names: Vec<String>,
+        #[serde(default)]
+        ids: Vec<String>,
+        ttl_seconds: u64,
+    }
+
+    #[derive(Deserialize)]
     struct ClaimWire {
         version: u64,
     }
@@ -395,6 +423,10 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
         rule: Option<RuleInput>,
         #[serde(default)]
         username: Option<String>,
+        #[serde(default)]
+        app: Option<String>,
+        #[serde(default)]
+        leasable: bool,
         #[serde(deserialize_with = "secret_bytes::deserialize")]
         value: SecretValue,
     }
@@ -511,10 +543,24 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
             secret: named(line)?,
             version: serde_json::from_slice::<ClaimWire>(line)?.version,
         },
+        "lease" => {
+            let w: LeaseWire = serde_json::from_slice(line)?;
+            let secrets = w.names.into_iter().map(SecretRef::Name).chain(w.ids.into_iter().map(SecretRef::Id)).collect();
+            Request::Lease { job: w.job, recipient: w.recipient, secrets, ttl_seconds: w.ttl_seconds }
+        }
         "audit" => Request::Audit { all: serde_json::from_slice::<AuditWire>(line)?.all },
         "add" => {
             let w: AddWire = serde_json::from_slice(line)?;
-            Request::Add { name: w.name, kind: w.kind, site: w.site, rule: w.rule, username: w.username, value: w.value }
+            Request::Add {
+                name: w.name,
+                kind: w.kind,
+                site: w.site,
+                rule: w.rule,
+                username: w.username,
+                app: w.app,
+                leasable: w.leasable,
+                value: w.value,
+            }
         }
         "confirm-kit" => Request::ConfirmKit { recovery_key: serde_json::from_slice::<ConfirmKitWire>(line)?.recovery_key },
         "reset" => Request::Reset { recovery_key: serde_json::from_slice::<ResetWire>(line)?.recovery_key },
@@ -548,6 +594,10 @@ pub(crate) enum SecretRequest<'a> {
         site: &'a str,
         rule: Option<&'a RuleInput>,
         username: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        app: Option<&'a str>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        leasable: bool,
         #[serde(serialize_with = "secret_bytes::serialize_ref")]
         value: &'a SecretValue,
     },
@@ -717,6 +767,26 @@ pub struct ClaimReply {
     pub backup: Option<BackupStatus>,
 }
 
+/// One app secret of a lease: its value sealed to the job's key, as base64 of an age file.
+#[derive(Serialize, Deserialize)]
+pub struct LeasedSecret {
+    pub name: String,
+    pub id: String,
+    pub sealed_base64: String,
+}
+
+/// A lease's answer: ciphertext only (R4).
+#[derive(Serialize, Deserialize)]
+pub struct LeaseReply {
+    pub ok: bool,
+    pub sealed: Vec<LeasedSecret>,
+    /// The names (or ids) the vault holds nothing under.
+    pub missing: Vec<String>,
+    /// When the lease ends, as sealed inside each value (RFC 3339).
+    pub expires_at: String,
+    pub job: String,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ImportReply {
     pub ok: bool,
@@ -873,10 +943,17 @@ pub struct ErrorReply {
     pub ok: bool,
     pub error: String,
     pub message: String,
+    /// `not_leasable`: the secrets refused, by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub names: Option<Vec<String>>,
 }
 
 impl ErrorReply {
     pub fn from(error: &VaultError) -> Self {
-        ErrorReply { ok: false, error: error.code().into(), message: error.to_string() }
+        let names = match error {
+            VaultError::NotLeasable(names) => Some(names.clone()),
+            _ => None,
+        };
+        ErrorReply { ok: false, error: error.code().into(), message: error.to_string(), names }
     }
 }
