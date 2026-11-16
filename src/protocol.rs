@@ -296,6 +296,9 @@ pub enum Request {
     SignCancel {
         secret: SecretRef,
         chain: String,
+        /// The payment fields the caller sent, which a cancel refuses: `to`, `token`, `amount`.
+        extra: Vec<&'static str>,
+        gas_limit: Option<u64>,
         nonce: u64,
         max_fee_per_gas: u64,
         max_priority_fee_per_gas: u64,
@@ -696,18 +699,17 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
             let secret = secret_ref(w.name, w.id)?;
             // A cancel (#7491) is the one transaction the vault builds for it: nothing a caller
             // could point at a recipient, a token or an amount is taken, so none may be sent.
+            // `wallet::check_cancel` refuses one that names any (`extra`), with its own message.
             if w.cancel {
-                if w.token.is_some() || w.to.is_some() || w.amount.is_some() {
-                    return Err(serde_json::Error::custom(
-                        "a cancel takes no to, token or amount: it is 0 ETH from the wallet to itself",
-                    ));
-                }
-                if w.gas_limit.is_some_and(|gas| gas != crate::wallet::CANCEL_GAS) {
-                    return Err(serde_json::Error::custom("a cancel's gas_limit is 21000"));
-                }
+                let extra = [("to", w.to.is_some()), ("token", w.token.is_some()), ("amount", w.amount.is_some())]
+                    .into_iter()
+                    .filter_map(|(field, given)| given.then_some(field))
+                    .collect();
                 return Ok(Request::SignCancel {
                     secret,
                     chain: w.chain,
+                    extra,
+                    gas_limit: w.gas_limit,
                     nonce: w.nonce,
                     max_fee_per_gas: w.max_fee_per_gas,
                     max_priority_fee_per_gas: w.max_priority_fee_per_gas,

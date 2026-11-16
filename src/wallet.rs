@@ -541,6 +541,10 @@ pub fn record(info: &mut WalletInfo, payment: &Payment, counted: Counted, now: u
 /// the vault builds the one transaction a cancel can be.
 pub struct CancelArgs<'a> {
     pub chain: &'a str,
+    /// Payment fields the caller sent anyway (`to`, `token`, `amount`): any refuses the cancel.
+    pub extra: Vec<&'static str>,
+    /// Refused unless absent or 21,000.
+    pub gas_limit: Option<u64>,
     pub nonce: u64,
     pub max_fee_per_gas: u64,
     pub max_priority_fee_per_gas: u64,
@@ -615,6 +619,15 @@ pub fn check_cancel(info: &WalletInfo, args: &CancelArgs<'_>, now: u64) -> Resul
     let chain = Chain::parse(args.chain)?;
     if chain != info.chain {
         return Err(bad(&format!("this wallet is for {}, not {}", info.chain.label(), chain.label())));
+    }
+    if !args.extra.is_empty() {
+        return Err(bad(&format!(
+            "a cancel takes no {}: the vault builds it as 0 ETH from the wallet to itself",
+            args.extra.join(" or ")
+        )));
+    }
+    if args.gas_limit.is_some_and(|gas| gas != CANCEL_GAS) {
+        return Err(bad(&format!("a cancel's gas_limit is {CANCEL_GAS}, a plain transfer of ETH")));
     }
     let address = evm::parse_address(&info.address).map_err(|_| VaultError::VaultFileCorrupt)?;
     let cancels: Vec<String> = info

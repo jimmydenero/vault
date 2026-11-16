@@ -250,7 +250,8 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   only an `app_secret` may carry either, and it too is added under a new name only.
 - **`lease`** seals app secrets to a build's own key (host only; "App secrets and leases" below).
 - **`sign`** signs one token payment from a wallet, within its caps, with a ladder of fee
-  bumps (the host's payment relay; "Wallets" below).
+  bumps, or with `"cancel":true` a 0-ETH cancel at a payment's nonce (the host's payment relay;
+  "Wallets" below).
 - **`import_plan`** is the upgrade's move of the host's existing plan tokens into the vault:
   `{"op":"import_plan","plans":[{"name":"main","value":"sk-ant-oat01-..."}]}` returns each plan's
   `result` by name: `done` (added, or a different value replaced, version up), `unchanged` (already
@@ -411,11 +412,35 @@ bumps were signed in advance.
 - **The same transfer at a nonce already signed for** in the last day counts once against the
   amount caps (only one can mine; `"replacement":true`), and against the fee cap only for what it
   raises the worst case by.
+- **A cancel** (v1's cancel button, work item #7491): `sign` with `"cancel":true`, `chain`,
+  `nonce` and the fees, and no `to`, `token` or `amount` (sent anyway, the cancel is refused).
+  The vault signs a transfer of 0 ETH from the wallet to itself, 21,000 gas and no data, at that
+  nonce, and **only at a nonce it signed a payment for in the last 24 hours**. Only one
+  transaction per nonce can mine: if the cancel does, nothing is paid; if the payment mines
+  first, the cancel is refused by the chain (`nonce too low`) and costs nothing.
+
+```json
+{"protocol":2,"op":"sign","name":"main-wallet","cancel":true,"chain":"ethereum","nonce":7,
+ "max_fee_per_gas":40000000000,"max_priority_fee_per_gas":2500000000,"ladder":2,
+ "on_behalf_of":"owner's cancel, payment #123","request_id":"..."}
+```
+
+  It answers `{"ok":true,"cancel":true,"signed":{...},"ladder":[...],"from","to","nonce","gas_limit",
+  "cancels":["12.5 USDC to 0x..."],"worst_fee_wei","counted_fees_wei","caps","spent_today_micros",
+  "fees_today_wei","backup"}`. A node takes it as the payment's replacement only with both fees
+  12.5% above the one it replaces, so the relay picks the fees as v1 did (`bump_fees`: raised from
+  the highest rung it sent, and at least twice the base fee plus the tip). The fee and its ladder
+  are bounded exactly as a payment's (`max_fee_per_gas`, at most 4 rungs, the caller's own
+  ceiling). It moves no value and counts no amount; its worst case (21,000 gas at its top rung)
+  counts against `daily_fees` for what it raises that nonce's worst case by, since only one of
+  the payment and its cancels can be paid for.
 - **Audit:** one `sign` line per payment (chain, amount, token, recipient, nonce, gas, fees, the
   hash, what it counted, `on_behalf_of`, the caller hint and request id), written with the change
   that records the payment, and one `sign-ladder` line per ladder (how many rungs, the top fee, the
   worst-case fee, every hash), both flushed to disk before the answer leaves. A refusal is one
-  `sign denied: <code>` line. `wallet-create` and `wallet-caps` lines show the address and the
+  `sign denied: <code>` line. Each cancel writes one `sign-cancel` line (the nonce, the fees, the
+  payments it cancels, its hash and its ladder's, the worst-case fee and what it counted, the
+  caller), the same way; a refused one, `sign-cancel denied: <code>`. `wallet-create` and `wallet-caps` lines show the address and the
   caps. Never a key.
 - **Each payment is a change** (the last day's payments are in the vault file, so the daily caps
   survive a restart), with its own backup.

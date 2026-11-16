@@ -694,6 +694,8 @@ impl Server {
             Request::SignCancel {
                 secret,
                 chain,
+                extra,
+                gas_limit,
                 nonce,
                 max_fee_per_gas,
                 max_priority_fee_per_gas,
@@ -703,6 +705,8 @@ impl Server {
             } => {
                 let args = CancelArgs {
                     chain: &chain,
+                    extra,
+                    gas_limit,
                     nonce,
                     max_fee_per_gas,
                     max_priority_fee_per_gas,
