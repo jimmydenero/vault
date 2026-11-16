@@ -116,6 +116,11 @@ pub fn install(for_restore: bool, json: bool) -> Result<(), VaultError> {
         out.error = result.as_ref().err().map(ErrorJson::from);
         if out.program.is_some() {
             let status = report::gather_status(&Paths::current());
+            if let Some(vault) = out.vault.as_mut().filter(|v| v.action == "kept") {
+                vault.identity = status.vault.identity.clone();
+                vault.vault_id = status.vault.vault_id.clone();
+                vault.recovery_fingerprint = status.vault.recovery_fingerprint.clone();
+            }
             out.problems = status.problems.clone();
             out.status = Some(status);
         }

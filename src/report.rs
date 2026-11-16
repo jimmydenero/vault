@@ -536,6 +536,8 @@ pub struct InstallVaultJson {
     /// `made` (a new vault), `kept` (the existing one) or `none` (none made: `--for-restore`,
     /// or a key without a vault file is there).
     pub action: &'static str,
+    /// For `made`, from the install; for `kept`, from the daemon after it (null if it didn't
+    /// answer).
     pub identity: Option<String>,
     pub vault_id: Option<String>,
     pub recovery_fingerprint: Option<String>,
