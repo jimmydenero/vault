@@ -38,7 +38,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::error::VaultError;
-use crate::model::{self, Kind, Record, SecretRef, VaultDoc};
+use crate::model::{self, Record, SecretRef, VaultDoc};
 use crate::secret::{SecretValue, WipingBuf};
 
 /// The shortest lease, in seconds.
@@ -181,7 +181,7 @@ fn plaintext(record: &Record, terms: &Terms) -> SecretValue {
 /// Seals one leasable app secret to the lease's key: base64 of a binary age file. Refuses any
 /// other record, whatever the caller checked before.
 pub(crate) fn seal(record: &Record, terms: &Terms) -> Result<String, VaultError> {
-    if !record.may_lease() || record.kind != Kind::AppSecret {
+    if !record.may_lease() {
         return Err(VaultError::NotLeasable(vec![record.name.clone()]));
     }
     let failed = || VaultError::Io("sealing the lease failed".into());
