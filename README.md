@@ -173,6 +173,11 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
 - `proxy` takes `method`, `path` (with query), optional `headers` (an object) and `body` or
   `body_base64`. It returns `{"ok":true,"status":200,"headers":[[name,value]],"body":"..."}`.
   The key goes only into the header its rule names, only to the rule's host, method and path.
+  You may also name the destination you meant, `host` and `port` (443 if left out): when it
+  isn't the key's rule's (the host compared case-insensitively), the call is refused
+  `rule_mismatch` before anything is sent, and the refusal is audited. Without them, the call
+  goes to the rule's host, as before:
+  `{"op":"proxy","name":"openai","host":"api.openai.com","port":443,"method":"GET","path":"/v1/models"}`.
   Redirects come back to you unfollowed. A reply that contains the key is withheld
   (`echo_blocked`).
 - **`stream`** is the streaming proxy, for model calls (the host's model proxy sends it). It

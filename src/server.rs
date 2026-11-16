@@ -488,9 +488,9 @@ impl Server {
                 });
                 self.finish(stream, peer, "totp", Some(&secret.label()), result)
             }
-            Request::Proxy { secret, method, path, headers, body, body_base64 } => {
+            Request::Proxy { secret, host, port, method, path, headers, body, body_base64 } => {
                 match self.snapshot() {
-                    Ok(doc) => match self.proxy(&doc, &secret, method, path, headers, body, body_base64, peer) {
+                    Ok(doc) => match self.proxy(&doc, &secret, (host, port), method, path, headers, body, body_base64, peer) {
                         Ok(out) => reply(stream, &peer.envelope, &out),
                         Err(error) => error_reply(stream, peer, &error),
                     },
@@ -1076,6 +1076,7 @@ impl Server {
         &self,
         doc: &VaultDoc,
         secret: &SecretRef,
+        (host, port): (Option<String>, Option<u16>),
         method: String,
         path: String,
         headers: std::collections::BTreeMap<String, String>,
@@ -1110,6 +1111,14 @@ impl Server {
         };
         let mut event = event;
         event.host = Some(rule.host.clone());
+        // Before anything else touches the request: a caller that named another destination than
+        // the rule's is refused, not sent to the rule's host instead.
+        if let Err(error) = rules::check_destination(rule, host.as_deref(), port) {
+            if let Some(asked) = &host {
+                event.host = Some(asked.chars().take(253).collect());
+            }
+            return Err(fail(error, event));
+        }
         let body = match (body, body_base64) {
             (Some(_), Some(_)) => {
                 return Err(fail(VaultError::BadRequest("send body or body_base64, not both".into()), event));
