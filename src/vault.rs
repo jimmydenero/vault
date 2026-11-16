@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::audit::{self, AuditEvent};
 use crate::backup;
+use crate::details;
 use crate::error::VaultError;
 use crate::keyprotect;
 use crate::kinds::{self, Renewed};
@@ -397,8 +398,8 @@ impl Vault {
     fn new_record(&mut self, new: NewSecret) -> Result<Record, VaultError> {
         model::validate_name(&new.name)?;
         let spec = kinds::spec(new.kind);
-        let site = match (new.site.is_empty(), spec) {
-            (true, Some(spec)) => spec.default_site.to_string(),
+        let site = match (new.site.is_empty(), new.kind.default_site()) {
+            (true, Some(default)) => default.to_string(),
             _ => new.site.clone(),
         };
         model::validate_site(&site)?;
@@ -411,12 +412,18 @@ impl Vault {
             None => (new.value, None),
         };
         let new = NewSecret { value: new_value, ..new };
-        let (value, totp_params) = match new.kind {
+        let (value, totp_params, fields) = match new.kind {
             Kind::TwoFactor => {
                 let (seed, params) = totp::parse_seed_input(&new.value)?;
-                (seed, Some(params))
+                (seed, Some(params), None)
             }
-            _ => (new.value, None),
+            // Personal details are stored as the vault's own object, with the filled fields named.
+            Kind::PersonalDetails => {
+                let (stored, fields) = details::intake(&new.value)?;
+                details::validate(&stored)?;
+                (stored, None, Some(fields))
+            }
+            _ => (new.value, None, None),
         };
         match new.kind {
             Kind::ApiKey if new.rule.is_none() => {
@@ -455,6 +462,7 @@ impl Vault {
                 claimed_at: Some(crate::now_rfc3339()),
                 imported: None,
             }),
+            fields,
             value,
         })
     }
@@ -900,7 +908,10 @@ impl Vault {
 fn describe(record: &Record) -> String {
     match &record.rule {
         Some(rule) => format!("{}; rule {}", record.kind.label(), rule.describe()),
-        None => format!("{} for {}", record.kind.label(), record.site),
+        None => match &record.fields {
+            Some(fields) => format!("{} for {}; fields {}", record.kind.label(), record.site, fields.join(", ")),
+            None => format!("{} for {}", record.kind.label(), record.site),
+        },
     }
 }
 

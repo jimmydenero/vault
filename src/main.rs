@@ -137,6 +137,10 @@ enum KindArg {
     /// A Grok Build login: its auth.json, read whole from standard input with --yes.
     #[value(name = "grok_login")]
     GrokLogin,
+    /// Your real name, address, birthday and phone: asked one field at a time, or v1's JSON
+    /// object read from standard input with --yes.
+    #[value(name = "personal_details")]
+    PersonalDetails,
 }
 
 fn main() -> ExitCode {
@@ -262,6 +266,7 @@ fn add(
         KindArg::ClaudePlan => Kind::ClaudePlan,
         KindArg::CodexLogin => Kind::CodexLogin,
         KindArg::GrokLogin => Kind::GrokLogin,
+        KindArg::PersonalDetails => Kind::PersonalDetails,
     };
     // The rule is checked here for the person to read, and again by the daemon, which never
     // takes a ready-made rule (R7).
@@ -277,10 +282,10 @@ fn add(
         Some(input) => Some(vault::rules::parse_rule(&input.host, input.port, &input.methods, &input.path, &input.header)?),
         None => None,
     };
-    let site = match (&site, &rule, vault::kinds::spec(kind)) {
+    let site = match (&site, &rule, kind.default_site()) {
         (Some(site), _, _) => site.clone(),
         (None, Some(rule), _) => rule.host.clone(),
-        (None, None, Some(spec)) => spec.default_site.to_string(),
+        (None, None, Some(default)) => default.to_string(),
         (None, None, None) => return Err(VaultError::InvalidSecret("give --site".into())),
     };
 
@@ -305,6 +310,10 @@ fn add(
             println!("  (the auth.json you give stops being renewable once the vault renews it)");
         }
     }
+    if kind == Kind::PersonalDetails {
+        println!("  fields: {} (leave any empty)", vault::details::FIELDS.join(", "));
+        println!("  stored and listed only: list shows which fields are filled, never what they say");
+    }
     let stdin_value = !std::io::stdin().is_terminal();
     if stdin_value && !yes {
         return Err(VaultError::InvalidSecret("reading the value from standard input needs --yes".into()));
@@ -313,21 +322,47 @@ fn add(
         println!("Nothing saved.");
         return Ok(());
     }
-    let prompt = match kind {
+    let value = if kind == Kind::PersonalDetails && !stdin_value {
+        read_details()?
+    } else {
+        read_hidden(prompt_for(kind))?
+    };
+    // R27: sent only to a daemon verified as your own user's.
+    let reply = client::add(paths, &name, kind, &site, rule_input.as_ref(), username.as_deref(), &value)?;
+    drop(value);
+    println!("Saved {} {:?} for {}.", reply.secret.kind.label(), reply.secret.name, reply.secret.site);
+    if let Some(fields) = &reply.secret.fields {
+        println!("  filled: {}", fields.join(", "));
+    }
+    print_backup(&reply.backup);
+    Ok(())
+}
+
+/// Personal details, one hidden prompt per field; the empty ones are left out.
+fn read_details() -> Result<SecretValue, VaultError> {
+    let mut fields = Vec::new();
+    for field in vault::details::FIELDS {
+        let label = match field {
+            "name" => "Name",
+            "address" => "Address",
+            "birthday" => "Birthday",
+            _ => "Phone",
+        };
+        fields.push((field, read_hidden(&format!("{label} (hidden; empty to skip): "))?));
+    }
+    Ok(vault::details::given_from_fields(&fields))
+}
+
+fn prompt_for(kind: Kind) -> &'static str {
+    match kind {
         Kind::ApiKey => "API key (hidden): ",
         Kind::Login => "Password (hidden): ",
         Kind::TwoFactor => "2FA seed, base32 or otpauth:// link (hidden): ",
         Kind::ClaudePlan => "Claude plan token, from `claude setup-token` (hidden): ",
         Kind::CodexLogin => "Codex auth.json, whole (hidden; or pipe the file in with --yes): ",
         Kind::GrokLogin => "Grok auth.json, whole (hidden; or pipe the file in with --yes): ",
-    };
-    let value = read_hidden(prompt)?;
-    // R27: sent only to a daemon verified as your own user's.
-    let reply = client::add(paths, &name, kind, &site, rule_input.as_ref(), username.as_deref(), &value)?;
-    drop(value);
-    println!("Saved {} {:?} for {}.", reply.secret.kind.label(), reply.secret.name, reply.secret.site);
-    print_backup(&reply.backup);
-    Ok(())
+        Kind::PersonalDetails => "Personal details, a JSON object (hidden; or pipe it in with --yes): ",
+    }
 }
 
 fn delete(paths: &Paths, name: &str, yes: bool) -> Result<(), VaultError> {
@@ -357,15 +392,18 @@ fn list(paths: &Paths) -> Result<(), VaultError> {
         println!("No secrets yet.");
         return Ok(());
     }
-    println!("{:<32}  {:<24} {:<11} {:>3}  SITE", "ID", "NAME", "KIND", "VER");
+    println!("{:<32}  {:<24} {:<16} {:>3}  SITE", "ID", "NAME", "KIND", "VER");
     for secret in reply.secrets {
+        // Personal details: which fields are filled, never what they say.
+        let fields = secret.fields.as_ref().map(|fields| format!("  (filled: {})", fields.join(", "))).unwrap_or_default();
         println!(
-            "{:<32}  {:<24} {:<11} {:>3}  {}",
+            "{:<32}  {:<24} {:<16} {:>3}  {}{}",
             secret.id,
             secret.name,
             secret.kind.label(),
             secret.version,
-            secret.site
+            secret.site,
+            fields
         );
     }
     Ok(())
