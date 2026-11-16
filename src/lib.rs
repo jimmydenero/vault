@@ -23,6 +23,7 @@ pub mod model;
 pub mod platform;
 pub mod protocol;
 pub mod proxy;
+pub mod report;
 pub mod rules;
 pub mod scrub;
 pub mod secret;
@@ -36,6 +37,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The git commit this build came from (set by build.rs; "unknown" outside a checkout).
 pub const GIT_COMMIT: &str = env!("VAULT_GIT_COMMIT");
+
+/// The target this build is for, e.g. `x86_64-unknown-linux-musl` (set by build.rs).
+pub const TARGET: &str = env!("VAULT_TARGET");
+
+/// What `vault --version` prints after the program's name.
+pub const VERSION_LINE: &str =
+    concat!(env!("CARGO_PKG_VERSION"), " (commit ", env!("VAULT_GIT_COMMIT"), ", ", env!("VAULT_TARGET"), ")");
 
 /// Now, as RFC 3339 in UTC, to the second.
 pub fn now_rfc3339() -> String {

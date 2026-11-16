@@ -47,6 +47,41 @@ pub fn describe(dir: &Path) -> String {
     }
 }
 
+/// Where the vault key is kept, as plain values for `vault status --json`. Information only.
+pub struct KeyState {
+    /// `tpm2` (sealed by systemd-creds, Linux), `file` (the 0600 key file) or `none` (no key).
+    pub kind: &'static str,
+    /// For `file`: why it isn't sealed (no TPM, no systemd-creds, or "macOS keeps it as a file").
+    pub reason: Option<String>,
+    /// A sealed key and a plain copy are both there (an interrupted seal).
+    pub plain_copy_left: bool,
+    /// For `file` on Linux: this machine could seal it now (`vault install` would).
+    pub sealable: bool,
+    /// `describe`, the sentence `vault status` prints.
+    pub detail: String,
+}
+
+pub fn state(dir: &Path) -> KeyState {
+    let plain = fs::symlink_metadata(dir.join(KEY_FILE)).is_ok();
+    let sealed = fs::symlink_metadata(dir.join(SEALED_FILE)).is_ok();
+    let detail = describe(dir);
+    if sealed {
+        return KeyState { kind: "tpm2", reason: None, plain_copy_left: plain, sealable: false, detail };
+    }
+    if !plain {
+        return KeyState { kind: "none", reason: None, plain_copy_left: false, sealable: false, detail: "no vault key".into() };
+    }
+    #[cfg(target_os = "linux")]
+    let (reason, sealable) = match sealed::ready() {
+        Ok(_) => ("not sealed yet, though this machine can seal it: `vault install` seals it".to_string(), true),
+        Err(why) => (why, false),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (reason, sealable) =
+        ("macOS keeps the vault key in a mode-600 file by design (no Keychain, no Secure Enclave)".to_string(), false);
+    KeyState { kind: "file", reason: Some(reason), plain_copy_left: false, sealable, detail }
+}
+
 pub fn key_exists(dir: &Path) -> bool {
     fs::symlink_metadata(dir.join(KEY_FILE)).is_ok() || fs::symlink_metadata(dir.join(SEALED_FILE)).is_ok()
 }
@@ -159,7 +194,7 @@ mod sealed {
     }
 
     /// Why the key can't be sealed here, or the tool to seal it with.
-    fn ready() -> Result<PathBuf, String> {
+    pub(super) fn ready() -> Result<PathBuf, String> {
         let tool = tool().ok_or("systemd-creds isn't installed")?;
         let out = Command::new(&tool)
             .arg("has-tpm2")

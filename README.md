@@ -79,6 +79,18 @@ a Mac:
 
 ## Install and update
 
+From a release, with no Rust toolchain (the Linux builds are static; see
+[docs/releasing.md](docs/releasing.md) for every target and how releases are made):
+
+```sh
+curl -fsSLO https://github.com/volgenic/vault/releases/download/v0.2.0/vault-0.2.0-x86_64-unknown-linux-musl.tar.gz
+curl -fsSLO https://github.com/volgenic/vault/releases/download/v0.2.0/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+tar xzf vault-0.2.0-x86_64-unknown-linux-musl.tar.gz && vault-0.2.0-x86_64-unknown-linux-musl/vault install
+```
+
+Or from source:
+
 ```sh
 cargo build --release
 target/release/vault install
@@ -117,14 +129,15 @@ The `vault` tool can't print a secret, so it is safe for any agent on the machin
 
 | Command | What it does |
 |---|---|
-| `vault install [--for-restore]` | Installs or updates the vault for your user. |
+| `vault install [--for-restore] [--json]` | Installs or updates the vault for your user. `--json`: one JSON object instead of prose, for a program ([docs/json.md](docs/json.md)). |
 | `vault add NAME --kind api-key --host HOST --method GET --path /v1 --header "Authorization: Bearer {key}"` | Adds an API key with its rule. The value is read at a hidden prompt, or from standard input with `--yes`. |
 | `vault add NAME --kind login --site SITE --username USER` | Adds a login. Stored and listed only, for now. |
 | `vault add NAME --kind 2fa --site SITE` | Adds a 2FA seed: base32, or an `otpauth://` link. |
 | `vault delete NAME` | Deletes a secret. Earlier backups keep it. |
 | `vault rename NAME NEW` | Renames a secret; its id, rule and value stay, its version goes up. |
 | `vault list` | Ids, names, kinds, versions and sites. |
-| `vault status` | The program, the daemon, backups and the audit chain. |
+| `vault status [--json]` | The program, the daemon, backups and the audit chain. `--json`: one JSON object for a program, with a `problems` list and the command for each ([docs/json.md](docs/json.md)); no secret names. |
+| `vault --version` | The version, the commit it was built from and the target. |
 | `vault audit [--all]` | The audit log, with its hash chain checked. |
 | `vault verify-backup [--with-recovery-key]` | Checks the newest backup decrypts and matches the vault. |
 | `vault backup` | Writes (or re-checks) the current backup now. |
@@ -165,6 +178,8 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
 ## Build
 
 A Rust (Cargo) project with no native shim: `cargo build` is the gate, on macOS or Linux.
+Release builds (static Linux, and macOS on a Mac): `scripts/release.sh`, described in
+[docs/releasing.md](docs/releasing.md).
 
 ## Tests: none, as an experiment
 

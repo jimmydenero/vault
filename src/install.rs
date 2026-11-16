@@ -24,6 +24,7 @@ use std::time::Duration;
 use crate::client;
 use crate::error::VaultError;
 use crate::keyprotect;
+use crate::report::{self, BootJson, ErrorJson, InstallJson, InstallProgramJson, InstallServiceJson, InstallVaultJson};
 use crate::store::{self, OwnerPaths, Paths};
 use crate::vault;
 
@@ -72,11 +73,18 @@ fn ensure_dir(dir: &Path) -> Result<(), VaultError> {
     Ok(())
 }
 
-/// Copies this build to the program path, through a temporary file and a rename.
-fn install_program(paths: &Paths, exe: &Path) -> Result<(), VaultError> {
+/// Copies this build to the program path, through a temporary file and a rename, and says what
+/// that was: `installed`, `updated`, `reinstalled` (the same bytes) or `in_place`.
+fn install_program(paths: &Paths, exe: &Path) -> Result<&'static str, VaultError> {
     if exe == paths.program {
-        return Ok(());
+        return Ok("in_place");
     }
+    let action = match fs::read(&paths.program) {
+        Err(_) => "installed",
+        Ok(old) => {
+            if fs::read(exe).is_ok_and(|new| new == old) { "reinstalled" } else { "updated" }
+        }
+    };
     let temp = paths.bin_dir.join(".vault.new");
     let _ = fs::remove_file(&temp);
     let bytes = fs::read(exe)?;
@@ -86,11 +94,43 @@ fn install_program(paths: &Paths, exe: &Path) -> Result<(), VaultError> {
         file.sync_all()?;
     }
     fs::rename(&temp, &paths.program)?;
-    Ok(())
+    Ok(action)
 }
 
-/// `vault install`: as the owner, no sudo, no questions.
-pub fn install(for_restore: bool) -> Result<(), VaultError> {
+/// Prints a line of the install's prose, unless the result is to be JSON.
+macro_rules! say {
+    ($json:expr, $($arg:tt)*) => {
+        if !$json {
+            println!($($arg)*);
+        }
+    };
+}
+
+/// `vault install`: as the owner, no sudo, no questions, no terminal needed. With `json`, prints
+/// one JSON object (`report::InstallJson`) instead of prose, errors included.
+pub fn install(for_restore: bool, json: bool) -> Result<(), VaultError> {
+    let mut out = InstallJson::new(for_restore);
+    let result = install_steps(for_restore, json, &mut out);
+    if json {
+        out.ok = result.is_ok();
+        out.error = result.as_ref().err().map(ErrorJson::from);
+        if out.program.is_some() {
+            let status = report::gather_status(&Paths::current());
+            if let Some(vault) = out.vault.as_mut().filter(|v| v.action == "kept") {
+                vault.identity = status.vault.identity.clone();
+                vault.vault_id = status.vault.vault_id.clone();
+                vault.recovery_fingerprint = status.vault.recovery_fingerprint.clone();
+            }
+            out.problems = status.problems.clone();
+            out.status = Some(status);
+        }
+        let text = serde_json::to_string_pretty(&out).map_err(|_| VaultError::Io("JSON encoding".into()))?;
+        println!("{text}");
+    }
+    result
+}
+
+fn install_steps(for_restore: bool, json: bool, out: &mut InstallJson) -> Result<(), VaultError> {
     let uid = unsafe { libc::getuid() };
     if uid == 0 || unsafe { libc::geteuid() } == 0 {
         return Err(VaultError::Io("run `vault install` as yourself, without sudo".into()));
@@ -111,37 +151,97 @@ pub fn install(for_restore: bool) -> Result<(), VaultError> {
     // Stop a running daemon before replacing the program.
     service::stop(uid);
     let exe = std::env::current_exe()?.canonicalize()?;
-    install_program(&paths, &exe)?;
-    println!("program:  {}", paths.program.display());
+    let action = install_program(&paths, &exe)?;
+    out.program = Some(InstallProgramJson {
+        action,
+        path: paths.program.display().to_string(),
+        from: exe.display().to_string(),
+        version: crate::VERSION.into(),
+        commit: crate::GIT_COMMIT.into(),
+    });
+    say!(json, "program:  {}", paths.program.display());
 
     if store::vault_exists(&paths) {
-        println!("vault:    kept");
+        say!(json, "vault:    kept");
+        out.vault = Some(InstallVaultJson {
+            action: "kept",
+            identity: None,
+            vault_id: None,
+            recovery_fingerprint: None,
+            kit_written: None,
+        });
         #[cfg(target_os = "linux")]
-        reseal_if_possible(&paths);
+        {
+            let note = reseal_if_possible(&paths);
+            say!(json, "key:      {note}");
+            out.key_note = Some(note);
+        }
     } else if for_restore || keyprotect::key_exists(&paths.dir) {
-        println!("vault:    none (restore one with `vault restore FILE`)");
+        say!(json, "vault:    none (restore one with `vault restore FILE`)");
+        out.vault = Some(InstallVaultJson {
+            action: "none",
+            identity: None,
+            vault_id: None,
+            recovery_fingerprint: None,
+            kit_written: None,
+        });
     } else {
         let report = vault::init(&paths, &owner.default_kit, &owner.default_mirror_dir())?;
-        println!("vault:    {} made (identity {})", report.vault_id, report.vault_identity);
-        println!("key:      {}", report.key_protection);
-        println!("kit:      {} (holds the recovery key for backups; stash it when you like)", report.kit_path.display());
+        say!(json, "vault:    {} made (identity {})", report.vault_id, report.vault_identity);
+        say!(json, "key:      {}", report.key_protection);
+        say!(
+            json,
+            "kit:      {} (holds the recovery key for backups; stash it when you like)",
+            report.kit_path.display()
+        );
+        out.vault = Some(InstallVaultJson {
+            action: "made",
+            identity: Some(report.vault_identity.clone()),
+            vault_id: Some(report.vault_id.clone()),
+            recovery_fingerprint: Some(report.recovery_fingerprint.clone()),
+            kit_written: Some(report.kit_path.display().to_string()),
+        });
+        out.key_note = Some(report.key_protection.clone());
     }
 
-    match service::start(&paths, &owner)? {
-        Started::Yes => {}
-        Started::No(why) => {
-            println!("daemon:   not started: {why}");
-            println!("          start it yourself: {} daemon", paths.program.display());
-            return Ok(());
+    let mut service_out = InstallServiceJson {
+        file: paths.service_file.display().to_string(),
+        started: false,
+        not_started_reason: None,
+        lingering: None,
+        pid: None,
+    };
+    let started = service::start(&paths, &owner, json, &mut service_out);
+    let started = match started {
+        Ok(started) => started,
+        Err(error) => {
+            out.service = Some(service_out);
+            return Err(error);
         }
+    };
+    if let Started::No(why) = started {
+        say!(json, "daemon:   not started: {why}");
+        say!(json, "          start it yourself: {} daemon", paths.program.display());
+        service_out.not_started_reason = Some(why);
+        out.service = Some(service_out);
+        return Ok(());
     }
     if client::wait_for_daemon(&paths, Duration::from_secs(30)) {
         let status = client::status(&paths)?;
-        println!("daemon:   running (pid {}), socket {}", status.pid, paths.socket.display());
+        say!(json, "daemon:   running (pid {}), socket {}", status.pid, paths.socket.display());
+        service_out.started = true;
+        service_out.pid = Some(status.pid);
+        out.service = Some(service_out);
         Ok(())
     } else {
+        out.service = Some(service_out);
         Err(VaultError::Daemon(format!("the daemon didn't answer within 30s; its log is {}", paths.daemon_log.display())))
     }
+}
+
+/// Whether the vault comes back by itself after a restart, for `vault status --json`.
+pub fn boot_state(paths: &Paths, uid: u32, user: Option<&str>) -> BootJson {
+    service::boot_state(paths, uid, user)
 }
 
 /// Whether `service::start` started the daemon.
@@ -153,17 +253,17 @@ enum Started {
 }
 
 /// An existing vault whose key is still the plain file (made before sealing existed, on a
-/// machine that got a TPM, or just restored): seal it now if this machine can.
+/// machine that got a TPM, or just restored): seal it now if this machine can. Says how the key
+/// is kept now.
 #[cfg(target_os = "linux")]
-fn reseal_if_possible(paths: &Paths) {
+fn reseal_if_possible(paths: &Paths) -> String {
     let plain = paths.dir.join(keyprotect::KEY_FILE);
     if fs::symlink_metadata(&plain).is_err() {
-        println!("key:      {}", keyprotect::describe(&paths.dir));
-        return;
+        return keyprotect::describe(&paths.dir);
     }
     match keyprotect::load(&paths.dir) {
-        Ok(key) => println!("key:      {}", keyprotect::protect(&paths.dir, &key)),
-        Err(error) => println!("key:      can't read the key file to seal it: {error}"),
+        Ok(key) => keyprotect::protect(&paths.dir, &key),
+        Err(error) => format!("can't read the key file to seal it: {error}"),
     }
 }
 
@@ -174,6 +274,7 @@ mod launchd {
 
     use super::{Started, run};
     use crate::error::VaultError;
+    use crate::report::{BootJson, InstallServiceJson};
     use crate::store::{self, OwnerPaths, Paths};
 
     pub fn stop(uid: u32) {
@@ -181,11 +282,35 @@ mod launchd {
         let _ = Command::new("/bin/launchctl").args(["bootout", &format!("{domain}/{}", store::DAEMON_LABEL)]).output();
     }
 
-    pub fn start(paths: &Paths, owner: &OwnerPaths) -> Result<Started, VaultError> {
+    pub fn start(
+        paths: &Paths,
+        owner: &OwnerPaths,
+        _json: bool,
+        _out: &mut InstallServiceJson,
+    ) -> Result<Started, VaultError> {
         let domain = format!("gui/{}", owner.uid);
         store::write_atomic_mode(&paths.service_file, daemon_plist(paths).as_bytes(), 0o644)?;
         run("/bin/launchctl", &["bootstrap", &domain, &paths.service_file.display().to_string()])?;
         Ok(Started::Yes)
+    }
+
+    /// The LaunchAgent is there and loaded in your login (`launchctl print`), so it starts at
+    /// each login and launchd keeps it running.
+    pub fn boot_state(paths: &Paths, uid: u32, _user: Option<&str>) -> BootJson {
+        let present = paths.service_file.is_file();
+        let loaded = Command::new("/bin/launchctl")
+            .args(["print", &format!("gui/{uid}/{}", store::DAEMON_LABEL)])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|out| out.status.success());
+        BootJson {
+            mechanism: "launch-agent",
+            persistent: present && loaded,
+            systemd: None,
+            lingering: None,
+            service_enabled: None,
+            launch_agent_loaded: Some(loaded),
+        }
     }
 
     pub fn xml_escape(text: &str) -> String {
@@ -225,6 +350,7 @@ mod systemd {
     use super::{Started, run_with};
     use crate::error::VaultError;
     use crate::platform;
+    use crate::report::{BootJson, InstallServiceJson};
     use crate::store::{self, OwnerPaths, Paths};
 
     const SYSTEMCTL: &str = "/usr/bin/systemctl";
@@ -291,34 +417,59 @@ mod systemd {
         )
     }
 
-    pub fn start(paths: &Paths, owner: &OwnerPaths) -> Result<Started, VaultError> {
+    pub fn start(
+        paths: &Paths,
+        owner: &OwnerPaths,
+        json: bool,
+        out: &mut InstallServiceJson,
+    ) -> Result<Started, VaultError> {
         store::write_atomic_mode(&paths.service_file, unit(paths).as_bytes(), 0o644)?;
-        println!("service:  {}", paths.service_file.display());
+        say!(json, "service:  {}", paths.service_file.display());
         if !platform::systemd_booted() {
             return Ok(Started::No("this machine isn't running systemd".into()));
         }
         // Lingering first: it starts the user's service manager now and at every boot, with
         // nobody logged in. Turning it on for yourself needs no root on most distributions
-        // (polkit's `set-self-linger`); where it does, say how.
-        let lingering = run_with(LOGINCTL, &["enable-linger", &owner.name], &[]).is_ok()
+        // (polkit's `set-self-linger`); where it does, say how. `--no-ask-password`: never a
+        // polkit prompt, with or without a terminal (R33).
+        let lingering = run_with(LOGINCTL, &["--no-ask-password", "enable-linger", &owner.name], &[]).is_ok()
             || linger_is_on(&owner.name);
+        out.lingering = Some(lingering);
         if lingering {
-            println!("boot:     starts at boot with nobody logged in (lingering is on for {})", owner.name);
+            say!(json, "boot:     starts at boot with nobody logged in (lingering is on for {})", owner.name);
         } else {
-            println!("boot:     lingering couldn't be turned on, so the vault runs only while you're logged in.");
-            println!("          To serve after a reboot with nobody logged in, run once:");
-            println!("            sudo loginctl enable-linger {}", owner.name);
+            say!(json, "boot:     lingering couldn't be turned on, so the vault runs only while you're logged in.");
+            say!(json, "          To serve after a reboot with nobody logged in, run once:");
+            say!(json, "            sudo loginctl enable-linger {}", owner.name);
         }
         let env = user_env(owner.uid);
         let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        run_with(SYSTEMCTL, &["--user", "daemon-reload"], &env)?;
-        run_with(SYSTEMCTL, &["--user", "enable", store::DAEMON_LABEL], &env)?;
-        run_with(SYSTEMCTL, &["--user", "restart", store::DAEMON_LABEL], &env)?;
+        run_with(SYSTEMCTL, &["--user", "--no-ask-password", "daemon-reload"], &env)?;
+        run_with(SYSTEMCTL, &["--user", "--no-ask-password", "enable", store::DAEMON_LABEL], &env)?;
+        run_with(SYSTEMCTL, &["--user", "--no-ask-password", "restart", store::DAEMON_LABEL], &env)?;
         Ok(Started::Yes)
     }
 
+    /// Lingering is systemd-logind's flag file `/var/lib/systemd/linger/<user>`; the unit is
+    /// enabled when its link is in `default.target.wants`. Files only: nothing is started.
+    pub fn boot_state(paths: &Paths, _uid: u32, user: Option<&str>) -> BootJson {
+        let systemd = platform::systemd_booted();
+        let lingering = user.map(|name| std::path::Path::new("/var/lib/systemd/linger").join(name).exists());
+        let enabled = paths.service_file.parent().map(|dir| {
+            std::fs::symlink_metadata(dir.join("default.target.wants").join(store::DAEMON_LABEL)).is_ok()
+        });
+        BootJson {
+            mechanism: "systemd-user-service",
+            persistent: systemd && lingering == Some(true) && enabled == Some(true),
+            systemd: Some(systemd),
+            lingering,
+            service_enabled: enabled,
+            launch_agent_loaded: None,
+        }
+    }
+
     fn linger_is_on(name: &str) -> bool {
-        run_with(LOGINCTL, &["show-user", name, "--property=Linger", "--value"], &[])
+        run_with(LOGINCTL, &["--no-ask-password", "show-user", name, "--property=Linger", "--value"], &[])
             .is_ok_and(|out| out.trim() == "yes")
     }
 }

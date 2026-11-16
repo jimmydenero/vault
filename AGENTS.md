@@ -12,6 +12,7 @@ A Rust (Cargo) project for macOS and Linux.
 cargo build                                    # the gate (on Linux it needs no OpenSSL headers)
 cargo check --target aarch64-apple-darwin      # from Linux: the macOS code still type-checks
 cargo run                                      # the command-line executable
+scripts/release.sh                             # release archives into dist/ (docs/releasing.md)
 ```
 
 - `src/lib.rs`: the library crate. Decisions live here as functions over plain values.

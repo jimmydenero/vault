@@ -1,4 +1,5 @@
-// Records the git commit the build came from, for `vault status`.
+// Records the git commit the build came from and the target it is for, for `vault status` and
+// `vault --version`.
 
 use std::process::Command;
 
@@ -18,5 +19,7 @@ fn main() {
         .output()
         .ok()
         .is_some_and(|out| out.status.success() && !out.stdout.is_empty());
+    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".into());
+    println!("cargo:rustc-env=VAULT_TARGET={target}");
     println!("cargo:rustc-env=VAULT_GIT_COMMIT={commit}{}", if dirty { "-modified" } else { "" });
 }
