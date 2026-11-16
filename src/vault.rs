@@ -38,6 +38,10 @@ pub struct NewSecret {
     pub username: Option<String>,
     /// For a 2FA seed: the base32 seed or the otpauth link.
     pub value: SecretValue,
+    /// An app secret only: the application it belongs to (required for one).
+    pub app: Option<String>,
+    /// An app secret only: it may be leased to builds (`lease`).
+    pub leasable: bool,
 }
 
 pub struct InitReport {
@@ -398,8 +402,26 @@ impl Vault {
     fn new_record(&mut self, new: NewSecret) -> Result<Record, VaultError> {
         model::validate_name(&new.name)?;
         let spec = kinds::spec(new.kind);
-        let site = match (new.site.is_empty(), new.kind.default_site()) {
-            (true, Some(default)) => default.to_string(),
+        // An app secret names its application; nothing else has one or may be leased (#7446).
+        let app = match (new.kind, &new.app) {
+            (Kind::AppSecret, Some(app)) => {
+                model::validate_app(app)?;
+                Some(app.clone())
+            }
+            (Kind::AppSecret, None) => {
+                return Err(VaultError::InvalidSecret("an app secret needs the application it belongs to".into()));
+            }
+            (_, Some(_)) => {
+                return Err(VaultError::InvalidSecret("only an app_secret belongs to an application".into()));
+            }
+            (_, None) => None,
+        };
+        if new.leasable && new.kind != Kind::AppSecret {
+            return Err(VaultError::InvalidSecret("only an app_secret may be leased to builds".into()));
+        }
+        let site = match (new.site.is_empty(), new.kind.default_site(), &app) {
+            (true, Some(default), _) => default.to_string(),
+            (true, None, Some(app)) => app.clone(),
             _ => new.site.clone(),
         };
         model::validate_site(&site)?;
@@ -438,6 +460,9 @@ impl Vault {
         if let Some(spec) = spec {
             (spec.validate)(&value)?;
         }
+        if new.kind == Kind::AppSecret {
+            crate::lease::validate_value(&value)?;
+        }
         let mut id = store::new_random_id()?;
         while self.doc.records.iter().any(|record| record.id == id) {
             id = store::new_random_id()?;
@@ -463,6 +488,8 @@ impl Vault {
                 imported: None,
             }),
             fields,
+            leasable: if new.kind == Kind::AppSecret { Some(new.leasable) } else { None },
+            app,
             value,
         })
     }
@@ -543,6 +570,8 @@ impl Vault {
                     rule: None,
                     username: None,
                     value,
+                    app: None,
+                    leasable: false,
                 };
                 let record = self.new_record(new)?;
                 let change = (record.name.clone(), record.id.clone(), "claude_plan added".to_string());
@@ -670,6 +699,8 @@ impl Vault {
                     rule: None,
                     username: None,
                     value: given,
+                    app: None,
+                    leasable: false,
                 })?;
                 record.handover = Some(unclaimed);
                 let change = (record.name.clone(), record.id.clone(), format!("{} added, unclaimed", kind.label()));
@@ -908,9 +939,14 @@ impl Vault {
 fn describe(record: &Record) -> String {
     match &record.rule {
         Some(rule) => format!("{}; rule {}", record.kind.label(), rule.describe()),
-        None => match &record.fields {
-            Some(fields) => format!("{} for {}; fields {}", record.kind.label(), record.site, fields.join(", ")),
-            None => format!("{} for {}", record.kind.label(), record.site),
+        None => match (&record.fields, &record.app) {
+            (Some(fields), _) => format!("{} for {}; fields {}", record.kind.label(), record.site, fields.join(", ")),
+            (None, Some(app)) => format!(
+                "{} for application {app:?}; {}",
+                record.kind.label(),
+                if record.may_lease() { "may be leased to builds" } else { "not leasable" }
+            ),
+            (None, None) => format!("{} for {}", record.kind.label(), record.site),
         },
     }
 }
@@ -939,6 +975,8 @@ pub(crate) fn same_records(a: &[Record], b: &[Record]) -> bool {
                     && x.totp == y.totp
                     && x.expires_at == y.expires_at
                     && x.handover == y.handover
+                    && x.app == y.app
+                    && x.leasable == y.leasable
                     && x.value.same_as(&y.value)
             })
         })

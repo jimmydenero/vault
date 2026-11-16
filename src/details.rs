@@ -107,7 +107,7 @@ fn check_field(field: &str, value: &SecretValue) -> Result<Option<SecretValue>, 
 
 /// Writes `"field":"<value>"` with the value escaped as a JSON string, straight into a wiped
 /// buffer: `"` and `\` escaped, a control character as `\uXXXX`.
-fn write_field(out: &mut WipingBuf, field: &str, value: &[u8]) {
+pub(crate) fn write_field(out: &mut WipingBuf, field: &str, value: &[u8]) {
     out.extend_from_slice(b"\"");
     out.extend_from_slice(field.as_bytes());
     out.extend_from_slice(b"\":\"");

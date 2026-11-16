@@ -73,6 +73,13 @@ enum Command {
         /// Login: the username.
         #[arg(long)]
         username: Option<String>,
+        /// App secret: the application it belongs to.
+        #[arg(long)]
+        app: Option<String>,
+        /// App secret: it may be leased to builds (sealed to one build's own key, for at most a
+        /// day). Without it the secret is stored and listed only. Set only when it is added.
+        #[arg(long)]
+        leasable: bool,
         /// Don't ask for confirmation (needed when the value comes from standard input).
         #[arg(long)]
         yes: bool,
@@ -141,6 +148,11 @@ enum KindArg {
     /// object read from standard input with --yes.
     #[value(name = "personal_details")]
     PersonalDetails,
+    /// One of an application's build or deploy secrets (an npm token, a database URL), for the
+    /// application --app names. Used only by `lease`, sealed to one build's own key, and only with
+    /// --leasable.
+    #[value(name = "app_secret")]
+    AppSecret,
 }
 
 fn main() -> ExitCode {
@@ -151,8 +163,8 @@ fn main() -> ExitCode {
         Command::Install { for_restore, json } => install::install(for_restore, json),
         Command::InstallMirror { yes } => install::install_mirror(yes),
         Command::ConfirmKit => confirm_kit(&paths),
-        Command::Add { name, kind, site, host, port, methods, path, header, username, yes } => {
-            add(&paths, name, kind, site, host, port, methods, path, header, username, yes)
+        Command::Add { name, kind, site, host, port, methods, path, header, username, app, leasable, yes } => {
+            add(&paths, name, kind, site, host, port, methods, path, header, username, app, leasable, yes)
         }
         Command::Delete { name, yes } => delete(&paths, &name, yes),
         Command::Rename { name, new_name } => rename(&paths, &name, &new_name),
@@ -255,6 +267,8 @@ fn add(
     path: String,
     header: String,
     username: Option<String>,
+    app: Option<String>,
+    leasable: bool,
     yes: bool,
 ) -> Result<(), VaultError> {
     let status = client::status(paths)?;
@@ -267,7 +281,17 @@ fn add(
         KindArg::CodexLogin => Kind::CodexLogin,
         KindArg::GrokLogin => Kind::GrokLogin,
         KindArg::PersonalDetails => Kind::PersonalDetails,
+        KindArg::AppSecret => Kind::AppSecret,
     };
+    match (kind, &app) {
+        (Kind::AppSecret, None) => return Err(VaultError::InvalidSecret("an app secret needs --app".into())),
+        (Kind::AppSecret, Some(_)) => {}
+        (_, Some(_)) => return Err(VaultError::InvalidSecret("--app is for --kind app_secret only".into())),
+        (_, None) if leasable => {
+            return Err(VaultError::InvalidSecret("--leasable is for --kind app_secret only".into()));
+        }
+        (_, None) => {}
+    }
     // The rule is checked here for the person to read, and again by the daemon, which never
     // takes a ready-made rule (R7).
     let rule_input = match kind {
@@ -282,11 +306,12 @@ fn add(
         Some(input) => Some(vault::rules::parse_rule(&input.host, input.port, &input.methods, &input.path, &input.header)?),
         None => None,
     };
-    let site = match (&site, &rule, kind.default_site()) {
-        (Some(site), _, _) => site.clone(),
-        (None, Some(rule), _) => rule.host.clone(),
-        (None, None, Some(default)) => default.to_string(),
-        (None, None, None) => return Err(VaultError::InvalidSecret("give --site".into())),
+    let site = match (&site, &rule, kind.default_site(), &app) {
+        (Some(site), _, _, _) => site.clone(),
+        (None, Some(rule), _, _) => rule.host.clone(),
+        (None, None, Some(default), _) => default.to_string(),
+        (None, None, None, Some(app)) => app.clone(),
+        (None, None, None, None) => return Err(VaultError::InvalidSecret("give --site".into())),
     };
 
     println!("Adding {} {name:?} for {site}", kind.label());
@@ -310,6 +335,13 @@ fn add(
             println!("  (the auth.json you give stops being renewable once the vault renews it)");
         }
     }
+    if kind == Kind::AppSecret {
+        if leasable {
+            println!("  used only by `lease`: sealed to one build's own key, for at most a day; never shown");
+        } else {
+            println!("  stored and listed only: without --leasable no build can lease it");
+        }
+    }
     if kind == Kind::PersonalDetails {
         println!("  fields: {} (leave any empty)", vault::details::FIELDS.join(", "));
         println!("  stored and listed only: list shows which fields are filled, never what they say");
@@ -328,7 +360,17 @@ fn add(
         read_hidden(prompt_for(kind))?
     };
     // R27: sent only to a daemon verified as your own user's.
-    let reply = client::add(paths, &name, kind, &site, rule_input.as_ref(), username.as_deref(), &value)?;
+    let reply = client::add(
+        paths,
+        &name,
+        kind,
+        &site,
+        rule_input.as_ref(),
+        username.as_deref(),
+        app.as_deref(),
+        leasable,
+        &value,
+    )?;
     drop(value);
     println!("Saved {} {:?} for {}.", reply.secret.kind.label(), reply.secret.name, reply.secret.site);
     if let Some(fields) = &reply.secret.fields {
@@ -362,6 +404,7 @@ fn prompt_for(kind: Kind) -> &'static str {
         Kind::CodexLogin => "Codex auth.json, whole (hidden; or pipe the file in with --yes): ",
         Kind::GrokLogin => "Grok auth.json, whole (hidden; or pipe the file in with --yes): ",
         Kind::PersonalDetails => "Personal details, a JSON object (hidden; or pipe it in with --yes): ",
+        Kind::AppSecret => "App secret's value (hidden; or pipe it in with --yes): ",
     }
 }
 
@@ -395,7 +438,12 @@ fn list(paths: &Paths) -> Result<(), VaultError> {
     println!("{:<32}  {:<24} {:<16} {:>3}  SITE", "ID", "NAME", "KIND", "VER");
     for secret in reply.secrets {
         // Personal details: which fields are filled, never what they say.
-        let fields = secret.fields.as_ref().map(|fields| format!("  (filled: {})", fields.join(", "))).unwrap_or_default();
+        let mut fields = secret.fields.as_ref().map(|fields| format!("  (filled: {})", fields.join(", "))).unwrap_or_default();
+        // App secrets: the application, and whether builds may lease it; never the value.
+        if let Some(app) = &secret.app {
+            let lease = if secret.leasable == Some(true) { "leasable" } else { "not leasable" };
+            fields = format!("  (app {app}, {lease})");
+        }
         println!(
             "{:<32}  {:<24} {:<16} {:>3}  {}{}",
             secret.id,

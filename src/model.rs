@@ -42,6 +42,12 @@ pub enum Kind {
     /// #7435). Stored and listed only, for now: no request gives a value back.
     #[serde(rename = "personal_details")]
     PersonalDetails,
+    /// One of an application's build and deploy secrets (an npm token, a database URL), stored
+    /// for the application it names (#7446). Its only use is `lease`: sealed to one build's own
+    /// key, for at most a day, and only when it was added as leasable (`lease`). No other request
+    /// uses it or gives its value back.
+    #[serde(rename = "app_secret")]
+    AppSecret,
 }
 
 impl Kind {
@@ -54,11 +60,12 @@ impl Kind {
             Kind::CodexLogin => "codex_login",
             Kind::GrokLogin => "grok_login",
             Kind::PersonalDetails => "personal_details",
+            Kind::AppSecret => "app_secret",
         }
     }
 
     /// Every kind, in the order listings count them.
-    pub const ALL: [Kind; 7] = [
+    pub const ALL: [Kind; 8] = [
         Kind::ApiKey,
         Kind::Login,
         Kind::TwoFactor,
@@ -66,6 +73,7 @@ impl Kind {
         Kind::CodexLogin,
         Kind::GrokLogin,
         Kind::PersonalDetails,
+        Kind::AppSecret,
     ];
 
     /// The site a secret of this kind gets when none is given, for a kind not tied to one site.
@@ -93,6 +101,12 @@ pub struct SecretSummary {
     /// Personal details only: which fields are filled (`details::FIELDS`), never their values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<Vec<String>>,
+    /// An app secret only: the application it belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    /// An app secret only: whether it may be leased to builds (`lease`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leasable: Option<bool>,
 }
 
 /// One stored secret.
@@ -129,6 +143,13 @@ pub(crate) struct Record {
     /// may use without opening the value (#7435).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<Vec<String>>,
+    /// For an app secret: the application it belongs to (#7446).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    /// For an app secret: it may be leased to builds, as said when it was added. Without it,
+    /// `lease` refuses the secret (`not_leasable`). Nothing changes it after the add.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leasable: Option<bool>,
     #[serde(with = "secret_bytes")]
     pub value: SecretValue,
 }
@@ -160,7 +181,14 @@ impl Record {
             site: self.site.clone(),
             version: self.version,
             fields: self.fields.clone(),
+            app: self.app.clone(),
+            leasable: if self.kind == Kind::AppSecret { Some(self.leasable == Some(true)) } else { None },
         }
+    }
+
+    /// Whether `lease` may seal this record's value to a build: an app secret added as leasable.
+    pub fn may_lease(&self) -> bool {
+        self.kind == Kind::AppSecret && self.leasable == Some(true)
     }
 }
 
@@ -219,10 +247,11 @@ pub(crate) struct VaultDoc {
 ///   of letting it call the file damaged (R36).
 /// - **4**: the `codex_login` and `grok_login` kinds and a record's `handover` (#7380).
 /// - **5**: the `personal_details` kind and a record's `fields` (#7435).
-pub(crate) const VAULT_FORMAT: u32 = 5;
+/// - **6**: the `app_secret` kind and a record's `app` and `leasable` (#7446).
+pub(crate) const VAULT_FORMAT: u32 = 6;
 
 /// Every format this build reads. Older ones are migrated to `VAULT_FORMAT` when read.
-pub(crate) const READABLE_FORMATS: [u32; 5] = [1, 2, 3, 4, 5];
+pub(crate) const READABLE_FORMATS: [u32; 6] = [1, 2, 3, 4, 5, 6];
 
 /// A secret as a request names it: by its name, or by its stable id.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -387,6 +416,18 @@ pub fn validate_site(site: &str) -> Result<(), VaultError> {
         Ok(())
     } else {
         Err(VaultError::InvalidSecret("the site must be 1 to 200 printable characters".into()))
+    }
+}
+
+/// An application's name, as an app secret records it: 1 to 128 printable characters.
+pub fn validate_app(app: &str) -> Result<(), VaultError> {
+    let ok = !app.trim().is_empty()
+        && app.chars().count() <= 128
+        && app.chars().all(|c| !c.is_control() && c != '\u{7f}');
+    if ok {
+        Ok(())
+    } else {
+        Err(VaultError::InvalidSecret("the application must be 1 to 128 printable characters".into()))
     }
 }
 

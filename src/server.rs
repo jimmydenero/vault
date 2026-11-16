@@ -32,7 +32,7 @@ use crate::platform::{self, Peer};
 use crate::protocol::{
     self, AddReply, AddSealedReply, AuditReply, BackupReply, ClaimReply, ConfirmKitReply, Envelope, ErrorReply, Framed,
     HealthReply, ImportLoginReply, ImportReply, ImportedLogin, ImportedPlan, ListReply, MirrorPlanReply, OkReply,
-    ProxyReplyOut, ReadBackupReply, RenameReply, Request, ResetReply, RestoreReply, StatusReply, TotpReply,
+    LeaseReply, LeasedSecret, ProxyReplyOut, ReadBackupReply, RenameReply, Request, ResetReply, RestoreReply, StatusReply, TotpReply,
     VerifyBackupReply,
 };
 use crate::proxy::{self, ProxyRequest};
@@ -41,6 +41,7 @@ use crate::store::{self, OwnerPaths, Paths};
 use crate::stream::{self, Streamer};
 use crate::vault::{self, ImportOutcome, NewSecret, Vault};
 use crate::intake;
+use crate::lease;
 
 /// After a renewal that failed (not refused), the vault sends none for that login for this long,
 /// so calls during a token server's outage don't each send one.
@@ -546,7 +547,16 @@ impl Server {
                         (None, Some(rule)) => rule.host.clone(),
                         (None, None) => String::new(),
                     };
-                    let new = NewSecret { name: sealed.name, kind, site, rule, username: sealed.username, value: sealed.value };
+                    let new = NewSecret {
+                        name: sealed.name,
+                        kind,
+                        site,
+                        rule,
+                        username: sealed.username,
+                        app: sealed.app,
+                        leasable: sealed.leasable,
+                        value: sealed.value,
+                    };
                     self.with_vault(|vault| vault.put(new, replace))
                         .map(|(secret, backup, replaced)| AddSealedReply { ok: true, secret, replaced, backup })
                 })();
@@ -648,7 +658,10 @@ impl Server {
                 self.audit(with_peer(AuditEvent::new("audit", "ok"), peer));
                 reply(stream, &peer.envelope, &report)
             }
-            Request::Add { name, kind, site, rule, username, value } => {
+            Request::Lease { job, recipient, secrets, ttl_seconds } => {
+                self.lease(stream, peer, &job, &recipient, &secrets, ttl_seconds)
+            }
+            Request::Add { name, kind, site, rule, username, app, leasable, value } => {
                 let result = (|| {
                     let rule = match (kind, rule) {
                         (Kind::ApiKey, Some(input)) => Some(rules::parse_rule(
@@ -661,7 +674,7 @@ impl Server {
                         (Kind::ApiKey, None) => return Err(VaultError::InvalidRule("an API key needs a rule".into())),
                         _ => None,
                     };
-                    let new = NewSecret { name: name.clone(), kind, site, rule, username, value };
+                    let new = NewSecret { name: name.clone(), kind, site, rule, username, app, leasable, value };
                     self.with_vault(|vault| vault.add(new))
                         .map(|(secret, backup)| AddReply { ok: true, secret, backup })
                 })();
@@ -790,6 +803,60 @@ impl Server {
                     Ok(OkReply { ok: true })
                 });
                 self.finish(stream, peer, "mirror-report", None, result)
+            }
+        }
+    }
+
+    /// `lease` (#7446): seals each named leasable app secret to the job's own key, with the job and
+    /// the expiry inside, and answers ciphertext only. One audit line per secret (its name and id,
+    /// the job, the recipient key's fingerprint, the expiry, the caller), flushed to disk before
+    /// the answer leaves (R28); no line, no lease. A refusal is one line naming the refused secrets.
+    fn lease(
+        &self,
+        out: &mut UnixStream,
+        peer: &Caller,
+        job: &str,
+        recipient: &str,
+        secrets: &[SecretRef],
+        ttl_seconds: u64,
+    ) -> std::io::Result<()> {
+        let result = (|| -> Result<LeaseReply, VaultError> {
+            let terms = lease::terms(job, recipient, ttl_seconds, crate::now_unix())?;
+            lease::check_secrets(secrets)?;
+            let doc = self.snapshot()?;
+            let (records, missing) = lease::choose(&doc, secrets)?;
+            let mut sealed = Vec::with_capacity(records.len());
+            for record in &records {
+                sealed.push(LeasedSecret {
+                    name: record.name.clone(),
+                    id: record.id.clone(),
+                    sealed_base64: lease::seal(record, &terms)?,
+                });
+            }
+            for record in &records {
+                let mut event = AuditEvent::named("lease", &record.name, "ok");
+                event.secret_id = Some(record.id.clone());
+                event.detail = Some(terms.describe());
+                self.record(with_peer(event, peer))?;
+            }
+            if records.is_empty() {
+                let mut event = AuditEvent::new("lease", "ok: nothing held");
+                event.detail = Some(format!("{}; none of the names is in the vault", terms.describe()));
+                self.audit(with_peer(event, peer));
+            }
+            Ok(LeaseReply { ok: true, sealed, missing, expires_at: terms.expires_at.clone(), job: terms.job.clone() })
+        })();
+        match result {
+            Ok(reply_value) => reply(out, &peer.envelope, &reply_value),
+            Err(error) => {
+                let mut event = AuditEvent::new("lease", &format!("denied: {}", error.code()));
+                let shown_job: String = job.chars().filter(|c| !c.is_control()).take(lease::MAX_JOB_CHARS).collect();
+                event.detail = Some(format!("job {shown_job:?}: {error}"));
+                if let VaultError::NotLeasable(names) = &error {
+                    event.name = Some(names.join(", "));
+                }
+                self.audit(with_peer(event, peer));
+                error_reply(out, peer, &error)
             }
         }
     }

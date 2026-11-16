@@ -155,9 +155,11 @@ pub fn add(
     site: &str,
     rule: Option<&RuleInput>,
     username: Option<&str>,
+    app: Option<&str>,
+    leasable: bool,
     value: &SecretValue,
 ) -> Result<AddReply, VaultError> {
-    let request = SecretRequest::Add { name, kind, site, rule, username, value };
+    let request = SecretRequest::Add { name, kind, site, rule, username, app, leasable, value };
     call_secret(paths, &request, None, CHANGE_WAIT)
 }
 
