@@ -63,6 +63,9 @@ pub enum VaultError {
     VersionMismatch(u64),
     /// An import of a login the vault already renews (its name).
     LoginClaimed(String),
+    /// The upstream refused an imported login's access token, and the vault may not renew it
+    /// until the host's daemon claims it (`claim_refresh`).
+    LoginAwaitingClaim,
     /// The upstream sent nothing for the idle timeout.
     IdleTimeout(u64),
 }
@@ -114,6 +117,7 @@ impl VaultError {
             CredentialRefused => "credential_refused",
             VersionMismatch(_) => "version_mismatch",
             LoginClaimed(_) => "login_claimed",
+            LoginAwaitingClaim => "login_awaiting_claim",
             IdleTimeout(_) => "idle_timeout",
         }
     }
@@ -186,6 +190,10 @@ impl fmt::Display for VaultError {
             VersionMismatch(have) => write!(
                 f,
                 "the secret is at version {have} now, not the one named: it changed meanwhile (import it again, then claim that version)"
+            ),
+            LoginAwaitingClaim => write!(
+                f,
+                "the provider refused the login's access token, and the vault may not renew it until the host's daemon claims it (claim_refresh)"
             ),
             LoginClaimed(name) => write!(
                 f,

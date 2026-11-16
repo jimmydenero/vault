@@ -184,8 +184,12 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   `authorization: Bearer <access token>` (your `x-xai-token-auth` and `x-grok-*` headers pass
   through). For a login the vault renews, a call that finds it due renews it first, and a 401
   from the upstream is held back: the vault renews the login and makes the call once more, so
-  you see the second reply only. If the provider refuses the renewal, the call ends with one
-  error line, `credential_refused` (sign in again). The request line is followed by exactly `body_len` raw body bytes (up to 32 MiB):
+  you see the second reply only. **A login's 401 never reaches you as a 401** (Codex fails the
+  turn on one, Grok retries it four times): when no renewal can fix it, the call ends with one
+  error line instead, `credential_refused` (the provider refused the renewal, the login was
+  refused already, or a fresh token got a 401 too: sign in again) or `login_awaiting_claim` (an
+  imported login the host's daemon hasn't claimed yet, which the vault may not renew). The
+  host's proxy answers either as 503, never 401. The request line is followed by exactly `body_len` raw body bytes (up to 32 MiB):
 
   ```json
   {"op":"stream","name":"main","method":"POST","path":"/v1/messages?beta=true",

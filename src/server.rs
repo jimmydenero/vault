@@ -837,7 +837,10 @@ impl Server {
                 Ok(credential) => credential,
                 Err(error) => return refuse(error, event, out),
             };
-            let hold_auth_error = !renewed_after_401 && self.renewable(record).is_some();
+            // A login's 401 never reaches the caller as a bare 401 (Codex fails the turn on one,
+            // Grok retries it four times): the vault renews and retries once when it may, and
+            // otherwise answers one error line the host's proxy maps to "sign in again".
+            let is_login = kinds::spec(record.kind).is_some_and(|spec| spec.refresher.is_some());
             // R28: the use is on disk before the credential leaves the vault. No line, no request.
             let mut attempt = event.clone();
             attempt.outcome = "sending".into();
@@ -851,24 +854,37 @@ impl Server {
                 Duration::from_secs(call.idle),
                 out,
                 &peer.envelope,
-                hold_auth_error,
+                is_login,
             );
             drop(credential);
             if outcome.end == "auth_error" {
-                // Nothing reached the caller: renew the login and make the call once more.
                 let mut held = event.clone();
                 held.status = Some(401);
                 held.outcome = "held: auth_error".into();
-                held.detail = Some("the upstream answered 401; renewing the login and trying once more".into());
-                self.audit(held);
-                renewed_after_401 = true;
-                match self.renew_login(&id, record.version, "the upstream answered 401") {
-                    Ok(fresh) => {
-                        doc = fresh;
-                        continue;
+                if !renewed_after_401 && self.renewable(record).is_some() {
+                    // Nothing reached the caller: renew the login and make the call once more.
+                    held.detail = Some("the upstream answered 401; renewing the login and trying once more".into());
+                    self.audit(held);
+                    renewed_after_401 = true;
+                    match self.renew_login(&id, record.version, "the upstream answered 401") {
+                        Ok(fresh) => {
+                            doc = fresh;
+                            continue;
+                        }
+                        Err(error) => return refuse(error, event, out),
                     }
-                    Err(error) => return refuse(error, event, out),
                 }
+                // No renewal can help: the login isn't claimed yet (the vault may not renew it),
+                // it was refused already, or a fresh token got a 401 too.
+                let unclaimed = record.handover.as_ref().is_some_and(|handover| !handover.claimed);
+                held.detail = Some("the upstream answered 401 and no renewal can fix it; answered as an error line, not a 401".into());
+                self.audit(held);
+                if unclaimed {
+                    self.observe(record, HealthState::Expired, Some(401));
+                    return refuse(VaultError::LoginAwaitingClaim, event, out);
+                }
+                self.observe(record, HealthState::Refused, Some(401));
+                return refuse(VaultError::CredentialRefused, event, out);
             }
             event.status = outcome.status;
             event.outcome = match (&outcome.error, outcome.head_sent, outcome.end) {
