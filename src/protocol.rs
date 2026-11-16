@@ -45,31 +45,41 @@
 //! secret it holds that may not be leased refuses the whole request:
 //! `{"ok":false,"error":"not_leasable","message","names":[...]}`.
 //!
-//! For the host daemon's payment relay (#7440), and the command line for the two that need the
-//! recovery key:
+//! For the host daemon's payment relay (#7440, #7490), and the command line for the two that need
+//! the recovery key:
 //!   {"op":"sign","name":"main-wallet","chain":"ethereum","token":"USDC",
 //!    "to":"0x...","amount":"12.50","nonce":7,"gas_limit":78000,
 //!    "max_fee_per_gas":30000000000,"max_priority_fee_per_gas":1500000000,
 //!    "ladder":4,"ladder_max_fee_per_gas":45000000000,"on_behalf_of":"agent @x, item #123"}
 //!                                       (or "id"; ladder, its ceiling and on_behalf_of optional)
+//!   {"op":"sign","name":"sol-wallet","chain":"solana","token":"USDC","to":"<base58 wallet>",
+//!    "amount":"12.50","recent_blockhash":"<base58>","compute_unit_limit":60000,
+//!    "compute_unit_price":50000,"create_recipient_account":true}   (price and create optional)
+//!   {"op":"sign","name":"tron-wallet","chain":"tron","token":"USDT","to":"T...","amount":"12.50",
+//!    "ref_block_num":87350971,"ref_block_id":"<64 hex>","timestamp":<ms>,"expiration":<ms>,
+//!    "fee_limit":20000000}
 //!   {"op":"wallet_create","name":"main-wallet","chain":"ethereum","caps":{...},"recovery_key":"AGE-SECRET-KEY-1..."}
 //!   {"op":"wallet_caps","name":"main-wallet","caps":{...},"recovery_key":"AGE-SECRET-KEY-1..."}
 //!
 //! **`sign`** (`wallet`) signs one token transfer the vault builds itself from those fields,
-//! within the wallet's caps, and answers the signed transaction and its ladder (the same
-//! transfer at rising fees, for the relay to send if the first stalls):
-//! `{"ok":true,"signed":{"raw","hash","max_fee_per_gas","max_priority_fee_per_gas"},"ladder":[...],...}`.
-//! Over a cap it answers `over_cap` and signs nothing.
+//! within the wallet's caps, and answers the signed transaction and, on Ethereum, its ladder (the
+//! same transfer at rising fees, for the relay to send if the first stalls):
+//! `{"ok":true,"signed":{"raw","hash",...},"ladder":[...],...}`. A field of another chain than the
+//! wallet's is `bad_request`. Over a cap it answers `over_cap` and signs nothing.
 //!
-//! **A cancel** (#7491) is `sign` with `"cancel":true`, `chain`, `nonce` and fees (and the same
-//! optional `ladder`, its ceiling and `on_behalf_of`), and no `to`, `token` or `amount`:
+//! **A cancel** (#7491), Ethereum only, is `sign` with `"cancel":true`, `chain`, `nonce` and fees
+//! (and the same optional `ladder`, its ceiling and `on_behalf_of`), and no `to`, `token`,
+//! `amount` or Solana or Tron field:
 //!   {"op":"sign","name":"main-wallet","cancel":true,"chain":"ethereum","nonce":7,
 //!    "max_fee_per_gas":40000000000,"max_priority_fee_per_gas":2500000000,"ladder":2}
 //! The vault signs a 0-ETH transfer from the wallet to itself, 21,000 gas and no data, only at a
 //! nonce it signed a payment for in the last day, and answers
-//! `{"ok":true,"cancel":true,"signed":{...},"ladder":[...],"cancels":[...],...}`. `caps` is
-//! `{"per_payment_micros","daily_micros","max_fee_per_gas","daily_fees_wei"}`: dollars in
-//! millionths, fees in wei. Fees and amounts in wei are JSON numbers up to 2^64.
+//! `{"ok":true,"cancel":true,"signed":{...},"ladder":[...],"cancels":[...],...}`.
+//!
+//! `caps` is `{"per_payment_micros","daily_micros"}` plus the wallet's chain's fee caps:
+//! `"max_fee_per_gas","daily_fees_wei"` (Ethereum), `"max_compute_unit_price","daily_fees_lamports"`
+//! (Solana), `"max_fee_limit_sun","daily_fees_sun"` (Tron). Dollars are in millionths, fees in the
+//! chain's smallest unit, JSON numbers up to 2^64.
 //!
 //! **`stream`** (R39) sends one request with a credential whose kind (`kinds`) or rule (an API key)
 //! decides the host, the methods, the paths and the headers the vault sets, and streams the reply
@@ -280,17 +290,7 @@ pub enum Request {
     },
     Sign {
         secret: SecretRef,
-        chain: String,
-        token: String,
-        to: String,
-        amount: String,
-        nonce: u64,
-        gas_limit: u64,
-        max_fee_per_gas: u64,
-        max_priority_fee_per_gas: u64,
-        ladder: usize,
-        ladder_max_fee_per_gas: Option<u64>,
-        on_behalf_of: Option<String>,
+        fields: SignFields,
     },
     /// `sign` with `"cancel":true` (#7491).
     SignCancel {
@@ -504,34 +504,6 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
     }
 
     #[derive(Deserialize)]
-    struct SignWire {
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default)]
-        id: Option<String>,
-        chain: String,
-        #[serde(default)]
-        cancel: bool,
-        #[serde(default)]
-        token: Option<String>,
-        #[serde(default)]
-        to: Option<String>,
-        #[serde(default)]
-        amount: Option<String>,
-        nonce: u64,
-        #[serde(default)]
-        gas_limit: Option<u64>,
-        max_fee_per_gas: u64,
-        max_priority_fee_per_gas: u64,
-        #[serde(default)]
-        ladder: usize,
-        #[serde(default)]
-        ladder_max_fee_per_gas: Option<u64>,
-        #[serde(default)]
-        on_behalf_of: Option<String>,
-    }
-
-    #[derive(Deserialize)]
     struct WalletCreateWire {
         name: String,
         chain: String,
@@ -695,44 +667,50 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
             Request::Lease { job: w.job, recipient: w.recipient, secrets, ttl_seconds: w.ttl_seconds }
         }
         "sign" => {
-            let w: SignWire = serde_json::from_slice(line)?;
-            let secret = secret_ref(w.name, w.id)?;
+            let secret = named(line)?;
+            let fields: SignFields = serde_json::from_slice(line)?;
+            let missing = |field: &str| serde_json::Error::custom(format!("missing field `{field}`"));
             // A cancel (#7491) is the one transaction the vault builds for it: nothing a caller
-            // could point at a recipient, a token or an amount is taken, so none may be sent.
-            // `wallet::check_cancel` refuses one that names any (`extra`), with its own message.
-            if w.cancel {
-                let extra = [("to", w.to.is_some()), ("token", w.token.is_some()), ("amount", w.amount.is_some())]
-                    .into_iter()
-                    .filter_map(|(field, given)| given.then_some(field))
-                    .collect();
+            // could point at a recipient, a token or an amount, nor another chain's terms, is
+            // taken, so none may be sent. `wallet::check_cancel` refuses one that names any
+            // (`extra`), with its own message.
+            if fields.cancel {
+                let extra = [
+                    ("to", fields.to.is_some()),
+                    ("token", fields.token.is_some()),
+                    ("amount", fields.amount.is_some()),
+                    ("recent_blockhash", fields.recent_blockhash.is_some()),
+                    ("compute_unit_limit", fields.compute_unit_limit.is_some()),
+                    ("compute_unit_price", fields.compute_unit_price.is_some()),
+                    ("create_recipient_account", fields.create_recipient_account.is_some()),
+                    ("ref_block_num", fields.ref_block_num.is_some()),
+                    ("ref_block_id", fields.ref_block_id.is_some()),
+                    ("timestamp", fields.timestamp.is_some()),
+                    ("expiration", fields.expiration.is_some()),
+                    ("fee_limit", fields.fee_limit.is_some()),
+                ]
+                .into_iter()
+                .filter_map(|(field, given)| given.then_some(field))
+                .collect();
                 return Ok(Request::SignCancel {
                     secret,
-                    chain: w.chain,
+                    chain: fields.chain,
                     extra,
-                    gas_limit: w.gas_limit,
-                    nonce: w.nonce,
-                    max_fee_per_gas: w.max_fee_per_gas,
-                    max_priority_fee_per_gas: w.max_priority_fee_per_gas,
-                    ladder: w.ladder,
-                    ladder_max_fee_per_gas: w.ladder_max_fee_per_gas,
-                    on_behalf_of: w.on_behalf_of,
+                    gas_limit: fields.gas_limit,
+                    nonce: fields.nonce.ok_or_else(|| missing("nonce"))?,
+                    max_fee_per_gas: fields.max_fee_per_gas.ok_or_else(|| missing("max_fee_per_gas"))?,
+                    max_priority_fee_per_gas: fields.max_priority_fee_per_gas.ok_or_else(|| missing("max_priority_fee_per_gas"))?,
+                    ladder: fields.ladder.unwrap_or(0),
+                    ladder_max_fee_per_gas: fields.ladder_max_fee_per_gas,
+                    on_behalf_of: fields.on_behalf_of,
                 });
             }
-            let missing = |field: &str| serde_json::Error::custom(format!("missing field `{field}`"));
-            Request::Sign {
-                secret,
-                chain: w.chain,
-                token: w.token.ok_or_else(|| missing("token"))?,
-                to: w.to.ok_or_else(|| missing("to"))?,
-                amount: w.amount.ok_or_else(|| missing("amount"))?,
-                nonce: w.nonce,
-                gas_limit: w.gas_limit.ok_or_else(|| missing("gas_limit"))?,
-                max_fee_per_gas: w.max_fee_per_gas,
-                max_priority_fee_per_gas: w.max_priority_fee_per_gas,
-                ladder: w.ladder,
-                ladder_max_fee_per_gas: w.ladder_max_fee_per_gas,
-                on_behalf_of: w.on_behalf_of,
+            for (field, given) in [("token", &fields.token), ("to", &fields.to), ("amount", &fields.amount)] {
+                if given.is_none() {
+                    return Err(missing(field));
+                }
             }
+            Request::Sign { secret, fields }
         }
         "wallet_create" => {
             let w: WalletCreateWire = serde_json::from_slice(line)?;
@@ -980,6 +958,81 @@ pub struct ClaimReply {
     pub backup: Option<BackupStatus>,
 }
 
+/// `sign`'s fields as the caller sent them: the transfer, and the terms of the wallet's chain
+/// (`wallet::SignArgs` says which). Structured fields only; there is none for raw bytes.
+#[derive(Deserialize, Default, Debug)]
+pub struct SignFields {
+    pub chain: String,
+    /// A cancel (#7491): no `to`, `token` or `amount`, which a payment needs.
+    #[serde(default)]
+    pub cancel: bool,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub amount: Option<String>,
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
+    #[serde(default)]
+    pub nonce: Option<u64>,
+    #[serde(default)]
+    pub gas_limit: Option<u64>,
+    #[serde(default)]
+    pub max_fee_per_gas: Option<u64>,
+    #[serde(default)]
+    pub max_priority_fee_per_gas: Option<u64>,
+    #[serde(default)]
+    pub ladder: Option<usize>,
+    #[serde(default)]
+    pub ladder_max_fee_per_gas: Option<u64>,
+    #[serde(default)]
+    pub recent_blockhash: Option<String>,
+    #[serde(default)]
+    pub compute_unit_limit: Option<u32>,
+    #[serde(default)]
+    pub compute_unit_price: Option<u64>,
+    #[serde(default)]
+    pub create_recipient_account: Option<bool>,
+    #[serde(default)]
+    pub ref_block_num: Option<u64>,
+    #[serde(default)]
+    pub ref_block_id: Option<String>,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
+    #[serde(default)]
+    pub expiration: Option<u64>,
+    #[serde(default)]
+    pub fee_limit: Option<u64>,
+}
+
+impl SignFields {
+    pub fn args(&self) -> crate::wallet::SignArgs<'_> {
+        crate::wallet::SignArgs {
+            chain: &self.chain,
+            token: self.token.as_deref().unwrap_or(""),
+            to: self.to.as_deref().unwrap_or(""),
+            amount: self.amount.as_deref().unwrap_or(""),
+            on_behalf_of: self.on_behalf_of.as_deref(),
+            nonce: self.nonce,
+            gas_limit: self.gas_limit,
+            max_fee_per_gas: self.max_fee_per_gas,
+            max_priority_fee_per_gas: self.max_priority_fee_per_gas,
+            ladder: self.ladder,
+            ladder_max_fee_per_gas: self.ladder_max_fee_per_gas,
+            recent_blockhash: self.recent_blockhash.as_deref(),
+            compute_unit_limit: self.compute_unit_limit,
+            compute_unit_price: self.compute_unit_price,
+            create_recipient_account: self.create_recipient_account,
+            ref_block_num: self.ref_block_num,
+            ref_block_id: self.ref_block_id.as_deref(),
+            timestamp: self.timestamp,
+            expiration: self.expiration,
+            fee_limit: self.fee_limit,
+        }
+    }
+}
+
 /// A wallet made or its caps changed.
 #[derive(Serialize, Deserialize)]
 pub struct WalletReply {
@@ -988,14 +1041,20 @@ pub struct WalletReply {
     pub backup: BackupStatus,
 }
 
-/// One signed transaction: its raw bytes (`0x` hex, for `eth_sendRawTransaction`), its hash and
-/// its fees.
+/// One signed transaction: its bytes in the chain's broadcast form and its id. Ethereum: `0x` hex
+/// for `eth_sendRawTransaction`, the `0x` hash, and its fees. Solana: base64 for `sendTransaction`
+/// (`"encoding":"base64"`) and the base58 signature. Tron: hex of the whole `Transaction` for
+/// `/wallet/broadcasthex`, the txid, and `raw_data_hex` for `/wallet/broadcasttransaction`.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SignedTx {
     pub raw: String,
     pub hash: String,
-    pub max_fee_per_gas: u64,
-    pub max_priority_fee_per_gas: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fee_per_gas: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_priority_fee_per_gas: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_data_hex: Option<String>,
 }
 
 /// `sign`'s answer: the transfer as the vault built it, the first transaction, the ladder in
@@ -1006,29 +1065,59 @@ pub struct SignReply {
     pub id: String,
     pub name: String,
     pub chain: crate::wallet::Chain,
-    pub chain_id: u64,
-    /// The wallet's address, EIP-55 mixed case.
+    /// Ethereum: the chain id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<u64>,
+    /// The wallet's address (EIP-55 mixed case on Ethereum).
     pub from: String,
-    /// The recipient, canonical.
+    /// The recipient's wallet, canonical.
     pub to: String,
     pub token: crate::wallet::Token,
-    /// The token's contract the transaction calls.
+    /// The token's contract the transaction calls (on Solana, its mint).
     pub contract: String,
     pub amount: String,
-    pub nonce: u64,
-    pub gas_limit: u64,
+    /// Ethereum: the nonce and gas limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gas_limit: Option<u64>,
+    /// Solana: the token accounts the vault derived (the wallet's, the recipient's), the blockhash
+    /// the transaction lives by, and whether it creates the recipient's token account if missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_token_account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_token_account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_blockhash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creates_recipient_account: Option<bool>,
+    /// Tron: when the transaction stops being valid (Unix ms), and its fee_limit (sun).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiration: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_limit: Option<u64>,
     pub signed: SignedTx,
+    /// Ethereum: the same transfer at rising fees, in rising order. Empty on Solana and Tron.
     pub ladder: Vec<SignedTx>,
-    /// The most any of these transactions could burn in fees: `gas_limit` at the top rung.
-    pub worst_fee_wei: u64,
-    /// The same transfer at the same nonce was signed in the last day: no amount counted again.
+    /// The most any of these transactions could cost in fees, in `fee_unit`.
+    pub worst_fee: u64,
+    pub fee_unit: String,
+    /// The same payment was signed in the last day (Ethereum: the same transfer at this nonce;
+    /// Solana and Tron: the very same transaction): no amount counted again.
     pub replacement: bool,
     pub counted_micros: u64,
-    pub counted_fees_wei: u64,
+    pub counted_fees: u64,
     /// The wallet's caps, and what the last 24 hours count against them now, this payment in.
     pub caps: crate::wallet::Caps,
     pub spent_today_micros: u64,
-    pub fees_today_wei: u64,
+    pub fees_today: u64,
+    /// Ethereum only, under the names #7440 gave them: `worst_fee`, `counted_fees`, `fees_today`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worst_fee_wei: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counted_fees_wei: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fees_today_wei: Option<u64>,
     pub backup: BackupStatus,
 }
 

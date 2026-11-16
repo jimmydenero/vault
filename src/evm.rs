@@ -13,7 +13,7 @@
 //! transfer  data = a9059cbb || 12 zero bytes || recipient (20) || amount (uint256)
 //! ```
 //!
-//! The private key is read here only, in `sign` and `address_of_key`: from the record's
+//! The private key is read here only, in `sign_digest` and `address_of_key`: from the record's
 //! `SecretValue` into k256's `SigningKey`, which wipes itself when dropped (R1). No function
 //! here returns it or anything derived from it but the public address and signatures.
 
@@ -201,27 +201,35 @@ impl Tx {
     }
 }
 
-/// Signs a transaction with a wallet's key: deterministic (RFC 6979), low-s, and checked by
-/// recovering the signer from the signature and comparing it with `expected` (the address the
-/// wallet record holds), so a signature the chain would read as someone else's never leaves.
-pub fn sign(tx: &Tx, key: &SecretValue, expected: &[u8; 20]) -> Result<Signed, VaultError> {
+/// Signs a 32-byte digest with a secp256k1 key: deterministic (RFC 6979), low-s, and checked by
+/// recovering the signer from the signature and comparing its 20-byte address with `expected`
+/// (the address the wallet record holds), so a signature the chain would read as someone else's
+/// never leaves. Answers `r || s` and the recovery id (0 or 1). Ethereum (`sign`) and Tron
+/// (`tron::sign`) share it: both name an account by those 20 bytes.
+pub(crate) fn sign_digest(digest: &[u8; 32], key: &SecretValue, expected: &[u8; 20]) -> Result<([u8; 64], u8), VaultError> {
     let failed = || VaultError::Io("signing failed".into());
     let signing = signing_key(key)?;
-    let prehash = keccak256(&tx.signing_payload());
-    let (signature, recovery): (Signature, RecoveryId) =
-        signing.sign_prehash_recoverable(&prehash).map_err(|_| failed())?;
+    let (signature, recovery): (Signature, RecoveryId) = signing.sign_prehash_recoverable(digest).map_err(|_| failed())?;
     drop(signing);
     // k256 already gives a low-s signature; normalize anyway, flipping the parity with it.
     let (signature, recovery) = match signature.normalize_s() {
         Some(low) => (low, RecoveryId::new(!recovery.is_y_odd(), recovery.is_x_reduced())),
         None => (signature, recovery),
     };
-    let recovered = VerifyingKey::recover_from_prehash(&prehash, &signature, recovery).map_err(|_| failed())?;
+    let recovered = VerifyingKey::recover_from_prehash(digest, &signature, recovery).map_err(|_| failed())?;
     if &address_of(&recovered) != expected {
         return Err(failed());
     }
-    let (r, s) = signature.split_bytes();
-    let raw = tx.encode_signed(recovery.is_y_odd() as u8, &r, &s);
+    let mut rs = [0u8; 64];
+    rs.copy_from_slice(&signature.to_bytes());
+    Ok((rs, recovery.is_y_odd() as u8))
+}
+
+/// Signs a transaction with a wallet's key (`sign_digest` over keccak256 of its signing payload).
+pub fn sign(tx: &Tx, key: &SecretValue, expected: &[u8; 20]) -> Result<Signed, VaultError> {
+    let prehash = keccak256(&tx.signing_payload());
+    let (rs, y_parity) = sign_digest(&prehash, key, expected)?;
+    let raw = tx.encode_signed(y_parity, &rs[..32], &rs[32..]);
     let hash = keccak256(&raw);
     Ok(Signed { raw, hash })
 }

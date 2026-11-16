@@ -123,11 +123,11 @@ Or restore a backup: `vault install --for-restore`, then `vault restore FILE`.
   recovery key does, and never names a machine. Its first 12 digits are the recovery-key
   fingerprint on the kit. The `vault_id` is the copy: new at every restore, and the prefix of
   the backup files' names.
-- **The vault file and backups are format 7** (format 2 plus the `claude_plan` kind and the
+- **The vault file and backups are format 8** (format 2 plus the `claude_plan` kind and the
   intake key in format 3, the `codex_login` and `grok_login` kinds and a login's handover
   state in format 4, the `personal_details` kind in format 5, the `app_secret` kind with its
-  application and lease flag in format 6, and the `wallet` kind with its chain, address, caps and
-  last day's payments in format 7). An older vault file is migrated at the daemon's first start, as a change of
+  application and lease flag in format 6, the `wallet` kind with its chain, address, caps and
+  last day's payments in format 7, and Solana and Tron wallets in format 8). An older vault file is migrated at the daemon's first start, as a change of
   its own (audited and backed up): a format-1 file's secrets get their ids, and a format-2 file
   gets its intake key. Older backups restore too. An older build refuses a newer file or backup
   as newer (`newer_format`); don't go back to an older build after upgrading.
@@ -146,8 +146,8 @@ The `vault` tool can't print a secret, so it is safe for any agent on the machin
 | `vault add NAME --kind codex_login --yes < auth.json` | Adds a Codex login (its `auth.json`, whole), which the vault alone renews from then on. Used only by `stream`, only to `chatgpt.com`. `grok_login` likewise for Grok Build, to `cli-chat-proxy.grok.com`. The host's daemon normally hands logins over itself (`import_login` and `claim_refresh`, or `add_sealed`). |
 | `vault add NAME --kind personal_details` | Adds your real details (name, address, birthday, phone), asked one field at a time; leave any empty. Or `--yes` with v1's JSON object on standard input (`{"name","address","birthday","phone"}`). Stored and listed only, for now: `list` says which fields are filled, never what they say. See "Personal details" below. |
 | `vault add NAME --kind app_secret --app APP [--leasable]` | Adds one of an application's build or deploy secrets (an npm token, a database URL). With `--leasable` a build may lease it, sealed to the build's own key for at most a day; without it, it is stored and listed only. Set only when it is added. See "App secrets and leases" below. |
-| `vault wallet create NAME --per-payment USD --daily USD [--chain ethereum] [--max-fee-gwei 100] [--daily-fees-eth 0.02]` | Makes a wallet: the vault makes its key and never shows it, and prints the address to fund. Asks for the recovery key. See "Wallets" below. |
-| `vault wallet caps NAME [--per-payment USD] [--daily USD] [--max-fee-gwei N] [--daily-fees-eth N]` | Changes a wallet's caps (the ones you leave out stay). Asks for the recovery key. |
+| `vault wallet create NAME --per-payment USD --daily USD [--chain ethereum\|solana\|tron\|sepolia\|solana_devnet\|tron_nile] [fee caps]` | Makes a wallet: the vault makes its key and never shows it, and prints the address to fund. Asks for the recovery key. Fee caps, the wallet's chain's only: `--max-fee-gwei 100 --daily-fees-eth 0.02` (Ethereum), `--max-priority-fee-micro-lamports 1000000 --daily-fees-sol 0.05` (Solana), `--max-fee-limit-trx 30 --daily-fees-trx 300` (Tron), those being the defaults. See "Wallets" below. |
+| `vault wallet caps NAME [--per-payment USD] [--daily USD] [fee caps]` | Changes a wallet's caps (the ones you leave out stay). Asks for the recovery key. |
 | `vault delete NAME` | Deletes a secret. Earlier backups keep it. A wallet isn't deleted: its key is the only way to its funds. |
 | `vault rename NAME NEW` | Renames a secret; its id, rule and value stay, its version goes up. |
 | `vault list` | Ids, names, kinds, versions and sites; for personal details, which fields are filled; for app secrets, the application and whether builds may lease it; for wallets, the address, the caps and what the last 24 hours spent. |
@@ -249,9 +249,9 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   (`{"v":1,"name":"shop-npm","kind":"app_secret","app":"shop","leasable":true,"value":"npm_..."}`);
   only an `app_secret` may carry either, and it too is added under a new name only.
 - **`lease`** seals app secrets to a build's own key (host only; "App secrets and leases" below).
-- **`sign`** signs one token payment from a wallet, within its caps, with a ladder of fee
-  bumps, or with `"cancel":true` a 0-ETH cancel at a payment's nonce (the host's payment relay;
-  "Wallets" below).
+- **`sign`** signs one token payment from a wallet, within its caps, on Ethereum with a ladder of
+  fee bumps, or on Ethereum with `"cancel":true` a 0-ETH cancel at a payment's nonce (the host's
+  payment relay; "Wallets" below).
 - **`import_plan`** is the upgrade's move of the host's existing plan tokens into the vault:
   `{"op":"import_plan","plans":[{"name":"main","value":"sk-ant-oat01-..."}]}` returns each plan's
   `result` by name: `done` (added, or a different value replaced, version up), `unchanged` (already
@@ -364,56 +364,129 @@ The build makes an age X25519 key of its own, and the host's daemon asks:
 ## Wallets
 
 Your agents' payments are signed by your vault, with a key that was made there and never leaves
-it (work item #7440). Volgenic's server never holds a key that spends money, so **payments wait
-while the vault's machine is off**; a payment already sent can still be sped up, because its fee
-bumps were signed in advance.
+it (work items #7440, #7490). Volgenic's server never holds a key that spends money, so **payments
+wait while the vault's machine is off**. An Ethereum payment already sent can still be sped up,
+because its fee bumps were signed in advance; a Solana or Tron one can't be, and needn't be ("Fee
+bumps" below).
 
-- **`vault wallet create NAME --per-payment 50 --daily 200`** makes a key from the operating
-  system's random numbers, keeps it as the wallet's value, and prints the address to fund with
-  USDC or USDT (and a little ETH for fees). It asks for the recovery key: the socket can't tell
-  you from an agent, and the caps are yours alone to set. `vault wallet caps` changes them, the
-  same way.
+- **`vault wallet create NAME --chain solana --per-payment 50 --daily 200`** makes a key from the
+  operating system's random numbers, keeps it as the wallet's value, and prints the address to
+  fund. It asks for the recovery key: the socket can't tell you from an agent, and the caps are
+  yours alone to set. `vault wallet caps` changes them, the same way.
 - **No request returns the key**, not even sealed: `add` and `add_sealed` refuse the `wallet`
   kind (the vault never takes a key from outside), `lease` refuses it (`not_leasable`), `totp`,
   `proxy` and `stream` refuse it (`wrong_kind`), and `delete` refuses it. Its only copies are the
   vault file and its backups, which only the vault key and the Recovery Kit open.
-- **Chains:** `ethereum` (USDC and USDT) and `sepolia`, a test network (USDC), for a dry run.
-  Solana and Tron, which v1's agent wallets also used, come later.
-- **`sign`** takes structured fields only and builds the transaction itself: an EIP-1559
-  `transfer(recipient, amount)` call on the token's own contract, value 0. There is no field for
-  raw bytes or call data.
+- **Chains**, each with a test network for a dry run (tokens with no value):
 
-```json
-{"protocol":2,"op":"sign","name":"main-wallet","chain":"ethereum","token":"USDC",
- "to":"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed","amount":"12.50","nonce":7,"gas_limit":78000,
- "max_fee_per_gas":30000000000,"max_priority_fee_per_gas":2000000000,"ladder":4,
- "on_behalf_of":"agent @x, work item #123","request_id":"..."}
-```
+  | Chain | Key and address | Tokens | Test network |
+  |---|---|---|---|
+  | `ethereum` | secp256k1, `0x…` (EIP-55) | USDC, USDT | `sepolia` (USDC) |
+  | `solana` | Ed25519, base58 | USDC, USDT | `solana_devnet` (USDC) |
+  | `tron` | secp256k1, base58check `T…` | USDT | `tron_nile` (USDT) |
 
-  It answers `{"ok":true,"signed":{"raw","hash","max_fee_per_gas","max_priority_fee_per_gas"},
-  "ladder":[...],"from","to","token","contract","amount","nonce","gas_limit","worst_fee_wei",
-  "replacement","counted_micros","counted_fees_wei","caps","spent_today_micros","fees_today_wei","backup"}`.
-  The relay broadcasts `signed.raw`; the vault never touches the network for a payment. The
-  recipient must be a real address (a mixed-case one with a matching checksum; not zero, not the
+  Contracts, mints and decimals are chain_pay's `ChainPay.Assets`.
+- **`sign`** takes structured fields only and builds the transaction itself. There is no field for
+  raw bytes, call data or instructions, and a field of another chain is refused (`bad_request`).
+  The vault never touches the network: the relay reads the chain (nonce, fees, a recent
+  blockhash or block) and broadcasts what it gets back.
+
+  **Ethereum:** an EIP-1559 `transfer(recipient, amount)` call on the token's own contract, value 0.
+  ```json
+  {"protocol":2,"op":"sign","name":"main-wallet","chain":"ethereum","token":"USDC",
+   "to":"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed","amount":"12.50","nonce":7,"gas_limit":78000,
+   "max_fee_per_gas":30000000000,"max_priority_fee_per_gas":2000000000,"ladder":4,
+   "on_behalf_of":"agent @x, work item #123","request_id":"..."}
+  ```
+  The recipient is a real address (a mixed-case one with a matching checksum; not zero, not the
   token's contract), the gas limit 21,000 to 150,000, the tip no more than the fee.
+
+  **Solana:** compute-unit limit and price, `CreateIdempotent` of the recipient's associated token
+  account (unless `"create_recipient_account":false`), and an SPL `TransferChecked` from the
+  wallet's associated token account to the recipient's. The vault derives both token accounts
+  itself; `to` is the recipient's **wallet** address, never a token account.
+  ```json
+  {"protocol":2,"op":"sign","name":"sol-wallet","chain":"solana","token":"USDC",
+   "to":"9hSR6S7WPtxmTojgo6GG3k4yDPecgJY292j7xrsUGWBu","amount":"12.50",
+   "recent_blockhash":"CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8",
+   "compute_unit_limit":60000,"compute_unit_price":50000,"on_behalf_of":"agent @x"}
+  ```
+  The limit is 1,000 to 200,000 compute units; the price, in micro-lamports per unit, is 0 when
+  left out. The recipient isn't the wallet itself, the mint or the system program.
+
+  **Tron:** a TRC-20 `transfer(to, amount)` (`TriggerSmartContract`, no TRX value) on the token's
+  contract, with the ref block, times and `fee_limit` the caller gives.
+  ```json
+  {"protocol":2,"op":"sign","name":"tron-wallet","chain":"tron","token":"USDT",
+   "to":"TLZeWMhAhsdKJJRwbRw4tBoVu9f75n2FwG","amount":"12.50",
+   "ref_block_num":87350971,"ref_block_id":"000000000534debba3791afd2edb6c53b21631db1f574f26b804ecfee83fd2b0",
+   "timestamp":1794850405000,"expiration":1794850465000,"fee_limit":20000000,"on_behalf_of":"agent @x"}
+  ```
+  `ref_block_num` and `ref_block_id` are TronGrid's `getnowblock` (`block_header.raw_data.number`,
+  `blockID`); the id must start with the number. `expiration` is at most 60 seconds after
+  `timestamp` (v1's window), in the future by the vault's clock, and at most 90 seconds ahead of it
+  (60 plus 30 for skew). The recipient is a `T…` address whose checksum matches; not zero, not the
+  token's contract, not the wallet itself.
+
+  It answers `{"ok":true,"signed":{"raw","hash",...},"ladder":[...],"from","to","token","contract",
+  "amount","worst_fee","fee_unit","replacement","counted_micros","counted_fees","caps",
+  "spent_today_micros","fees_today","backup"}`, plus each chain's own:
+  - Ethereum: `chain_id`, `nonce`, `gas_limit`; each signed transaction's `max_fee_per_gas` and
+    `max_priority_fee_per_gas`; `raw` is `0x` hex for `eth_sendRawTransaction`; and
+    `worst_fee_wei`, `counted_fees_wei`, `fees_today_wei` (the names #7440 gave them).
+  - Solana: `source_token_account`, `recipient_token_account`, `recent_blockhash`,
+    `creates_recipient_account`; `raw` is base64 for `sendTransaction` (`"encoding":"base64"`),
+    `hash` the base58 signature (the transaction's id). `ladder` is empty.
+  - Tron: `expiration`, `fee_limit`; `raw` is hex of the whole `Transaction` for
+    `/wallet/broadcasthex`, `hash` the txid, and `signed.raw_data_hex` for
+    `/wallet/broadcasttransaction`. `ladder` is empty.
 - **Caps, set by you:** `per_payment` and `daily` (rolling 24 hours) in dollars, USDC and USDT one
-  for one; `max_fee_per_gas`, the highest fee per gas any signed transaction may offer (100 gwei
-  unless you say); and `daily_fees`, the most a day's signed transactions could burn in fees (0.02
-  ETH unless you say). A payment that would pass any of them is refused, `over_cap`, and nothing is
-  signed.
-- **The fee ladder:** with `"ladder":N` (0 to 4) the vault also signs N replacements: the same
-  transfer at the same nonce, each with both fees raised 12.5% (rounded up), the least a node
-  takes as a replacement. If the first stalls while the vault is off, the relay sends the next
-  rung. Only one transaction per nonce can mine, so a ladder never pays twice. **Its top is
-  bounded three ways:** at most 4 rungs (about 1.6 times the first fee); no rung above the
-  wallet's `max_fee_per_gas` or the caller's own `ladder_max_fee_per_gas`, whichever is lower (a
-  rung that would pass it isn't signed, so the ladder comes back shorter); and the whole ladder's
-  worst case (`gas_limit` times its top fee) counts against `daily_fees` before anything is signed.
-- **The same transfer at a nonce already signed for** in the last day counts once against the
-  amount caps (only one can mine; `"replacement":true`), and against the fee cap only for what it
-  raises the worst case by.
-- **A cancel** (v1's cancel button, work item #7491): `sign` with `"cancel":true`, `chain`,
-  `nonce` and the fees, and no `to`, `token` or `amount` (sent anyway, the cancel is refused).
+  for one; then a per-transaction fee cap and a daily fee cap in the chain's own terms. A payment
+  that would pass any of them is refused, `over_cap`, and nothing is signed.
+
+  | Chain | Per transaction | Each payment counts against the daily fee cap |
+  |---|---|---|
+  | Ethereum | `max_fee_per_gas`, wei per gas (100 gwei) | `gas_limit` × its ladder's top fee (`daily_fees_wei`, 0.02 ETH) |
+  | Solana | `max_compute_unit_price`, micro-lamports per compute unit (1,000,000) | 5,000 lamports for the signature, plus price × limit, plus 0.00203928 SOL of rent when it creates the recipient's token account (`daily_fees_lamports`, 0.05 SOL) |
+  | Tron | `max_fee_limit_sun`, the most TRX it may burn for energy (30 TRX) | `fee_limit` plus its bandwidth at 1,000 sun a byte (`daily_fees_sun`, 300 TRX) |
+
+  A wallet's caps JSON holds only its own chain's fee caps:
+  `{"per_payment_micros","daily_micros","max_fee_per_gas","daily_fees_wei"}` on Ethereum,
+  `"max_compute_unit_price","daily_fees_lamports"` on Solana, `"max_fee_limit_sun","daily_fees_sun"`
+  on Tron.
+- **Fee bumps.** On Ethereum, with `"ladder":N` (0 to 4) the vault also signs N replacements: the
+  same transfer at the same nonce, each with both fees raised 12.5% (rounded up), the least a node
+  takes as a replacement. If the first stalls while the vault is off, the relay sends the next rung.
+  Only one transaction per nonce can mine, so a ladder never pays twice. **Its top is bounded three
+  ways:** at most 4 rungs (about 1.6 times the first fee); no rung above the wallet's
+  `max_fee_per_gas` or the caller's own `ladder_max_fee_per_gas`, whichever is lower (a rung that
+  would pass it isn't signed, so the ladder comes back shorter); and the whole ladder's worst case
+  (`gas_limit` times its top fee) counts against the daily fee cap before anything is signed.
+
+  **Solana and Tron have no ladder**, and a request for one is refused. Neither chain has a nonce:
+  two signed transactions of the same transfer at different fees are two payments, and both can
+  land. What stops a transaction is its expiry: its recent blockhash on Solana (about 150 blocks,
+  a minute or two), its `expiration` on Tron (60 seconds here). On Tron a bump isn't needed: there
+  is no fee auction, energy has a fixed price, and `fee_limit` is only a ceiling (a transfer whose
+  `fee_limit` is too low fails on chain and burns what it used; the relay estimates energy first,
+  as v1 did). On Solana a higher priority fee helps only a transaction not yet sent.
+
+  **A stalled payment while the vault is offline:** a Solana or Tron payment that doesn't land
+  before it expires is dead and can't pay any more. It needs a new signature, with a fresh
+  blockhash or ref block, so it waits, like any payment needing a signature, until the vault's
+  machine is back. The relay must not ask for that new one until the first has expired and isn't
+  on chain (Solana: `getSignatureStatuses` with history after the block height passed its
+  `lastValidBlockHeight`; Tron: no transaction info after a solidified block past its expiration),
+  exactly as v1's `broadcast` decided `:expired`. The vault can't see the chain, so the new
+  signature counts against the caps again: the caps over-count a payment that expired, never
+  under-count one that landed.
+- **The same payment asked for again** in the last day counts once against the amount caps
+  (`"replacement":true`): on Ethereum the same transfer at a nonce already signed for (only one can
+  mine; against the fee cap it counts only for what it raises the worst case by); on Solana and
+  Tron the very same transaction (the same fields, blockhash or ref block and times: signing is
+  deterministic, so it is the same bytes, which can land only once).
+- **A cancel** (v1's cancel button, work item #7491; Ethereum only, since only Ethereum has a nonce, and refused on a Solana or Tron wallet): `sign` with `"cancel":true`, `chain`,
+  `nonce` and the fees, and no `to`, `token`, `amount` or Solana or Tron field (sent anyway, the cancel is refused).
   The vault signs a transfer of 0 ETH from the wallet to itself, 21,000 gas and no data, at that
   nonce, and **only at a nonce it signed a payment for in the last 24 hours**. Only one
   transaction per nonce can mine: if the cancel does, nothing is paid; if the payment mines
@@ -434,14 +507,14 @@ bumps were signed in advance.
   ceiling). It moves no value and counts no amount; its worst case (21,000 gas at its top rung)
   counts against `daily_fees` for what it raises that nonce's worst case by, since only one of
   the payment and its cancels can be paid for.
-- **Audit:** one `sign` line per payment (chain, amount, token, recipient, nonce, gas, fees, the
-  hash, what it counted, `on_behalf_of`, the caller hint and request id), written with the change
-  that records the payment, and one `sign-ladder` line per ladder (how many rungs, the top fee, the
-  worst-case fee, every hash), both flushed to disk before the answer leaves. A refusal is one
-  `sign denied: <code>` line. Each cancel writes one `sign-cancel` line (the nonce, the fees, the
-  payments it cancels, its hash and its ladder's, the worst-case fee and what it counted, the
-  caller), the same way; a refused one, `sign-cancel denied: <code>`. `wallet-create` and `wallet-caps` lines show the address and the
-  caps. Never a key.
+- **Audit:** one `sign` line per payment (chain, amount, token, recipient, the chain's own terms,
+  the hash, what it counted, `on_behalf_of`, the caller hint and request id), written with the
+  change that records the payment, and on Ethereum one `sign-ladder` line per ladder (how many
+  rungs, the top fee, the worst-case fee, every hash), both flushed to disk before the answer
+  leaves. A refusal is one `sign denied: <code>` line. Each cancel writes one `sign-cancel` line
+  (the nonce, the fees, the payments it cancels, its hash and its ladder's, the worst-case fee and
+  what it counted, the caller), the same way; a refused one, `sign-cancel denied: <code>`.
+  `wallet-create` and `wallet-caps` lines show the address and the caps. Never a key.
 - **Each payment is a change** (the last day's payments are in the vault file, so the daily caps
   survive a restart), with its own backup.
 

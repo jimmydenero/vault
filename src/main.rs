@@ -10,7 +10,7 @@ use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use vault::client;
 use vault::error::VaultError;
@@ -141,7 +141,8 @@ enum WalletCommand {
     /// Its only use is signing token payments within the caps you set here.
     Create {
         name: String,
-        /// ethereum, or sepolia (a test network) for a dry run.
+        /// ethereum, solana or tron; or sepolia, solana_devnet or tron_nile (test networks) for a
+        /// dry run.
         #[arg(long, default_value = "ethereum")]
         chain: String,
         /// The most one payment may move, in US dollars (USDC and USDT count one for one).
@@ -150,12 +151,8 @@ enum WalletCommand {
         /// The most the payments of any 24 hours may move, in US dollars.
         #[arg(long)]
         daily: String,
-        /// The highest fee per gas any signed transaction may offer, in gwei.
-        #[arg(long, default_value = "100")]
-        max_fee_gwei: String,
-        /// The most the fees of any 24 hours could come to, in ETH, each payment counted at its worst.
-        #[arg(long, default_value = "0.02")]
-        daily_fees_eth: String,
+        #[command(flatten)]
+        fees: FeeCapArgs,
     },
     /// Change a wallet's caps. Caps you leave out stay as they are.
     Caps {
@@ -164,11 +161,38 @@ enum WalletCommand {
         per_payment: Option<String>,
         #[arg(long)]
         daily: Option<String>,
-        #[arg(long)]
-        max_fee_gwei: Option<String>,
-        #[arg(long)]
-        daily_fees_eth: Option<String>,
+        #[command(flatten)]
+        fees: FeeCapArgs,
     },
+}
+
+/// A wallet's fee caps, each in its chain's own terms; only the wallet's chain's may be given.
+/// Left out when making a wallet, each takes the default shown.
+#[derive(Args)]
+struct FeeCapArgs {
+    /// Ethereum: the highest fee per gas any signed transaction may offer, in gwei [default: 100].
+    #[arg(long)]
+    max_fee_gwei: Option<String>,
+    /// Ethereum: the most the fees of any 24 hours could come to, in ETH, each payment counted at
+    /// its worst [default: 0.02].
+    #[arg(long)]
+    daily_fees_eth: Option<String>,
+    /// Tron: the highest fee_limit (TRX it may burn for energy) any transaction may carry, in TRX
+    /// [default: 30].
+    #[arg(long)]
+    max_fee_limit_trx: Option<String>,
+    /// Tron: the most the fees of any 24 hours could come to, in TRX, each payment counted at its
+    /// fee_limit and bandwidth [default: 300].
+    #[arg(long)]
+    daily_fees_trx: Option<String>,
+    /// Solana: the highest priority fee any transaction may offer, in micro-lamports per compute
+    /// unit [default: 1000000].
+    #[arg(long)]
+    max_priority_fee_micro_lamports: Option<String>,
+    /// Solana: the most the fees of any 24 hours could come to, in SOL, each payment counted at its
+    /// worst, a recipient's new token account's rent included [default: 0.05].
+    #[arg(long)]
+    daily_fees_sol: Option<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -210,11 +234,11 @@ fn main() -> ExitCode {
         }
         Command::Delete { name, yes } => delete(&paths, &name, yes),
         Command::Rename { name, new_name } => rename(&paths, &name, &new_name),
-        Command::Wallet { action: WalletCommand::Create { name, chain, per_payment, daily, max_fee_gwei, daily_fees_eth } } => {
-            wallet_create(&paths, &name, &chain, &per_payment, &daily, &max_fee_gwei, &daily_fees_eth)
+        Command::Wallet { action: WalletCommand::Create { name, chain, per_payment, daily, fees } } => {
+            wallet_create(&paths, &name, &chain, &per_payment, &daily, &fees)
         }
-        Command::Wallet { action: WalletCommand::Caps { name, per_payment, daily, max_fee_gwei, daily_fees_eth } } => {
-            wallet_caps(&paths, &name, per_payment, daily, max_fee_gwei, daily_fees_eth)
+        Command::Wallet { action: WalletCommand::Caps { name, per_payment, daily, fees } } => {
+            wallet_caps(&paths, &name, per_payment, daily, &fees)
         }
         Command::List => list(&paths),
         Command::Health => health(&paths),
@@ -464,44 +488,102 @@ fn cap_units(text: &str, decimals: u32, what: &str) -> Result<u64, VaultError> {
     u64::try_from(units).map_err(|_| VaultError::InvalidSecret(format!("{what} is too large")))
 }
 
-fn caps_from(per_payment: &str, daily: &str, max_fee_gwei: &str, daily_fees_eth: &str) -> Result<vault::wallet::Caps, VaultError> {
-    let caps = vault::wallet::Caps {
-        per_payment_micros: cap_units(per_payment, 6, "--per-payment")?,
-        daily_micros: cap_units(daily, 6, "--daily")?,
-        max_fee_per_gas: cap_units(max_fee_gwei, 9, "--max-fee-gwei")?,
-        daily_fees_wei: cap_units(daily_fees_eth, 18, "--daily-fees-eth")?,
+/// The caps a command line asks for: each one given, else the current wallet's (`vault wallet
+/// caps`), else the chain's default (`vault wallet create`). A fee cap of another chain is refused.
+fn caps_from(
+    chain: vault::wallet::Chain,
+    per_payment: Option<&str>,
+    daily: Option<&str>,
+    fees: &FeeCapArgs,
+    current: Option<vault::wallet::Caps>,
+) -> Result<vault::wallet::Caps, VaultError> {
+    use vault::wallet::Family;
+    let family = chain.family();
+    let given = |flag: &Option<String>, name: &str, own: Family| -> Result<Option<String>, VaultError> {
+        match flag {
+            Some(_) if own != family => {
+                Err(VaultError::InvalidSecret(format!("--{name} is for {} wallets; this one is on {}", own.coin(), chain.label())))
+            }
+            other => Ok(other.clone()),
+        }
     };
-    caps.validate()?;
+    // Each fee cap: (what was typed, the current value, its default, decimals, the flag).
+    let pick = |typed: Option<String>, now: Option<u64>, default: &str, decimals: u32, name: &str| -> Result<u64, VaultError> {
+        match (typed, now) {
+            (Some(text), _) => cap_units(&text, decimals, &format!("--{name}")),
+            (None, Some(units)) => Ok(units),
+            (None, None) if family_owns(name, family) => cap_units(default, decimals, &format!("--{name}")),
+            (None, None) => Ok(0),
+        }
+    };
+    let max_fee_gwei = given(&fees.max_fee_gwei, "max-fee-gwei", Family::Evm)?;
+    let daily_fees_eth = given(&fees.daily_fees_eth, "daily-fees-eth", Family::Evm)?;
+    let max_fee_limit_trx = given(&fees.max_fee_limit_trx, "max-fee-limit-trx", Family::Tron)?;
+    let daily_fees_trx = given(&fees.daily_fees_trx, "daily-fees-trx", Family::Tron)?;
+    let max_priority = given(&fees.max_priority_fee_micro_lamports, "max-priority-fee-micro-lamports", Family::Solana)?;
+    let daily_fees_sol = given(&fees.daily_fees_sol, "daily-fees-sol", Family::Solana)?;
+    let caps = vault::wallet::Caps {
+        per_payment_micros: match (per_payment, current) {
+            (Some(text), _) => cap_units(text, 6, "--per-payment")?,
+            (None, Some(caps)) => caps.per_payment_micros,
+            (None, None) => return Err(VaultError::InvalidSecret("--per-payment is needed".into())),
+        },
+        daily_micros: match (daily, current) {
+            (Some(text), _) => cap_units(text, 6, "--daily")?,
+            (None, Some(caps)) => caps.daily_micros,
+            (None, None) => return Err(VaultError::InvalidSecret("--daily is needed".into())),
+        },
+        max_fee_per_gas: pick(max_fee_gwei, current.map(|c| c.max_fee_per_gas), "100", 9, "max-fee-gwei")?,
+        daily_fees_wei: pick(daily_fees_eth, current.map(|c| c.daily_fees_wei), "0.02", 18, "daily-fees-eth")?,
+        max_fee_limit_sun: pick(max_fee_limit_trx, current.map(|c| c.max_fee_limit_sun), "30", 6, "max-fee-limit-trx")?,
+        daily_fees_sun: pick(daily_fees_trx, current.map(|c| c.daily_fees_sun), "300", 6, "daily-fees-trx")?,
+        max_compute_unit_price: pick(
+            max_priority,
+            current.map(|c| c.max_compute_unit_price),
+            "1000000",
+            0,
+            "max-priority-fee-micro-lamports",
+        )?,
+        daily_fees_lamports: pick(daily_fees_sol, current.map(|c| c.daily_fees_lamports), "0.05", 9, "daily-fees-sol")?,
+    };
+    caps.validate(chain)?;
     Ok(caps)
+}
+
+/// Whether a fee-cap flag is the family's own (so a new wallet gets its default).
+fn family_owns(flag: &str, family: vault::wallet::Family) -> bool {
+    use vault::wallet::Family;
+    match family {
+        Family::Evm => flag.ends_with("gwei") || flag.ends_with("eth"),
+        Family::Tron => flag.ends_with("trx"),
+        Family::Solana => flag.ends_with("lamports") || flag.ends_with("sol"),
+    }
 }
 
 fn print_wallet(secret: &vault::model::SecretSummary) {
     if let Some(wallet) = &secret.wallet {
-        println!("  chain:            {} (chain id {})", wallet.chain.label(), wallet.chain.chain_id());
+        let family = wallet.chain.family();
+        match wallet.chain.chain_id() {
+            Some(id) => println!("  chain:            {} (chain id {id})", wallet.chain.label()),
+            None if wallet.chain.is_test() => println!("  chain:            {} (a test network: its tokens have no value)", wallet.chain.label()),
+            None => println!("  chain:            {}", wallet.chain.label()),
+        }
         println!("  address:          {}", wallet.checksummed);
-        println!("  caps:             {}", wallet.caps.describe());
+        println!("  caps:             {}", wallet.caps.describe(wallet.chain));
         println!(
-            "  last 24 hours:    ${} paid, {} ETH in fees at most",
+            "  last 24 hours:    ${} paid, {} in fees at most",
             vault::wallet::decimal(wallet.spent_today_micros as u128, 6),
-            vault::wallet::decimal(wallet.fees_today_wei as u128, 18)
+            family.fee_text(wallet.fees_today)
         );
     }
 }
 
-fn wallet_create(
-    paths: &Paths,
-    name: &str,
-    chain: &str,
-    per_payment: &str,
-    daily: &str,
-    max_fee_gwei: &str,
-    daily_fees_eth: &str,
-) -> Result<(), VaultError> {
+fn wallet_create(paths: &Paths, name: &str, chain: &str, per_payment: &str, daily: &str, fees: &FeeCapArgs) -> Result<(), VaultError> {
     vault::model::validate_name(name)?;
     let chain = vault::wallet::Chain::parse(chain)?;
-    let caps = caps_from(per_payment, daily, max_fee_gwei, daily_fees_eth)?;
+    let caps = caps_from(chain, Some(per_payment), Some(daily), fees, None)?;
     println!("Making wallet {name:?} on {}", chain.label());
-    println!("  caps:             {}", caps.describe());
+    println!("  caps:             {}", caps.describe(chain));
     println!("  its key is made in this vault and never shown or exported; it signs token payments only");
     println!("  only the recovery key can change the caps later");
     let typed = read_hidden("Paste the recovery key from the kit (AGE-SECRET-KEY-1...), hidden: ")?;
@@ -509,32 +591,25 @@ fn wallet_create(
     drop(typed);
     println!("Made wallet {:?} (id {}).", reply.secret.name, reply.secret.id);
     print_wallet(&reply.secret);
-    println!("Fund it by sending USDC or USDT, and a little ETH for fees, to the address above.");
+    let funding = match chain.family() {
+        vault::wallet::Family::Evm => "USDC or USDT, and a little ETH for fees",
+        vault::wallet::Family::Solana => "USDC (or USDT on mainnet), and a little SOL for fees and recipients' token accounts",
+        vault::wallet::Family::Tron => "USDT, and some TRX for energy and bandwidth (a Tron address is active once it holds TRX)",
+    };
+    println!("Fund it by sending {funding} to the address above.");
     print_backup(&reply.backup);
     Ok(())
 }
 
-fn wallet_caps(
-    paths: &Paths,
-    name: &str,
-    per_payment: Option<String>,
-    daily: Option<String>,
-    max_fee_gwei: Option<String>,
-    daily_fees_eth: Option<String>,
-) -> Result<(), VaultError> {
+fn wallet_caps(paths: &Paths, name: &str, per_payment: Option<String>, daily: Option<String>, fees: &FeeCapArgs) -> Result<(), VaultError> {
     let listed = client::list(paths)?;
     let secret = listed.secrets.iter().find(|secret| secret.name == name).ok_or_else(|| VaultError::UnknownSecret(name.into()))?;
-    let current = secret.wallet.as_ref().ok_or(VaultError::WrongKind)?.caps;
-    let keep = |units: u64, decimals: u32| vault::wallet::decimal(units as u128, decimals);
-    let caps = caps_from(
-        &per_payment.unwrap_or_else(|| keep(current.per_payment_micros, 6)),
-        &daily.unwrap_or_else(|| keep(current.daily_micros, 6)),
-        &max_fee_gwei.unwrap_or_else(|| keep(current.max_fee_per_gas, 9)),
-        &daily_fees_eth.unwrap_or_else(|| keep(current.daily_fees_wei, 18)),
-    )?;
+    let wallet = secret.wallet.as_ref().ok_or(VaultError::WrongKind)?;
+    let (chain, current) = (wallet.chain, wallet.caps);
+    let caps = caps_from(chain, per_payment.as_deref(), daily.as_deref(), fees, Some(current))?;
     println!("Changing the caps of wallet {name:?}");
-    println!("  now:              {}", current.describe());
-    println!("  new:              {}", caps.describe());
+    println!("  now:              {}", current.describe(chain));
+    println!("  new:              {}", caps.describe(chain));
     let typed = read_hidden("Paste the recovery key from the kit (AGE-SECRET-KEY-1...), hidden: ")?;
     let reply = client::wallet_caps(paths, &SecretRef::Name(name.into()), &caps, &typed)?;
     drop(typed);

@@ -45,14 +45,12 @@ pub struct NewSecret {
     pub leasable: bool,
 }
 
-/// What `sign` made: the payment as checked, its first transaction and its ladder, signed, and
-/// what it counted against the caps.
+/// What `sign` made: the payment as checked, its first transaction and (Ethereum) its ladder,
+/// signed, and what it counted against the caps.
 pub struct SignOutcome {
     pub summary: SecretSummary,
-    pub from: String,
     pub payment: Payment,
-    pub signed: crate::evm::Signed,
-    pub ladder: Vec<(wallet::Fees, crate::evm::Signed)>,
+    pub signatures: wallet::Signatures,
     pub counted: wallet::Counted,
     pub backup: BackupStatus,
 }
@@ -553,12 +551,11 @@ impl Vault {
         self.ready_for_change()?;
         self.check_recovery_key(recovery_key, "wallet-create", name)?;
         model::validate_name(name)?;
-        caps.validate()?;
+        caps.validate(chain)?;
         if self.doc.find(name).is_some() {
             return Err(VaultError::NameTaken(name.into()));
         }
-        let key = crate::evm::new_key()?;
-        let address = crate::evm::address_text(&crate::evm::address_of_key(&key)?);
+        let (key, address) = wallet::new_key(chain)?;
         let mut id = store::new_random_id()?;
         while self.doc.records.iter().any(|record| record.id == id) {
             id = store::new_random_id()?;
@@ -605,21 +602,22 @@ impl Vault {
         self.ready_for_change()?;
         let label = self.doc.find_ref(secret).map(|record| record.name.clone()).unwrap_or_else(|| secret.label());
         self.check_recovery_key(recovery_key, "wallet-caps", &label)?;
-        caps.validate()?;
         let record = match secret {
             SecretRef::Name(name) => self.doc.records.iter_mut().find(|record| &record.name == name),
             SecretRef::Id(id) => self.doc.records.iter_mut().find(|record| &record.id == id),
         }
         .ok_or_else(|| secret.not_found())?;
         let info = record.wallet.as_mut().filter(|_| record.kind == Kind::Wallet).ok_or(VaultError::WrongKind)?;
+        caps.validate(info.chain)?;
         let before = info.caps;
+        let chain = info.chain;
         info.caps = caps;
         record.version += 1;
         record.updated_at = Some(crate::now_rfc3339());
         let summary = record.summary();
         let mut event = AuditEvent::named("wallet-caps", &summary.name, "ok");
         event.secret_id = Some(summary.id.clone());
-        event.detail = Some(format!("caps were {}; now {}", before.describe(), caps.describe()));
+        event.detail = Some(format!("caps were {}; now {}", before.describe(chain), caps.describe(chain)));
         let status = self.commit(event)?;
         Ok((summary, status))
     }
@@ -638,24 +636,21 @@ impl Vault {
         self.reload()?;
         self.ready_for_change()?;
         let now = crate::now_unix();
+        let now_ms = crate::now_unix_ms();
         let index = self.doc.records.iter().position(|record| match secret {
             SecretRef::Name(name) => &record.name == name,
             SecretRef::Id(id) => &record.id == id,
         });
         let record = &self.doc.records[index.ok_or_else(|| secret.not_found())?];
         let info = record.wallet.as_ref().filter(|_| record.kind == Kind::Wallet).ok_or(VaultError::WrongKind)?;
-        let payment = wallet::check(info, args)?;
+        let payment = wallet::check(info, args, now_ms)?;
         let counted = wallet::decide(info, &payment, now)?;
-        let from = crate::evm::parse_address(&info.address).map_err(|_| VaultError::VaultFileCorrupt)?;
-        let signed = crate::evm::sign(&payment.tx(payment.first), &record.value, &from)?;
-        let mut ladder = Vec::with_capacity(payment.ladder.len());
-        for fees in &payment.ladder {
-            ladder.push((*fees, crate::evm::sign(&payment.tx(*fees), &record.value, &from)?));
-        }
+        let signatures = wallet::sign(info, &payment, &record.value)?;
+        let family = info.chain.family();
         let index = index.ok_or(VaultError::VaultFileCorrupt)?;
         let record = &mut self.doc.records[index];
         if let Some(info) = record.wallet.as_mut() {
-            wallet::record(info, &payment, counted, now);
+            wallet::record(info, &payment, counted, now)?;
         }
         self.check_fits()?;
         let record = &self.doc.records[index];
@@ -663,24 +658,24 @@ impl Vault {
         let mut event = AuditEvent::named("sign", &record.name, "ok");
         event.secret_id = Some(record.id.clone());
         event.detail = Some(format!(
-            "{}; hash 0x{}; {}",
+            "{}; hash {}; {}",
             payment.describe(),
-            hex::encode(signed.hash),
-            if counted.replaces.is_some() {
-                format!(
-                    "replaces the same transfer at this nonce: no amount counted again, {} ETH more worst-case fees",
-                    wallet::decimal(counted.fee_wei as u128, 18)
-                )
-            } else {
-                format!(
-                    "counted ${} and {} ETH worst-case fees against the daily caps",
+            signatures.first.hash,
+            match (counted.replaces, &payment.plan) {
+                (Some(_), wallet::Plan::Evm(_)) => format!(
+                    "replaces the same transfer at this nonce: no amount counted again, {} more worst-case fees",
+                    family.fee_text(counted.fee)
+                ),
+                (Some(_), _) => "the same transaction asked for again: nothing counted again".to_string(),
+                (None, _) => format!(
+                    "counted ${} and {} worst-case fees against the daily caps",
                     wallet::decimal(counted.micros as u128, 6),
-                    wallet::decimal(counted.fee_wei as u128, 18)
-                )
+                    family.fee_text(counted.fee)
+                ),
             }
         ));
         let backup = self.commit(stamp(event))?;
-        Ok(SignOutcome { summary, from: crate::evm::address_text(&from), payment, signed, ladder, counted, backup })
+        Ok(SignOutcome { summary, payment, signatures, counted, backup })
     }
 
     /// `sign` with `cancel` (#7491): a 0-ETH transfer from the wallet to itself at the nonce of a
@@ -739,7 +734,7 @@ impl Vault {
             hex::encode(signed.hash),
             ladder_text,
             wallet::decimal(cancel.worst_fee_wei() as u128, 18),
-            wallet::decimal(counted.fee_wei as u128, 18)
+            wallet::decimal(counted.fee as u128, 18)
         ));
         let backup = self.commit(stamp(event))?;
         Ok(CancelOutcome { summary, cancel, signed, ladder, counted, backup })
@@ -1197,7 +1192,7 @@ impl Vault {
 /// How the audit log describes a stored secret: its kind and rule, or its kind and site.
 fn describe(record: &Record) -> String {
     if let Some(info) = &record.wallet {
-        return format!("wallet on {} at {}; caps {}", info.chain.label(), info.address, info.caps.describe());
+        return format!("wallet on {} at {}; caps {}", info.chain.label(), info.address, info.caps.describe(info.chain));
     }
     match &record.rule {
         Some(rule) => format!("{}; rule {}", record.kind.label(), rule.describe()),

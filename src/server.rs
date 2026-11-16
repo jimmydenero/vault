@@ -662,35 +662,7 @@ impl Server {
             Request::Lease { job, recipient, secrets, ttl_seconds } => {
                 self.lease(stream, peer, &job, &recipient, &secrets, ttl_seconds)
             }
-            Request::Sign {
-                secret,
-                chain,
-                token,
-                to,
-                amount,
-                nonce,
-                gas_limit,
-                max_fee_per_gas,
-                max_priority_fee_per_gas,
-                ladder,
-                ladder_max_fee_per_gas,
-                on_behalf_of,
-            } => {
-                let args = SignArgs {
-                    chain: &chain,
-                    token: &token,
-                    to: &to,
-                    amount: &amount,
-                    nonce,
-                    gas_limit,
-                    max_fee_per_gas,
-                    max_priority_fee_per_gas,
-                    ladder,
-                    ladder_max_fee_per_gas,
-                    on_behalf_of: on_behalf_of.as_deref(),
-                };
-                self.sign(stream, peer, &secret, &args)
-            }
+            Request::Sign { secret, fields } => self.sign(stream, peer, &secret, &fields.args()),
             Request::SignCancel {
                 secret,
                 chain,
@@ -929,41 +901,45 @@ impl Server {
         }
     }
 
-    /// `sign` (#7440): one token transfer the vault builds from structured fields, within the
-    /// wallet's caps, signed with its ladder. The `sign` line (chain, token, amount, recipient,
-    /// nonce, fees, hash, the caller) is written with the change that records the payment, and
-    /// the ladder's `sign-ladder` line (how many rungs, the top fee, the worst-case fee, the
-    /// hashes) is flushed to disk after it: both before the answer leaves (R28); no line, no
-    /// signature. A refusal is one `sign denied: <code>` line.
+    /// `sign` (#7440, #7490): one token transfer the vault builds from structured fields, within
+    /// the wallet's caps, signed (on Ethereum with its ladder). The `sign` line (chain, token,
+    /// amount, recipient, the chain's terms, hash, the caller) is written with the change that
+    /// records the payment, and an Ethereum ladder's `sign-ladder` line (how many rungs, the top
+    /// fee, the worst-case fee, the hashes) is flushed to disk after it: both before the answer
+    /// leaves (R28); no line, no signature. A refusal is one `sign denied: <code>` line.
     fn sign(&self, out: &mut UnixStream, peer: &Caller, secret: &SecretRef, args: &SignArgs<'_>) -> std::io::Result<()> {
         let result = (|| -> Result<SignReply, VaultError> {
             let outcome = self.with_vault(|vault| vault.sign_payment(secret, args, |event| with_peer(event, peer)))?;
             let payment = &outcome.payment;
-            if !outcome.ladder.is_empty() {
+            let family = payment.chain.family();
+            if let (wallet::Plan::Evm(plan), false) = (&payment.plan, outcome.signatures.ladder.is_empty()) {
+                let top = payment.top().unwrap_or(plan.first);
                 let mut event = AuditEvent::named("sign-ladder", &outcome.summary.name, "ok");
                 event.secret_id = Some(outcome.summary.id.clone());
                 event.detail = Some(format!(
-                    "{} replacement(s) of {} {} {} to {} at nonce {}: top max fee {} gwei/gas, worst-case fee {} ETH; hashes {}",
-                    outcome.ladder.len(),
+                    "{} replacement(s) of {} {} {} to {} at nonce {}: top max fee {} gwei/gas, worst-case fee {}; hashes {}",
+                    outcome.signatures.ladder.len(),
                     payment.chain.label(),
                     payment.amount_text(),
                     payment.token.label(),
                     payment.to_text,
-                    payment.nonce,
-                    wallet::decimal(payment.top().max_fee_per_gas as u128, 9),
-                    wallet::decimal(payment.worst_fee_wei() as u128, 18),
-                    outcome.ladder.iter().map(|(_, signed)| format!("0x{}", hex::encode(signed.hash))).collect::<Vec<_>>().join(", ")
+                    plan.nonce,
+                    wallet::decimal(top.max_fee_per_gas as u128, 9),
+                    family.fee_text(payment.worst_fee()),
+                    outcome.signatures.ladder.iter().map(|signed| signed.hash.clone()).collect::<Vec<_>>().join(", ")
                 ));
                 self.record(with_peer(event, peer))?;
             }
-            let out_tx = |fees: wallet::Fees, signed: &crate::evm::Signed| SignedTx {
-                raw: format!("0x{}", hex::encode(&signed.raw)),
-                hash: format!("0x{}", hex::encode(signed.hash)),
-                max_fee_per_gas: fees.max_fee_per_gas,
-                max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+            let out_tx = |signed: &wallet::SignedTx| SignedTx {
+                raw: signed.raw.clone(),
+                hash: signed.hash.clone(),
+                max_fee_per_gas: signed.fees.map(|fees| fees.max_fee_per_gas),
+                max_priority_fee_per_gas: signed.fees.map(|fees| fees.max_priority_fee_per_gas),
+                raw_data_hex: signed.raw_data_hex.clone(),
             };
             let wallet = outcome.summary.wallet.as_ref().ok_or(VaultError::VaultFileCorrupt)?;
-            Ok(SignReply {
+            let evm = family == wallet::Family::Evm;
+            let mut reply = SignReply {
                 ok: true,
                 id: outcome.summary.id.clone(),
                 name: outcome.summary.name.clone(),
@@ -972,21 +948,48 @@ impl Server {
                 from: wallet.checksummed.clone(),
                 to: payment.to_text.clone(),
                 token: payment.token,
-                contract: crate::evm::address_text(&payment.contract),
+                contract: payment.contract_text.clone(),
                 amount: payment.amount_text(),
-                nonce: payment.nonce,
-                gas_limit: payment.gas_limit,
-                signed: out_tx(payment.first, &outcome.signed),
-                ladder: outcome.ladder.iter().map(|(fees, signed)| out_tx(*fees, signed)).collect(),
-                worst_fee_wei: payment.worst_fee_wei(),
+                nonce: None,
+                gas_limit: None,
+                source_token_account: None,
+                recipient_token_account: None,
+                recent_blockhash: None,
+                creates_recipient_account: None,
+                expiration: None,
+                fee_limit: None,
+                signed: out_tx(&outcome.signatures.first),
+                ladder: outcome.signatures.ladder.iter().map(out_tx).collect(),
+                worst_fee: payment.worst_fee(),
+                fee_unit: family.fee_unit().to_string(),
                 replacement: outcome.counted.replaces.is_some(),
                 counted_micros: outcome.counted.micros,
-                counted_fees_wei: outcome.counted.fee_wei,
+                counted_fees: outcome.counted.fee,
                 caps: wallet.caps,
                 spent_today_micros: wallet.spent_today_micros,
-                fees_today_wei: wallet.fees_today_wei,
+                fees_today: wallet.fees_today,
+                worst_fee_wei: evm.then_some(payment.worst_fee()),
+                counted_fees_wei: evm.then_some(outcome.counted.fee),
+                fees_today_wei: evm.then_some(wallet.fees_today),
                 backup: outcome.backup,
-            })
+            };
+            match &payment.plan {
+                wallet::Plan::Evm(plan) => {
+                    reply.nonce = Some(plan.nonce);
+                    reply.gas_limit = Some(plan.gas_limit);
+                }
+                wallet::Plan::Solana(transfer) => {
+                    reply.source_token_account = Some(crate::solana::address_text(&transfer.source()?));
+                    reply.recipient_token_account = Some(crate::solana::address_text(&transfer.destination()?));
+                    reply.recent_blockhash = Some(crate::solana::address_text(&transfer.recent_blockhash));
+                    reply.creates_recipient_account = Some(transfer.create_recipient_account);
+                }
+                wallet::Plan::Tron(transfer) => {
+                    reply.expiration = Some(transfer.expiration);
+                    reply.fee_limit = Some(transfer.fee_limit);
+                }
+            }
+            Ok(reply)
         })();
         match result {
             Ok(reply_value) => reply(out, &peer.envelope, &reply_value),
@@ -1000,8 +1003,8 @@ impl Server {
                 let shown_for: String =
                     args.on_behalf_of.unwrap_or("").chars().filter(|c| !c.is_control()).take(wallet::MAX_LABEL_CHARS).collect();
                 event.detail = Some(format!(
-                    "{shown_chain} {shown_amount} {shown_token} to {shown_to} at nonce {}{}: {error}",
-                    args.nonce,
+                    "{shown_chain} {shown_amount} {shown_token} to {shown_to}{}{}: {error}",
+                    args.nonce.map(|nonce| format!(" at nonce {nonce}")).unwrap_or_default(),
                     if shown_for.is_empty() { String::new() } else { format!(", for {shown_for}") }
                 ));
                 self.audit(with_peer(event, peer));
@@ -1021,8 +1024,9 @@ impl Server {
             let out_tx = |fees: wallet::Fees, signed: &crate::evm::Signed| SignedTx {
                 raw: format!("0x{}", hex::encode(&signed.raw)),
                 hash: format!("0x{}", hex::encode(signed.hash)),
-                max_fee_per_gas: fees.max_fee_per_gas,
-                max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+                max_fee_per_gas: Some(fees.max_fee_per_gas),
+                max_priority_fee_per_gas: Some(fees.max_priority_fee_per_gas),
+                raw_data_hex: None,
             };
             let wallet = outcome.summary.wallet.as_ref().ok_or(VaultError::VaultFileCorrupt)?;
             Ok(CancelReply {
@@ -1031,7 +1035,7 @@ impl Server {
                 id: outcome.summary.id.clone(),
                 name: outcome.summary.name.clone(),
                 chain: cancel.chain,
-                chain_id: cancel.chain.chain_id(),
+                chain_id: cancel.chain.chain_id().unwrap_or(0),
                 from: wallet.checksummed.clone(),
                 to: wallet.checksummed.clone(),
                 nonce: cancel.nonce,
@@ -1040,10 +1044,10 @@ impl Server {
                 signed: out_tx(cancel.first, &outcome.signed),
                 ladder: outcome.ladder.iter().map(|(fees, signed)| out_tx(*fees, signed)).collect(),
                 worst_fee_wei: cancel.worst_fee_wei(),
-                counted_fees_wei: outcome.counted.fee_wei,
+                counted_fees_wei: outcome.counted.fee,
                 caps: wallet.caps,
                 spent_today_micros: wallet.spent_today_micros,
-                fees_today_wei: wallet.fees_today_wei,
+                fees_today_wei: wallet.fees_today,
                 backup: outcome.backup,
             })
         })();
