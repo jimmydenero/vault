@@ -88,10 +88,10 @@ From a release, with no Rust toolchain (the Linux builds are static; see
 [docs/releasing.md](docs/releasing.md) for every target and how releases are made):
 
 ```sh
-curl -fsSLO https://github.com/volgenic/vault/releases/download/v0.3.0/vault-0.3.0-x86_64-unknown-linux-musl.tar.gz
-curl -fsSLO https://github.com/volgenic/vault/releases/download/v0.3.0/SHA256SUMS
+curl -fsSLO https://github.com/volgenic/vault/releases/download/v0.4.0/vault-0.4.0-x86_64-unknown-linux-musl.tar.gz
+curl -fsSLO https://github.com/volgenic/vault/releases/download/v0.4.0/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
-tar xzf vault-0.3.0-x86_64-unknown-linux-musl.tar.gz && vault-0.3.0-x86_64-unknown-linux-musl/vault install
+tar xzf vault-0.4.0-x86_64-unknown-linux-musl.tar.gz && vault-0.4.0-x86_64-unknown-linux-musl/vault install
 ```
 
 Or from source:
