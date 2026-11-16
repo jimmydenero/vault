@@ -131,7 +131,7 @@ pub fn run() -> Result<(), VaultError> {
     let started = std::time::Instant::now();
     match audit::check(&paths.audit_log, &mut audit_check, opened.as_ref().map(Vault::audit_head)) {
         Ok(()) => log(&format!(
-            "audit log: {} lines in {} files, hash chain intact (checked in {} ms)",
+            "audit log: {} lines in {} file(s), hash chain intact (checked in {} ms)",
             audit_check.lines(),
             audit_check.files(),
             started.elapsed().as_millis()

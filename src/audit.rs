@@ -233,17 +233,44 @@ struct Position {
     line: usize,
 }
 
+/// A rotated file as it was when it was checked to its end. A rotated file is never written
+/// again, so any change to it (an edit, a truncation, a copy put in its place) changes its size,
+/// its inode or its change time, which nobody but the kernel sets.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Stamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl Stamp {
+    fn of(meta: &fs::Metadata) -> Stamp {
+        Stamp {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
 /// How far the chain has been checked, kept in the daemon's memory so `vault status` and
-/// `vault audit` check only the lines written since the last check (R29). A full check, from the
-/// first file, runs at the daemon's start, for `vault audit --all`, and whenever the checkpoint
-/// can't be followed: its file is gone or shorter, a new line doesn't follow, or the head the
-/// vault file records isn't among the new lines.
+/// `vault audit` check only the lines written since the last check (R29), plus one `stat` per
+/// rotated file to see it is unchanged. A full check, from the first file, runs at the daemon's
+/// start, for `vault audit --all`, and whenever the checkpoint can't be followed: a rotated file
+/// is gone, added or changed, the checkpoint's file is gone or shorter, a new line doesn't
+/// follow, or the head the vault file records isn't among the new lines.
 #[derive(Clone, Debug)]
 pub struct Checkpoint {
     lines: usize,
     files: usize,
     head: String,
     at: Option<Position>,
+    /// The rotated files before `at`'s, as they were when they were checked to their end.
+    sealed: Vec<Stamp>,
     /// The last head the vault file recorded that was found in the chain.
     found_head: Option<String>,
     tail: VecDeque<AuditLine>,
@@ -257,6 +284,7 @@ impl Default for Checkpoint {
             files: 0,
             head: GENESIS.into(),
             at: None,
+            sealed: Vec::new(),
             found_head: None,
             tail: VecDeque::new(),
             recent: VecDeque::new(),
@@ -356,6 +384,14 @@ fn walk(
             None => return Ok(Err(LostPlace)),
         },
     };
+    if cp.sealed.len() != start {
+        return Ok(Err(LostPlace));
+    }
+    for (stamp, segment) in cp.sealed.iter().zip(&segments[..start]) {
+        if *stamp != Stamp::of(&segment.file.metadata()?) {
+            return Ok(Err(LostPlace));
+        }
+    }
     let mut buf = Vec::with_capacity(1024);
     for (index, segment) in segments.iter_mut().enumerate().skip(start) {
         let (mut offset, mut line_no) = match position.take() {
@@ -400,6 +436,9 @@ fn walk(
             visit(line);
         }
         cp.at = Some(Position { dev: segment.dev, ino: segment.ino, offset, line: line_no });
+        if !last {
+            cp.sealed.push(Stamp::of(&segment.file.metadata()?));
+        }
     }
     cp.files = count;
     Ok(Ok(()))
