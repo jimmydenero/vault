@@ -22,7 +22,7 @@ use vault::secret::SecretValue;
 use vault::store::{self, Paths};
 
 #[derive(Parser)]
-#[command(name = "vault", version, about = "Volgenic's vault: agents use your secrets without seeing them.")]
+#[command(name = "vault", version = vault::VERSION_LINE, about = "Volgenic's vault: agents use your secrets without seeing them.")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -36,6 +36,9 @@ enum Command {
         /// Install without making a vault, to restore one from a backup file next.
         #[arg(long)]
         for_restore: bool,
+        /// Print one JSON object for a program instead of prose. Never prompts.
+        #[arg(long)]
+        json: bool,
     },
     /// Install the agent in your login that copies backups to the mirror folder (no sudo).
     InstallMirror {
@@ -85,7 +88,11 @@ enum Command {
     /// List secrets: ids, names, kinds, sites and versions only.
     List,
     /// Show the vault's state. Information only; never a value.
-    Status,
+    Status {
+        /// Print one JSON object for a program (no secret names, no values).
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the audit log and check its hash chain.
     Audit {
         /// Show every line, not just the last 25.
@@ -127,7 +134,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let paths = Paths::current();
     let result = match cli.command {
-        Command::Install { for_restore } => install::install(for_restore),
+        Command::Install { for_restore, json } => install::install(for_restore, json),
         Command::InstallMirror { yes } => install::install_mirror(yes),
         Command::ConfirmKit => confirm_kit(&paths),
         Command::Add { name, kind, site, host, port, methods, path, header, username, yes } => {
@@ -136,7 +143,8 @@ fn main() -> ExitCode {
         Command::Delete { name, yes } => delete(&paths, &name, yes),
         Command::Rename { name, new_name } => rename(&paths, &name, &new_name),
         Command::List => list(&paths),
-        Command::Status => status(&paths),
+        Command::Status { json: true } => status_json(&paths),
+        Command::Status { json: false } => status(&paths),
         Command::Audit { all } => show_audit(&paths, all),
         Command::VerifyBackup { with_recovery_key } => verify_backup(&paths, with_recovery_key),
         Command::Backup => backup_now(&paths),
@@ -342,6 +350,15 @@ fn owner_and_mode(path: &std::path::Path) -> String {
         }
         Err(_) => "missing".into(),
     }
+}
+
+/// `vault status --json`: always one JSON object on standard output, and success, whatever the
+/// vault's state; `healthy` and `problems` say what is wrong.
+fn status_json(paths: &Paths) -> Result<(), VaultError> {
+    let status = vault::report::gather_status(paths);
+    let text = serde_json::to_string_pretty(&status).map_err(|_| VaultError::Io("JSON encoding".into()))?;
+    println!("{text}");
+    Ok(())
 }
 
 fn status(paths: &Paths) -> Result<(), VaultError> {
