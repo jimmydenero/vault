@@ -19,9 +19,17 @@
 //!   {"op":"totp","name":"github-2fa"}                  (or "id":"<32 hex digits>")
 //!   {"op":"proxy","name":"openai","method":"GET","path":"/v1/models",
 //!    "headers":{"accept":"application/json"},"body":"..."}            (or "body_base64")
+//!   {"op":"proxy","name":"openai","host":"api.openai.com","port":443,"method":"GET",
+//!    "path":"/v1/models"}                       (host and port optional; see below)
 //!   {"op":"stream","name":"main","method":"POST","path":"/v1/messages?beta=true",
 //!    "headers":[["anthropic-version","2023-06-01"]],"body_len":1234}  then 1234 body bytes
 //!   {"op":"health"}
+//!
+//! **`proxy`'s destination.** The key's rule alone decides where a `proxy` call goes. A caller
+//! may name the destination it meant, `host` (compared case-insensitively) and `port` (a number
+//! or its decimal text; 443 when only `host` is given): when that isn't the rule's, the call is
+//! refused `rule_mismatch` before anything is sent, and the refusal is audited with the host
+//! asked for, as `stream` refuses one. Without either, the call goes to the rule's host as before.
 //!
 //! For the host daemon and Volgenic's app (R40, R41):
 //!   {"op":"add_sealed","name":"main","kind":"claude_plan","sealed_base64":"...","replace":true}
@@ -186,6 +194,10 @@ pub enum Request {
     },
     Proxy {
         secret: SecretRef,
+        /// The destination the caller meant, if it names one: refused unless it's the key's
+        /// rule's (`rules::check_destination`). Left out, the rule's host and port.
+        host: Option<String>,
+        port: Option<u16>,
         method: String,
         path: String,
         headers: BTreeMap<String, String>,
@@ -302,6 +314,10 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
         name: Option<String>,
         #[serde(default)]
         id: Option<String>,
+        #[serde(default)]
+        host: Option<String>,
+        #[serde(default)]
+        port: Option<PortWire>,
         method: String,
         path: String,
         #[serde(default)]
@@ -310,6 +326,23 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
         body: Option<String>,
         #[serde(default)]
         body_base64: Option<String>,
+    }
+
+    /// A port as a number or as its decimal text (a URL's port is often kept as text).
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum PortWire {
+        Number(u16),
+        Text(String),
+    }
+
+    impl PortWire {
+        fn port(self) -> Result<u16, serde_json::Error> {
+            match self {
+                PortWire::Number(port) => Ok(port),
+                PortWire::Text(text) => text.parse().map_err(|_| serde_json::Error::custom("port isn't a port number")),
+            }
+        }
     }
 
     /// Headers as `[[name, value], ...]` (order kept, names may repeat) or as an object.
@@ -470,6 +503,8 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
             let w: ProxyWire = serde_json::from_slice(line)?;
             Request::Proxy {
                 secret: secret_ref(w.name, w.id)?,
+                host: w.host,
+                port: w.port.map(PortWire::port).transpose()?,
                 method: w.method,
                 path: w.path,
                 headers: w.headers,

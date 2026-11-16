@@ -205,6 +205,23 @@ pub fn path_within(prefix: &str, path: &str) -> bool {
     path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// Checks the host and port a caller named, if any, against the rule's. The rule alone decides
+/// where a request goes; a caller who names a destination (core's relay passes on the URL it was
+/// given) is refused when that isn't the rule's, rather than sent to the rule's host unasked.
+/// The host compares case-insensitively; a port left out is 443 once either is named.
+pub fn check_destination(rule: &ProxyRule, host: Option<&str>, port: Option<u16>) -> Result<(), VaultError> {
+    if host.is_some_and(|host| !host.eq_ignore_ascii_case(&rule.host)) {
+        return Err(VaultError::RuleMismatch("the host isn't the key's rule's host".into()));
+    }
+    if host.is_some() || port.is_some() {
+        let port = port.unwrap_or(443);
+        if port != rule.port {
+            return Err(VaultError::RuleMismatch(format!("port {port} isn't the key's rule's port")));
+        }
+    }
+    Ok(())
+}
+
 /// Checks the method and path against the rule.
 pub fn check_against_rule(rule: &ProxyRule, method: &str, path: &str) -> Result<(), VaultError> {
     let method = method.to_ascii_uppercase();
