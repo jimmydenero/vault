@@ -45,6 +45,24 @@
 //! secret it holds that may not be leased refuses the whole request:
 //! `{"ok":false,"error":"not_leasable","message","names":[...]}`.
 //!
+//! For the host daemon's payment relay (#7440), and the command line for the two that need the
+//! recovery key:
+//!   {"op":"sign","name":"main-wallet","chain":"ethereum","token":"USDC",
+//!    "to":"0x...","amount":"12.50","nonce":7,"gas_limit":78000,
+//!    "max_fee_per_gas":30000000000,"max_priority_fee_per_gas":1500000000,
+//!    "ladder":4,"ladder_max_fee_per_gas":45000000000,"on_behalf_of":"agent @x, item #123"}
+//!                                       (or "id"; ladder, its ceiling and on_behalf_of optional)
+//!   {"op":"wallet_create","name":"main-wallet","chain":"ethereum","caps":{...},"recovery_key":"AGE-SECRET-KEY-1..."}
+//!   {"op":"wallet_caps","name":"main-wallet","caps":{...},"recovery_key":"AGE-SECRET-KEY-1..."}
+//!
+//! **`sign`** (`wallet`) signs one token transfer the vault builds itself from those fields,
+//! within the wallet's caps, and answers the signed transaction and its ladder (the same
+//! transfer at rising fees, for the relay to send if the first stalls):
+//! `{"ok":true,"signed":{"raw","hash","max_fee_per_gas","max_priority_fee_per_gas"},"ladder":[...],...}`.
+//! Over a cap it answers `over_cap` and signs nothing. `caps` is
+//! `{"per_payment_micros","daily_micros","max_fee_per_gas","daily_fees_wei"}`: dollars in
+//! millionths, fees in wei. Fees and amounts in wei are JSON numbers up to 2^64.
+//!
 //! **`stream`** (R39) sends one request with a credential whose kind (`kinds`) or rule (an API key)
 //! decides the host, the methods, the paths and the headers the vault sets, and streams the reply
 //! back as it arrives. Its body follows the request line as raw bytes, exactly `body_len` of them
@@ -80,7 +98,7 @@
 //! No reply type has a field that could carry a secret value (R4): `SecretValue` doesn't
 //! implement `Serialize`, so it can't appear in any of them. The one exception is ciphertext:
 //! `lease` answers app secrets sealed to the job's own key (`lease::seal`), which only that key
-//! opens.
+//! opens. A wallet's key is in no reply at all, sealed or not; `sign` answers signatures.
 
 use std::collections::BTreeMap;
 
@@ -251,6 +269,31 @@ pub enum Request {
         /// The names, then the ids, as given.
         secrets: Vec<SecretRef>,
         ttl_seconds: u64,
+    },
+    Sign {
+        secret: SecretRef,
+        chain: String,
+        token: String,
+        to: String,
+        amount: String,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas: u64,
+        max_priority_fee_per_gas: u64,
+        ladder: usize,
+        ladder_max_fee_per_gas: Option<u64>,
+        on_behalf_of: Option<String>,
+    },
+    WalletCreate {
+        name: String,
+        chain: String,
+        caps: crate::wallet::Caps,
+        recovery_key: SecretValue,
+    },
+    WalletCaps {
+        secret: SecretRef,
+        caps: crate::wallet::Caps,
+        recovery_key: SecretValue,
     },
     Status,
     Audit {
@@ -439,6 +482,44 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
     }
 
     #[derive(Deserialize)]
+    struct SignWire {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        id: Option<String>,
+        chain: String,
+        token: String,
+        to: String,
+        amount: String,
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas: u64,
+        max_priority_fee_per_gas: u64,
+        #[serde(default)]
+        ladder: usize,
+        #[serde(default)]
+        ladder_max_fee_per_gas: Option<u64>,
+        #[serde(default)]
+        on_behalf_of: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct WalletCreateWire {
+        name: String,
+        chain: String,
+        caps: crate::wallet::Caps,
+        #[serde(deserialize_with = "secret_bytes::deserialize")]
+        recovery_key: SecretValue,
+    }
+
+    #[derive(Deserialize)]
+    struct WalletCapsWire {
+        caps: crate::wallet::Caps,
+        #[serde(deserialize_with = "secret_bytes::deserialize")]
+        recovery_key: SecretValue,
+    }
+
+    #[derive(Deserialize)]
     struct ClaimWire {
         version: u64,
     }
@@ -585,6 +666,32 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
             let secrets = w.names.into_iter().map(SecretRef::Name).chain(w.ids.into_iter().map(SecretRef::Id)).collect();
             Request::Lease { job: w.job, recipient: w.recipient, secrets, ttl_seconds: w.ttl_seconds }
         }
+        "sign" => {
+            let w: SignWire = serde_json::from_slice(line)?;
+            Request::Sign {
+                secret: secret_ref(w.name, w.id)?,
+                chain: w.chain,
+                token: w.token,
+                to: w.to,
+                amount: w.amount,
+                nonce: w.nonce,
+                gas_limit: w.gas_limit,
+                max_fee_per_gas: w.max_fee_per_gas,
+                max_priority_fee_per_gas: w.max_priority_fee_per_gas,
+                ladder: w.ladder,
+                ladder_max_fee_per_gas: w.ladder_max_fee_per_gas,
+                on_behalf_of: w.on_behalf_of,
+            }
+        }
+        "wallet_create" => {
+            let w: WalletCreateWire = serde_json::from_slice(line)?;
+            Request::WalletCreate { name: w.name, chain: w.chain, caps: w.caps, recovery_key: w.recovery_key }
+        }
+        "wallet_caps" => {
+            let secret = named(line)?;
+            let w: WalletCapsWire = serde_json::from_slice(line)?;
+            Request::WalletCaps { secret, caps: w.caps, recovery_key: w.recovery_key }
+        }
         "audit" => Request::Audit { all: serde_json::from_slice::<AuditWire>(line)?.all },
         "add" => {
             let w: AddWire = serde_json::from_slice(line)?;
@@ -639,6 +746,24 @@ pub(crate) enum SecretRequest<'a> {
         value: &'a SecretValue,
     },
     ConfirmKit {
+        #[serde(serialize_with = "secret_bytes::serialize_ref")]
+        recovery_key: &'a SecretValue,
+    },
+    #[serde(rename = "wallet_create")]
+    WalletCreate {
+        name: &'a str,
+        chain: &'a str,
+        caps: &'a crate::wallet::Caps,
+        #[serde(serialize_with = "secret_bytes::serialize_ref")]
+        recovery_key: &'a SecretValue,
+    },
+    #[serde(rename = "wallet_caps")]
+    WalletCaps {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<&'a str>,
+        caps: &'a crate::wallet::Caps,
         #[serde(serialize_with = "secret_bytes::serialize_ref")]
         recovery_key: &'a SecretValue,
     },
@@ -802,6 +927,58 @@ pub struct ClaimReply {
     pub already: bool,
     /// The backup of the change, or null when nothing changed.
     pub backup: Option<BackupStatus>,
+}
+
+/// A wallet made or its caps changed.
+#[derive(Serialize, Deserialize)]
+pub struct WalletReply {
+    pub ok: bool,
+    pub secret: SecretSummary,
+    pub backup: BackupStatus,
+}
+
+/// One signed transaction: its raw bytes (`0x` hex, for `eth_sendRawTransaction`), its hash and
+/// its fees.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SignedTx {
+    pub raw: String,
+    pub hash: String,
+    pub max_fee_per_gas: u64,
+    pub max_priority_fee_per_gas: u64,
+}
+
+/// `sign`'s answer: the transfer as the vault built it, the first transaction, the ladder in
+/// rising order, and what it counted against the caps. Signatures, never a key (R4).
+#[derive(Serialize, Deserialize)]
+pub struct SignReply {
+    pub ok: bool,
+    pub id: String,
+    pub name: String,
+    pub chain: crate::wallet::Chain,
+    pub chain_id: u64,
+    /// The wallet's address, EIP-55 mixed case.
+    pub from: String,
+    /// The recipient, canonical.
+    pub to: String,
+    pub token: crate::wallet::Token,
+    /// The token's contract the transaction calls.
+    pub contract: String,
+    pub amount: String,
+    pub nonce: u64,
+    pub gas_limit: u64,
+    pub signed: SignedTx,
+    pub ladder: Vec<SignedTx>,
+    /// The most any of these transactions could burn in fees: `gas_limit` at the top rung.
+    pub worst_fee_wei: u64,
+    /// The same transfer at the same nonce was signed in the last day: no amount counted again.
+    pub replacement: bool,
+    pub counted_micros: u64,
+    pub counted_fees_wei: u64,
+    /// The wallet's caps, and what the last 24 hours count against them now, this payment in.
+    pub caps: crate::wallet::Caps,
+    pub spent_today_micros: u64,
+    pub fees_today_wei: u64,
+    pub backup: BackupStatus,
 }
 
 /// One app secret of a lease: its value sealed to the job's key, as base64 of an age file.

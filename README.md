@@ -1,8 +1,8 @@
 # volgenic/vault
 
 Volgenic's vault keeps your agents' secrets (API keys, website logins, 2FA seeds, Claude plan
-tokens, Codex and Grok logins, your personal details, and your applications' build and deploy
-secrets) on your own
+tokens, Codex and Grok logins, your personal details, your applications' build and deploy
+secrets, and your agents' wallet keys) on your own
 machine (a Mac, or a Linux box such as the always-on primary host), and lets agents **use** them
 without ever **seeing** them. An agent asks the vault to make
 an API call and gets the API's reply; the vault adds the key on the way out. An agent asks for a
@@ -10,7 +10,9 @@ an API call and gets the API's reply; the vault adds the key on the way out. An 
 naming a Claude plan, and the vault adds the plan's token and streams the reply back as it
 arrives. Nothing the vault returns, to an agent or on the command line, can carry a secret value,
 with one exception: a build's `lease`, an app secret's value sealed to that build's own key for at
-most a day ("App secrets and leases" below).
+most a day ("App secrets and leases" below). A wallet's key is made inside the vault and never
+leaves it at all; agents' payments get the vault's signature, within caps only you set
+("Wallets" below).
 
 - Design: [Volgenic v2 secret store](https://volgenic.com/pages/1f495021-effc-4fd2-9160-24cbcd73dbe3)
 - Threat model, with the numbered rules (R1, R2, ...) every change is reviewed against:
@@ -121,10 +123,11 @@ Or restore a backup: `vault install --for-restore`, then `vault restore FILE`.
   recovery key does, and never names a machine. Its first 12 digits are the recovery-key
   fingerprint on the kit. The `vault_id` is the copy: new at every restore, and the prefix of
   the backup files' names.
-- **The vault file and backups are format 6** (format 2 plus the `claude_plan` kind and the
+- **The vault file and backups are format 7** (format 2 plus the `claude_plan` kind and the
   intake key in format 3, the `codex_login` and `grok_login` kinds and a login's handover
-  state in format 4, the `personal_details` kind in format 5, and the `app_secret` kind with its
-  application and lease flag in format 6). An older vault file is migrated at the daemon's first start, as a change of
+  state in format 4, the `personal_details` kind in format 5, the `app_secret` kind with its
+  application and lease flag in format 6, and the `wallet` kind with its chain, address, caps and
+  last day's payments in format 7). An older vault file is migrated at the daemon's first start, as a change of
   its own (audited and backed up): a format-1 file's secrets get their ids, and a format-2 file
   gets its intake key. Older backups restore too. An older build refuses a newer file or backup
   as newer (`newer_format`); don't go back to an older build after upgrading.
@@ -143,9 +146,11 @@ The `vault` tool can't print a secret, so it is safe for any agent on the machin
 | `vault add NAME --kind codex_login --yes < auth.json` | Adds a Codex login (its `auth.json`, whole), which the vault alone renews from then on. Used only by `stream`, only to `chatgpt.com`. `grok_login` likewise for Grok Build, to `cli-chat-proxy.grok.com`. The host's daemon normally hands logins over itself (`import_login` and `claim_refresh`, or `add_sealed`). |
 | `vault add NAME --kind personal_details` | Adds your real details (name, address, birthday, phone), asked one field at a time; leave any empty. Or `--yes` with v1's JSON object on standard input (`{"name","address","birthday","phone"}`). Stored and listed only, for now: `list` says which fields are filled, never what they say. See "Personal details" below. |
 | `vault add NAME --kind app_secret --app APP [--leasable]` | Adds one of an application's build or deploy secrets (an npm token, a database URL). With `--leasable` a build may lease it, sealed to the build's own key for at most a day; without it, it is stored and listed only. Set only when it is added. See "App secrets and leases" below. |
-| `vault delete NAME` | Deletes a secret. Earlier backups keep it. |
+| `vault wallet create NAME --per-payment USD --daily USD [--chain ethereum] [--max-fee-gwei 100] [--daily-fees-eth 0.02]` | Makes a wallet: the vault makes its key and never shows it, and prints the address to fund. Asks for the recovery key. See "Wallets" below. |
+| `vault wallet caps NAME [--per-payment USD] [--daily USD] [--max-fee-gwei N] [--daily-fees-eth N]` | Changes a wallet's caps (the ones you leave out stay). Asks for the recovery key. |
+| `vault delete NAME` | Deletes a secret. Earlier backups keep it. A wallet isn't deleted: its key is the only way to its funds. |
 | `vault rename NAME NEW` | Renames a secret; its id, rule and value stay, its version goes up. |
-| `vault list` | Ids, names, kinds, versions and sites; for personal details, which fields are filled; for app secrets, the application and whether builds may lease it. |
+| `vault list` | Ids, names, kinds, versions and sites; for personal details, which fields are filled; for app secrets, the application and whether builds may lease it; for wallets, the address, the caps and what the last 24 hours spent. |
 | `vault health` | For each Claude plan, Codex login and Grok login, by name: whether it works, has expired or was refused (sign in again), and who renews it. |
 | `vault status [--json]` | The program, the daemon, backups and the audit chain. `--json`: one JSON object for a program, with a `problems` list and the command for each ([docs/json.md](docs/json.md)); no secret names. |
 | `vault --version` | The version, the commit it was built from and the target. |
@@ -244,6 +249,8 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   (`{"v":1,"name":"shop-npm","kind":"app_secret","app":"shop","leasable":true,"value":"npm_..."}`);
   only an `app_secret` may carry either, and it too is added under a new name only.
 - **`lease`** seals app secrets to a build's own key (host only; "App secrets and leases" below).
+- **`sign`** signs one token payment from a wallet, within its caps, with a ladder of fee
+  bumps (the host's payment relay; "Wallets" below).
 - **`import_plan`** is the upgrade's move of the host's existing plan tokens into the vault:
   `{"op":"import_plan","plans":[{"name":"main","value":"sk-ant-oat01-..."}]}` returns each plan's
   `result` by name: `done` (added, or a different value replaced, version up), `unchanged` (already
@@ -259,7 +266,7 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   `backup`, `verify-backup`, `read-backup`, `mirror-plan`, `mirror-report`) are what the
   command-line tool and the mirror send; `src/protocol.rs` lists them.
 - Errors are `{"ok":false,"error":"rule_mismatch","message":"..."}`; `not_leasable` adds
-  `"names"`.
+  `"names"`. `sign` over a cap answers `over_cap`.
 
 ## Handing over a Codex or Grok login
 
@@ -352,6 +359,66 @@ The build makes an age X25519 key of its own, and the host's daemon asks:
 - **The accepted gap:** any process running as you can lease to a key of its own, as it can read
   the vault's files today. A lease is never automatic: only secrets you marked leasable, and each
   lease is in `vault audit`. See the threat model's 2026-11-16 (3) block.
+
+## Wallets
+
+Your agents' payments are signed by your vault, with a key that was made there and never leaves
+it (work item #7440). Volgenic's server never holds a key that spends money, so **payments wait
+while the vault's machine is off**; a payment already sent can still be sped up, because its fee
+bumps were signed in advance.
+
+- **`vault wallet create NAME --per-payment 50 --daily 200`** makes a key from the operating
+  system's random numbers, keeps it as the wallet's value, and prints the address to fund with
+  USDC or USDT (and a little ETH for fees). It asks for the recovery key: the socket can't tell
+  you from an agent, and the caps are yours alone to set. `vault wallet caps` changes them, the
+  same way.
+- **No request returns the key**, not even sealed: `add` and `add_sealed` refuse the `wallet`
+  kind (the vault never takes a key from outside), `lease` refuses it (`not_leasable`), `totp`,
+  `proxy` and `stream` refuse it (`wrong_kind`), and `delete` refuses it. Its only copies are the
+  vault file and its backups, which only the vault key and the Recovery Kit open.
+- **Chains:** `ethereum` (USDC and USDT) and `sepolia`, a test network (USDC), for a dry run.
+  Solana and Tron, which v1's agent wallets also used, come later.
+- **`sign`** takes structured fields only and builds the transaction itself: an EIP-1559
+  `transfer(recipient, amount)` call on the token's own contract, value 0. There is no field for
+  raw bytes or call data.
+
+```json
+{"protocol":2,"op":"sign","name":"main-wallet","chain":"ethereum","token":"USDC",
+ "to":"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed","amount":"12.50","nonce":7,"gas_limit":78000,
+ "max_fee_per_gas":30000000000,"max_priority_fee_per_gas":2000000000,"ladder":4,
+ "on_behalf_of":"agent @x, work item #123","request_id":"..."}
+```
+
+  It answers `{"ok":true,"signed":{"raw","hash","max_fee_per_gas","max_priority_fee_per_gas"},
+  "ladder":[...],"from","to","token","contract","amount","nonce","gas_limit","worst_fee_wei",
+  "replacement","counted_micros","counted_fees_wei","caps","spent_today_micros","fees_today_wei","backup"}`.
+  The relay broadcasts `signed.raw`; the vault never touches the network for a payment. The
+  recipient must be a real address (a mixed-case one with a matching checksum; not zero, not the
+  token's contract), the gas limit 21,000 to 150,000, the tip no more than the fee.
+- **Caps, set by you:** `per_payment` and `daily` (rolling 24 hours) in dollars, USDC and USDT one
+  for one; `max_fee_per_gas`, the highest fee per gas any signed transaction may offer (100 gwei
+  unless you say); and `daily_fees`, the most a day's signed transactions could burn in fees (0.02
+  ETH unless you say). A payment that would pass any of them is refused, `over_cap`, and nothing is
+  signed.
+- **The fee ladder:** with `"ladder":N` (0 to 4) the vault also signs N replacements: the same
+  transfer at the same nonce, each with both fees raised 12.5% (rounded up), the least a node
+  takes as a replacement. If the first stalls while the vault is off, the relay sends the next
+  rung. Only one transaction per nonce can mine, so a ladder never pays twice. **Its top is
+  bounded three ways:** at most 4 rungs (about 1.6 times the first fee); no rung above the
+  wallet's `max_fee_per_gas` or the caller's own `ladder_max_fee_per_gas`, whichever is lower (a
+  rung that would pass it isn't signed, so the ladder comes back shorter); and the whole ladder's
+  worst case (`gas_limit` times its top fee) counts against `daily_fees` before anything is signed.
+- **The same transfer at a nonce already signed for** in the last day counts once against the
+  amount caps (only one can mine; `"replacement":true`), and against the fee cap only for what it
+  raises the worst case by.
+- **Audit:** one `sign` line per payment (chain, amount, token, recipient, nonce, gas, fees, the
+  hash, what it counted, `on_behalf_of`, the caller hint and request id), written with the change
+  that records the payment, and one `sign-ladder` line per ladder (how many rungs, the top fee, the
+  worst-case fee, every hash), both flushed to disk before the answer leaves. A refusal is one
+  `sign denied: <code>` line. `wallet-create` and `wallet-caps` lines show the address and the
+  caps. Never a key.
+- **Each payment is a change** (the last day's payments are in the vault file, so the daily caps
+  survive a restart), with its own backup.
 
 ## Build
 

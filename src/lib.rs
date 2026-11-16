@@ -17,6 +17,7 @@ pub mod backup;
 pub mod client;
 pub mod details;
 pub mod error;
+pub mod evm;
 pub mod health;
 pub mod install;
 pub mod intake;
@@ -38,6 +39,7 @@ pub mod store;
 pub mod stream;
 pub mod totp;
 pub mod vault;
+pub mod wallet;
 
 /// The vault's version, from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

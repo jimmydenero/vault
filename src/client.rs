@@ -27,7 +27,7 @@ use crate::platform;
 use crate::protocol::{
     self, AddReply, AuditReply, BackupCheck, BackupReply, ConfirmKitReply, ErrorReply, HealthReply, ListReply, MirrorPlanReply,
     OkReply, Outgoing, ReadBackupReply, RenameReply, ReplyFrame, ResetReply, RestoreReply, RuleInput, SecretRequest,
-    StatusReply, VerifyBackupReply,
+    StatusReply, VerifyBackupReply, WalletReply,
 };
 use crate::secret::SecretValue;
 use crate::store::{self, Paths};
@@ -178,6 +178,31 @@ pub fn rename(paths: &Paths, secret: &SecretRef, new_name: &str) -> Result<Renam
 
 pub fn confirm_kit(paths: &Paths, recovery_key: &SecretValue) -> Result<ConfirmKitReply, VaultError> {
     call_secret(paths, &SecretRequest::ConfirmKit { recovery_key }, None, CHANGE_WAIT)
+}
+
+/// Makes a wallet: the vault makes its key itself (#7440). Needs the recovery key.
+pub fn wallet_create(
+    paths: &Paths,
+    name: &str,
+    chain: &str,
+    caps: &crate::wallet::Caps,
+    recovery_key: &SecretValue,
+) -> Result<WalletReply, VaultError> {
+    call_secret(paths, &SecretRequest::WalletCreate { name, chain, caps, recovery_key }, None, CHANGE_WAIT)
+}
+
+/// Changes a wallet's caps. Needs the recovery key.
+pub fn wallet_caps(
+    paths: &Paths,
+    secret: &SecretRef,
+    caps: &crate::wallet::Caps,
+    recovery_key: &SecretValue,
+) -> Result<WalletReply, VaultError> {
+    let (name, id) = match secret {
+        SecretRef::Name(name) => (Some(name.as_str()), None),
+        SecretRef::Id(id) => (None, Some(id.as_str())),
+    };
+    call_secret(paths, &SecretRequest::WalletCaps { name, id, caps, recovery_key }, None, CHANGE_WAIT)
 }
 
 pub fn reset(paths: &Paths, recovery_key: Option<&SecretValue>) -> Result<ResetReply, VaultError> {

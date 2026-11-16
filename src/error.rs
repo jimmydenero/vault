@@ -71,6 +71,8 @@ pub enum VaultError {
     /// `lease` named secrets that may not be leased to a build (their names): not app secrets, or
     /// app secrets not added as leasable.
     NotLeasable(Vec<String>),
+    /// `sign` would pass one of the wallet's caps (which, and by how much): nothing was signed.
+    OverCap(String),
 }
 
 impl VaultError {
@@ -123,6 +125,7 @@ impl VaultError {
             LoginAwaitingClaim => "login_awaiting_claim",
             IdleTimeout(_) => "idle_timeout",
             NotLeasable(_) => "not_leasable",
+            OverCap(_) => "over_cap",
         }
     }
 }
@@ -209,6 +212,7 @@ impl fmt::Display for VaultError {
                 "not leased: {} may not be leased to builds (only an app_secret added as leasable may be); nothing was sealed",
                 names.iter().map(|name| format!("{name:?}")).collect::<Vec<_>>().join(", ")
             ),
+            OverCap(why) => write!(f, "not signed: {why}; only the person at the vault's {MACHINE} can raise a wallet's caps"),
         }
     }
 }

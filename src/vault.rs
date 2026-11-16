@@ -20,6 +20,7 @@ use crate::rules::ProxyRule;
 use crate::secret::SecretValue;
 use crate::store::{self, Paths};
 use crate::totp::{self, TotpCode};
+use crate::wallet::{self, Caps, Chain, Payment, SignArgs, WalletInfo};
 
 /// An open vault: its paths, its key and its decrypted document.
 pub struct Vault {
@@ -42,6 +43,18 @@ pub struct NewSecret {
     pub app: Option<String>,
     /// An app secret only: it may be leased to builds (`lease`).
     pub leasable: bool,
+}
+
+/// What `sign` made: the payment as checked, its first transaction and its ladder, signed, and
+/// what it counted against the caps.
+pub struct SignOutcome {
+    pub summary: SecretSummary,
+    pub from: String,
+    pub payment: Payment,
+    pub signed: crate::evm::Signed,
+    pub ladder: Vec<(wallet::Fees, crate::evm::Signed)>,
+    pub counted: wallet::Counted,
+    pub backup: BackupStatus,
 }
 
 pub struct InitReport {
@@ -401,6 +414,12 @@ impl Vault {
     /// a fresh id and version 1 (R5, R7). Whether the name is free is the caller's check.
     fn new_record(&mut self, new: NewSecret) -> Result<Record, VaultError> {
         model::validate_name(&new.name)?;
+        // A wallet's key is made by the vault itself (`create_wallet`) and never given to it.
+        if new.kind == Kind::Wallet {
+            return Err(VaultError::InvalidSecret(
+                "the vault makes a wallet's key itself and never takes one: `vault wallet create`".into(),
+            ));
+        }
         let spec = kinds::spec(new.kind);
         // An app secret names its application; nothing else has one or may be leased (#7446).
         let app = match (new.kind, &new.app) {
@@ -490,8 +509,167 @@ impl Vault {
             fields,
             leasable: if new.kind == Kind::AppSecret { Some(new.leasable) } else { None },
             app,
+            wallet: None,
             value,
         })
+    }
+
+    /// Checks a recovery key the person typed against this vault's (R16): the gate for what only
+    /// the person on this machine may do, since the socket can't tell them from an agent (R23).
+    fn check_recovery_key(&self, typed: SecretValue, op: &str, name: &str) -> Result<(), VaultError> {
+        let identity = backup::parse_identity(&typed);
+        drop(typed);
+        let matches = identity.as_ref().is_ok_and(|id| backup::public_of(id) == self.doc.recovery_recipient);
+        if matches {
+            Ok(())
+        } else {
+            let _ = self.audit(AuditEvent::named(op, name, "denied: wrong recovery key"));
+            Err(VaultError::WrongRecoveryKey)
+        }
+    }
+
+    /// Makes a wallet (#7440): a new key from the operating system's random numbers, kept as
+    /// the record's value and never given out; its address and the caps the person set. Needs
+    /// the recovery key, because the caps are the person's alone to set.
+    pub fn create_wallet(
+        &mut self,
+        name: &str,
+        chain: Chain,
+        caps: Caps,
+        recovery_key: SecretValue,
+    ) -> Result<(SecretSummary, BackupStatus), VaultError> {
+        self.reload()?;
+        self.ready_for_change()?;
+        self.check_recovery_key(recovery_key, "wallet-create", name)?;
+        model::validate_name(name)?;
+        caps.validate()?;
+        if self.doc.find(name).is_some() {
+            return Err(VaultError::NameTaken(name.into()));
+        }
+        let key = crate::evm::new_key()?;
+        let address = crate::evm::address_text(&crate::evm::address_of_key(&key)?);
+        let mut id = store::new_random_id()?;
+        while self.doc.records.iter().any(|record| record.id == id) {
+            id = store::new_random_id()?;
+        }
+        let created_at = crate::now_rfc3339();
+        self.doc.records.push(Record {
+            id,
+            version: 1,
+            name: name.to_string(),
+            kind: Kind::Wallet,
+            site: chain.label().to_string(),
+            updated_at: Some(created_at.clone()),
+            created_at,
+            rule: None,
+            username: None,
+            totp: None,
+            expires_at: None,
+            handover: None,
+            fields: None,
+            app: None,
+            leasable: None,
+            wallet: Some(WalletInfo { chain, address, caps, spends: Vec::new() }),
+            value: key,
+        });
+        self.check_fits()?;
+        let record = self.doc.find(name).ok_or(VaultError::VaultFileCorrupt)?;
+        let summary = record.summary();
+        let mut event = AuditEvent::named("wallet-create", name, "ok");
+        event.secret_id = Some(record.id.clone());
+        event.detail = Some(describe(record));
+        let status = self.commit(event)?;
+        Ok((summary, status))
+    }
+
+    /// Changes a wallet's caps: only with the recovery key. Its key, address and the last day's
+    /// payments stay; its version goes up by one.
+    pub fn set_wallet_caps(
+        &mut self,
+        secret: &SecretRef,
+        caps: Caps,
+        recovery_key: SecretValue,
+    ) -> Result<(SecretSummary, BackupStatus), VaultError> {
+        self.reload()?;
+        self.ready_for_change()?;
+        let label = self.doc.find_ref(secret).map(|record| record.name.clone()).unwrap_or_else(|| secret.label());
+        self.check_recovery_key(recovery_key, "wallet-caps", &label)?;
+        caps.validate()?;
+        let record = match secret {
+            SecretRef::Name(name) => self.doc.records.iter_mut().find(|record| &record.name == name),
+            SecretRef::Id(id) => self.doc.records.iter_mut().find(|record| &record.id == id),
+        }
+        .ok_or_else(|| secret.not_found())?;
+        let info = record.wallet.as_mut().filter(|_| record.kind == Kind::Wallet).ok_or(VaultError::WrongKind)?;
+        let before = info.caps;
+        info.caps = caps;
+        record.version += 1;
+        record.updated_at = Some(crate::now_rfc3339());
+        let summary = record.summary();
+        let mut event = AuditEvent::named("wallet-caps", &summary.name, "ok");
+        event.secret_id = Some(summary.id.clone());
+        event.detail = Some(format!("caps were {}; now {}", before.describe(), caps.describe()));
+        let status = self.commit(event)?;
+        Ok((summary, status))
+    }
+
+    /// `sign` (#7440): checks the transfer against the wallet and its caps, signs it and its
+    /// ladder, and records the payment in the wallet's last day, as one change whose audit line
+    /// (`sign`: chain, token, amount, recipient, nonce, fees, hash, the caller) is on disk before
+    /// anything is returned (R28). `stamp` adds the caller's hint to that line. The ladder's own
+    /// line is the caller's (`server`), after this.
+    pub fn sign_payment(
+        &mut self,
+        secret: &SecretRef,
+        args: &SignArgs<'_>,
+        stamp: impl Fn(AuditEvent) -> AuditEvent,
+    ) -> Result<SignOutcome, VaultError> {
+        self.reload()?;
+        self.ready_for_change()?;
+        let now = crate::now_unix();
+        let index = self.doc.records.iter().position(|record| match secret {
+            SecretRef::Name(name) => &record.name == name,
+            SecretRef::Id(id) => &record.id == id,
+        });
+        let record = &self.doc.records[index.ok_or_else(|| secret.not_found())?];
+        let info = record.wallet.as_ref().filter(|_| record.kind == Kind::Wallet).ok_or(VaultError::WrongKind)?;
+        let payment = wallet::check(info, args)?;
+        let counted = wallet::decide(info, &payment, now)?;
+        let from = crate::evm::parse_address(&info.address).map_err(|_| VaultError::VaultFileCorrupt)?;
+        let signed = crate::evm::sign(&payment.tx(payment.first), &record.value, &from)?;
+        let mut ladder = Vec::with_capacity(payment.ladder.len());
+        for fees in &payment.ladder {
+            ladder.push((*fees, crate::evm::sign(&payment.tx(*fees), &record.value, &from)?));
+        }
+        let index = index.ok_or(VaultError::VaultFileCorrupt)?;
+        let record = &mut self.doc.records[index];
+        if let Some(info) = record.wallet.as_mut() {
+            wallet::record(info, &payment, counted, now);
+        }
+        self.check_fits()?;
+        let record = &self.doc.records[index];
+        let summary = record.summary();
+        let mut event = AuditEvent::named("sign", &record.name, "ok");
+        event.secret_id = Some(record.id.clone());
+        event.detail = Some(format!(
+            "{}; hash 0x{}; {}",
+            payment.describe(),
+            hex::encode(signed.hash),
+            if counted.replaces.is_some() {
+                format!(
+                    "replaces the same transfer at this nonce: no amount counted again, {} ETH more worst-case fees",
+                    wallet::decimal(counted.fee_wei as u128, 18)
+                )
+            } else {
+                format!(
+                    "counted ${} and {} ETH worst-case fees against the daily caps",
+                    wallet::decimal(counted.micros as u128, 6),
+                    wallet::decimal(counted.fee_wei as u128, 18)
+                )
+            }
+        ));
+        let backup = self.commit(stamp(event))?;
+        Ok(SignOutcome { summary, from: crate::evm::address_text(&from), payment, signed, ladder, counted, backup })
     }
 
     /// Every backup must stay small enough for `vault restore FILE` to take back. Measured
@@ -777,6 +955,14 @@ impl Vault {
         self.reload()?;
         self.ready_for_change()?;
         let (name, id) = match self.doc.find_ref(secret) {
+            // A wallet's key is the only way to its funds: deleting it isn't a socket request
+            // anyone with the owner's user ID can make (#7440). A restore can still bring back a
+            // generation without it.
+            Some(record) if record.kind == Kind::Wallet => {
+                return Err(VaultError::InvalidSecret(
+                    "a wallet holds money and its key exists only in this vault, so it isn't deleted".into(),
+                ));
+            }
             Some(record) => (record.name.clone(), record.id.clone()),
             None => return Err(secret.not_found()),
         };
@@ -937,6 +1123,9 @@ impl Vault {
 
 /// How the audit log describes a stored secret: its kind and rule, or its kind and site.
 fn describe(record: &Record) -> String {
+    if let Some(info) = &record.wallet {
+        return format!("wallet on {} at {}; caps {}", info.chain.label(), info.address, info.caps.describe());
+    }
     match &record.rule {
         Some(rule) => format!("{}; rule {}", record.kind.label(), rule.describe()),
         None => match (&record.fields, &record.app) {
@@ -977,6 +1166,7 @@ pub(crate) fn same_records(a: &[Record], b: &[Record]) -> bool {
                     && x.handover == y.handover
                     && x.app == y.app
                     && x.leasable == y.leasable
+                    && x.wallet == y.wallet
                     && x.value.same_as(&y.value)
             })
         })

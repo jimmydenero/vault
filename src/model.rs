@@ -48,6 +48,11 @@ pub enum Kind {
     /// uses it or gives its value back.
     #[serde(rename = "app_secret")]
     AppSecret,
+    /// A wallet's private key, made by the vault itself and never given out, not even sealed
+    /// (#7440). Its only use is `sign`: a token transfer the vault builds from structured fields,
+    /// within the caps the person set (`wallet`). No request adds or replaces one with a value.
+    #[serde(rename = "wallet")]
+    Wallet,
 }
 
 impl Kind {
@@ -61,11 +66,12 @@ impl Kind {
             Kind::GrokLogin => "grok_login",
             Kind::PersonalDetails => "personal_details",
             Kind::AppSecret => "app_secret",
+            Kind::Wallet => "wallet",
         }
     }
 
     /// Every kind, in the order listings count them.
-    pub const ALL: [Kind; 8] = [
+    pub const ALL: [Kind; 9] = [
         Kind::ApiKey,
         Kind::Login,
         Kind::TwoFactor,
@@ -74,6 +80,7 @@ impl Kind {
         Kind::GrokLogin,
         Kind::PersonalDetails,
         Kind::AppSecret,
+        Kind::Wallet,
     ];
 
     /// The site a secret of this kind gets when none is given, for a kind not tied to one site.
@@ -107,6 +114,23 @@ pub struct SecretSummary {
     /// An app secret only: whether it may be leased to builds (`lease`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leasable: Option<bool>,
+    /// A wallet only: its chain, address and caps, and what it signed in the last day. Never
+    /// its key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet: Option<WalletSummary>,
+}
+
+/// What a listing shows of a wallet.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WalletSummary {
+    pub chain: crate::wallet::Chain,
+    /// Canonical (lower case); `checksummed` is the same address in EIP-55 mixed case.
+    pub address: String,
+    pub checksummed: String,
+    pub caps: crate::wallet::Caps,
+    /// What the last 24 hours' payments count against the caps.
+    pub spent_today_micros: u64,
+    pub fees_today_wei: u64,
 }
 
 /// One stored secret.
@@ -150,6 +174,10 @@ pub(crate) struct Record {
     /// `lease` refuses the secret (`not_leasable`). Nothing changes it after the add.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leasable: Option<bool>,
+    /// For a wallet: its chain, address, caps and last day's payments (#7440). The key itself is
+    /// the record's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet: Option<crate::wallet::WalletInfo>,
     #[serde(with = "secret_bytes")]
     pub value: SecretValue,
 }
@@ -183,6 +211,20 @@ impl Record {
             fields: self.fields.clone(),
             app: self.app.clone(),
             leasable: if self.kind == Kind::AppSecret { Some(self.leasable == Some(true)) } else { None },
+            wallet: self.wallet.as_ref().map(|info| {
+                let now = crate::now_unix();
+                let (spent, fees) = info.spent(now);
+                WalletSummary {
+                    chain: info.chain,
+                    address: info.address.clone(),
+                    checksummed: crate::evm::parse_address(&info.address)
+                        .map(|bytes| crate::evm::checksummed(&bytes))
+                        .unwrap_or_else(|_| info.address.clone()),
+                    caps: info.caps,
+                    spent_today_micros: spent,
+                    fees_today_wei: fees,
+                }
+            }),
         }
     }
 
@@ -248,10 +290,11 @@ pub(crate) struct VaultDoc {
 /// - **4**: the `codex_login` and `grok_login` kinds and a record's `handover` (#7380).
 /// - **5**: the `personal_details` kind and a record's `fields` (#7435).
 /// - **6**: the `app_secret` kind and a record's `app` and `leasable` (#7446).
-pub(crate) const VAULT_FORMAT: u32 = 6;
+/// - **7**: the `wallet` kind and a record's `wallet` (#7440).
+pub(crate) const VAULT_FORMAT: u32 = 7;
 
 /// Every format this build reads. Older ones are migrated to `VAULT_FORMAT` when read.
-pub(crate) const READABLE_FORMATS: [u32; 6] = [1, 2, 3, 4, 5, 6];
+pub(crate) const READABLE_FORMATS: [u32; 7] = [1, 2, 3, 4, 5, 6, 7];
 
 /// A secret as a request names it: by its name, or by its stable id.
 #[derive(Clone, Debug, PartialEq, Eq)]
