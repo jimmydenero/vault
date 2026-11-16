@@ -70,9 +70,14 @@ for target in $TARGETS; do
   mkdir "$stage/$name"
   cp "$bin" "$stage/$name/vault"
   cp README.md LICENSE "$stage/$name/"
-  # Owner 0 in the archive (GNU tar), so it names no local account.
-  tar -C "$stage" -czf "$DIST/$name.tar.gz" --owner=0 --group=0 "$name" 2>/dev/null \
-    || tar -C "$stage" -czf "$DIST/$name.tar.gz" "$name"
+  if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+    # Owner 0 in the archive, so it names no local account.
+    tar -C "$stage" -czf "$DIST/$name.tar.gz" --owner=0 --group=0 "$name"
+  else
+    # bsdtar (a Mac): no AppleDouble `._*` entries (COPYFILE_DISABLE) and no xattr headers such
+    # as com.apple.provenance, which GNU tar warns about, so the archive holds only the folder.
+    COPYFILE_DISABLE=1 tar -C "$stage" -czf "$DIST/$name.tar.gz" --no-xattrs --no-mac-metadata "$name"
+  fi
   rm -rf "${stage:?}"
   BUILT+=("$name.tar.gz")
   file "$bin" || true
