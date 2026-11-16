@@ -1,13 +1,16 @@
 # volgenic/vault
 
 Volgenic's vault keeps your agents' secrets (API keys, website logins, 2FA seeds, Claude plan
-tokens, Codex and Grok logins, and your personal details) on your own
+tokens, Codex and Grok logins, your personal details, and your applications' build and deploy
+secrets) on your own
 machine (a Mac, or a Linux box such as the always-on primary host), and lets agents **use** them
 without ever **seeing** them. An agent asks the vault to make
 an API call and gets the API's reply; the vault adds the key on the way out. An agent asks for a
 2FA code and gets the six digits, never the seed. The host's model proxy sends a model call
 naming a Claude plan, and the vault adds the plan's token and streams the reply back as it
-arrives. Nothing the vault returns, to an agent or on the command line, can carry a secret value.
+arrives. Nothing the vault returns, to an agent or on the command line, can carry a secret value,
+with one exception: a build's `lease`, an app secret's value sealed to that build's own key for at
+most a day ("App secrets and leases" below).
 
 - Design: [Volgenic v2 secret store](https://volgenic.com/pages/1f495021-effc-4fd2-9160-24cbcd73dbe3)
 - Threat model, with the numbered rules (R1, R2, ...) every change is reviewed against:
@@ -118,9 +121,10 @@ Or restore a backup: `vault install --for-restore`, then `vault restore FILE`.
   recovery key does, and never names a machine. Its first 12 digits are the recovery-key
   fingerprint on the kit. The `vault_id` is the copy: new at every restore, and the prefix of
   the backup files' names.
-- **The vault file and backups are format 5** (format 2 plus the `claude_plan` kind and the
+- **The vault file and backups are format 6** (format 2 plus the `claude_plan` kind and the
   intake key in format 3, the `codex_login` and `grok_login` kinds and a login's handover
-  state in format 4, and the `personal_details` kind in format 5). An older vault file is migrated at the daemon's first start, as a change of
+  state in format 4, the `personal_details` kind in format 5, and the `app_secret` kind with its
+  application and lease flag in format 6). An older vault file is migrated at the daemon's first start, as a change of
   its own (audited and backed up): a format-1 file's secrets get their ids, and a format-2 file
   gets its intake key. Older backups restore too. An older build refuses a newer file or backup
   as newer (`newer_format`); don't go back to an older build after upgrading.
@@ -138,9 +142,10 @@ The `vault` tool can't print a secret, so it is safe for any agent on the machin
 | `vault add NAME --kind claude_plan` | Adds a Claude plan's token (from `claude setup-token`). Used only by `stream`, only to `api.anthropic.com`. The host's daemon normally stores plans itself (`import_plan`, `add_sealed`). |
 | `vault add NAME --kind codex_login --yes < auth.json` | Adds a Codex login (its `auth.json`, whole), which the vault alone renews from then on. Used only by `stream`, only to `chatgpt.com`. `grok_login` likewise for Grok Build, to `cli-chat-proxy.grok.com`. The host's daemon normally hands logins over itself (`import_login` and `claim_refresh`, or `add_sealed`). |
 | `vault add NAME --kind personal_details` | Adds your real details (name, address, birthday, phone), asked one field at a time; leave any empty. Or `--yes` with v1's JSON object on standard input (`{"name","address","birthday","phone"}`). Stored and listed only, for now: `list` says which fields are filled, never what they say. See "Personal details" below. |
+| `vault add NAME --kind app_secret --app APP [--leasable]` | Adds one of an application's build or deploy secrets (an npm token, a database URL). With `--leasable` a build may lease it, sealed to the build's own key for at most a day; without it, it is stored and listed only. Set only when it is added. See "App secrets and leases" below. |
 | `vault delete NAME` | Deletes a secret. Earlier backups keep it. |
 | `vault rename NAME NEW` | Renames a secret; its id, rule and value stay, its version goes up. |
-| `vault list` | Ids, names, kinds, versions and sites; for personal details, which fields are filled. |
+| `vault list` | Ids, names, kinds, versions and sites; for personal details, which fields are filled; for app secrets, the application and whether builds may lease it. |
 | `vault health` | For each Claude plan, Codex login and Grok login, by name: whether it works, has expired or was refused (sign in again), and who renews it. |
 | `vault status [--json]` | The program, the daemon, backups and the audit chain. `--json`: one JSON object for a program, with a `problems` list and the command for each ([docs/json.md](docs/json.md)); no secret names. |
 | `vault --version` | The version, the commit it was built from and the target. |
@@ -170,7 +175,8 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   and is served the same way. A newer protocol is refused with `unsupported_protocol`.
 - **Naming a secret:** `totp`, `proxy`, `delete` and `rename` take `"name"` or `"id"`, one of them.
 - `list` returns `{"ok":true,"secrets":[{"id","name","kind","site","version"}]}`; a
-  `personal_details` secret also has `"fields":["name","address",...]`, the filled ones.
+  `personal_details` secret also has `"fields":["name","address",...]`, the filled ones, and an
+  `app_secret` has `"app"` and `"leasable"`.
 - `totp` returns `{"ok":true,"id":"...","name":"github-2fa","code":"123456","seconds_left":17}`.
 - `proxy` takes `method`, `path` (with query), optional `headers` (an object) and `body` or
   `body_base64`. It returns `{"ok":true,"status":200,"headers":[[name,value]],"body":"..."}`.
@@ -229,6 +235,10 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   (`{"v":1,"name":"v1-details","kind":"personal_details","value":"{\"name\":\"...\",\"address\":\"...\"}"}`);
   they are added under a new name only, like an API key (whoever seals could otherwise change
   the address a form is filled with): delete, then add, to change them.
+  A sealed app secret carries its `app` and, to be leasable, `"leasable":true`
+  (`{"v":1,"name":"shop-npm","kind":"app_secret","app":"shop","leasable":true,"value":"npm_..."}`);
+  only an `app_secret` may carry either, and it too is added under a new name only.
+- **`lease`** seals app secrets to a build's own key (host only; "App secrets and leases" below).
 - **`import_plan`** is the upgrade's move of the host's existing plan tokens into the vault:
   `{"op":"import_plan","plans":[{"name":"main","value":"sk-ant-oat01-..."}]}` returns each plan's
   `result` by name: `done` (added, or a different value replaced, version up), `unchanged` (already
@@ -243,7 +253,8 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
 - The other requests (`status`, `audit`, `add`, `delete`, `rename`, `confirm-kit`, `reset`, `restore`,
   `backup`, `verify-backup`, `read-backup`, `mirror-plan`, `mirror-report`) are what the
   command-line tool and the mirror send; `src/protocol.rs` lists them.
-- Errors are `{"ok":false,"error":"rule_mismatch","message":"..."}`.
+- Errors are `{"ok":false,"error":"rule_mismatch","message":"..."}`; `not_leasable` adds
+  `"names"`.
 
 ## Handing over a Codex or Grok login
 
@@ -295,6 +306,47 @@ sites that need the real person (work item #7435). v1 kept them on Volgenic's se
 - **Used** by nothing yet: no request gives a value back, `proxy`, `stream` and `totp` refuse it
   (`wrong_kind`). A way for a form-filling agent to fill one field without Volgenic's server
   seeing it is a later step. Today: add, list, rename, delete.
+
+## App secrets and leases
+
+An `app_secret` is one of an application's build or deploy secrets (an npm token, a database URL),
+in its owner's vault, for the application it names (work item #7446). A build can't run without
+them, so this is **the one kind whose value leaves the vault**, and only one way: a **lease**,
+sealed to one build's own key, for at most a day, audited. It is for jobs the host's daemon runs
+(builds and deploys), never for an agent.
+
+- **Added** with `vault add NAME --kind app_secret --app APP [--leasable]`, or sealed
+  (`add_sealed`, with `app` and `leasable` inside the sealed object). The value is UTF-8 text
+  without a NUL, kept exactly as given. **Only a secret added as leasable can be leased**; nothing
+  changes the flag later (delete and add again).
+- **Listed** with its application and whether it is leasable, never its value.
+- **Used only by `lease`.** `stream`, `proxy` and `totp` refuse it (`wrong_kind`).
+
+The build makes an age X25519 key of its own, and the host's daemon asks:
+
+```json
+{"protocol":2,"op":"lease","job":"build:4812","recipient":"age1...","names":["shop-npm","shop-db"],
+ "ttl_seconds":3600,"request_id":"..."}
+```
+
+- `job`: 1 to 128 printable characters, no spaces (`build:<id>`, `deploy:<id>`). `recipient`: an
+  age X25519 public key (`age1...`; no SSH or plugin recipients). `names` (and/or `ids`): 1 to 64
+  secrets, each once. `ttl_seconds`: 60 to 86,400.
+- **Answer:** `{"ok":true,"sealed":[{"name","id","sealed_base64"}],"missing":[names it holds nothing under],"expires_at","job"}`.
+  Ciphertext only: each `sealed_base64` is an age file sealed to `recipient`, whose plaintext is
+  `{"v":1,"lease":"build:4812","name":"shop-npm","value":"npm_...","expires_at":"2026-11-16T13:00:00Z"}`.
+- **The job checks what it opens:** it refuses a plaintext whose `v`, `lease` or `name` isn't
+  what it asked for, or whose `expires_at` has passed. The expiry is inside the ciphertext, so no
+  relay can change it; the vault can't reach the job to hold it to it.
+- **A secret it holds that isn't a leasable app secret refuses the whole lease**, and nothing is
+  sealed: `{"ok":false,"error":"not_leasable","message","names":[the refused names]}`. A vault
+  older than this answers `bad_request` "unknown op".
+- **Audit:** one `lease` line per secret leased (its name and id, the job, the recipient key's
+  fingerprint, the expiry and the caller), on disk before the answer leaves; a refusal is one
+  `lease denied: <code>` line. Never a value.
+- **The accepted gap:** any process running as you can lease to a key of its own, as it can read
+  the vault's files today. A lease is never automatic: only secrets you marked leasable, and each
+  lease is in `vault audit`. See the threat model's 2026-11-16 (3) block.
 
 ## Build
 

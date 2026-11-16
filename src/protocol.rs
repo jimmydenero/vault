@@ -70,7 +70,9 @@
 //! are its own user's (R22, R27).
 //!
 //! No reply type has a field that could carry a secret value (R4): `SecretValue` doesn't
-//! implement `Serialize`, so it can't appear in any of them.
+//! implement `Serialize`, so it can't appear in any of them. The one exception is ciphertext:
+//! `lease` answers app secrets sealed to the job's own key (`lease::seal`), which only that key
+//! opens.
 
 use std::collections::BTreeMap;
 
