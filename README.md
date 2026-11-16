@@ -1,11 +1,13 @@
 # volgenic/vault
 
-Volgenic's vault keeps your agents' secrets (API keys, website logins and 2FA seeds) on your own
+Volgenic's vault keeps your agents' secrets (API keys, website logins, 2FA seeds and Claude plan
+tokens) on your own
 machine (a Mac, or a Linux box such as the always-on primary host), and lets agents **use** them
 without ever **seeing** them. An agent asks the vault to make
 an API call and gets the API's reply; the vault adds the key on the way out. An agent asks for a
-2FA code and gets the six digits, never the seed. Nothing the vault returns, to an agent or on
-the command line, can carry a secret value.
+2FA code and gets the six digits, never the seed. The host's model proxy sends a model call
+naming a Claude plan, and the vault adds the plan's token and streams the reply back as it
+arrives. Nothing the vault returns, to an agent or on the command line, can carry a secret value.
 
 - Design: [Volgenic v2 secret store](https://volgenic.com/pages/1f495021-effc-4fd2-9160-24cbcd73dbe3)
 - Threat model, with the numbered rules (R1, R2, ...) every change is reviewed against:
@@ -116,12 +118,11 @@ Or restore a backup: `vault install --for-restore`, then `vault restore FILE`.
   recovery key does, and never names a machine. Its first 12 digits are the recovery-key
   fingerprint on the kit. The `vault_id` is the copy: new at every restore, and the prefix of
   the backup files' names.
-- **The vault file and backups are format 2.** A format-1 vault file (written before ids) is
-  migrated at the daemon's first start: every secret gets an id, the file is written again in
-  format 2, and the migration is audited and backed up as a change of its own. A format-1
-  backup restores too; its secrets get their ids at the restore. An older build can't open a
-  format-2 file or backup (it refuses it as damaged), so don't go back to an older build after
-  upgrading.
+- **The vault file and backups are format 3** (format 2 plus the `claude_plan` kind and the
+  intake key). An older vault file is migrated at the daemon's first start, as a change of its
+  own (audited and backed up): a format-1 file's secrets get their ids, and a format-2 file gets
+  its intake key. Format-1 and format-2 backups restore too. A format-2 build refuses a format-3
+  file or backup as newer (`newer_format`); don't go back to an older build after upgrading.
 
 ## Commands
 
@@ -133,9 +134,11 @@ The `vault` tool can't print a secret, so it is safe for any agent on the machin
 | `vault add NAME --kind api-key --host HOST --method GET --path /v1 --header "Authorization: Bearer {key}"` | Adds an API key with its rule. The value is read at a hidden prompt, or from standard input with `--yes`. |
 | `vault add NAME --kind login --site SITE --username USER` | Adds a login. Stored and listed only, for now. |
 | `vault add NAME --kind 2fa --site SITE` | Adds a 2FA seed: base32, or an `otpauth://` link. |
+| `vault add NAME --kind claude_plan` | Adds a Claude plan's token (from `claude setup-token`). Used only by `stream`, only to `api.anthropic.com`. The host's daemon normally stores plans itself (`import_plan`, `add_sealed`). |
 | `vault delete NAME` | Deletes a secret. Earlier backups keep it. |
 | `vault rename NAME NEW` | Renames a secret; its id, rule and value stay, its version goes up. |
 | `vault list` | Ids, names, kinds, versions and sites. |
+| `vault health` | For each Claude plan, by name: whether its token works, has expired or was refused, from the replies to its last calls. |
 | `vault status [--json]` | The program, the daemon, backups and the audit chain. `--json`: one JSON object for a program, with a `problems` list and the command for each ([docs/json.md](docs/json.md)); no secret names. |
 | `vault --version` | The version, the commit it was built from and the target. |
 | `vault audit [--all]` | The audit log, with its hash chain checked. |
@@ -170,6 +173,43 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   The key goes only into the header its rule names, only to the rule's host, method and path.
   Redirects come back to you unfollowed. A reply that contains the key is withheld
   (`echo_blocked`).
+- **`stream`** is the streaming proxy, for model calls (the host's model proxy sends it). It
+  names a secret whose kind (`claude_plan`; the table is `src/kinds.rs`) or rule (an API key)
+  decides the upstream host, methods and paths, and which headers the vault sets: you never
+  choose those. The request line is followed by exactly `body_len` raw body bytes (up to 32 MiB):
+
+  ```json
+  {"op":"stream","name":"main","method":"POST","path":"/v1/messages?beta=true",
+   "headers":[["anthropic-version","2023-06-01"],["anthropic-beta","oauth-2025-04-20"],["content-type","application/json"]],
+   "body_len":1234,"idle_timeout_secs":300}
+  ```
+
+  The reply is a head line (`{"ok":true,"status":200,"headers":[[name,value],...]}`), then the body
+  as it arrives in chunks, each `<length in decimal>\n<bytes>`, then `0\n` and a trailer line:
+  `{"ok":true,"end":"complete","bytes":N}`, or `"ok":false` with `end` `idle_timeout`,
+  `upstream_failed` or `echo_blocked` for a reply cut short. A refusal (or a failure before the
+  reply's head) is one error line instead. There is no overall time or size limit; the upstream
+  must send something at least every `idle_timeout_secs` (300 by default, at most 900). Close
+  your socket to cancel: the vault drops the upstream connection within a fraction of a second.
+  Keep your side open until the trailer (on macOS a half-close reads as hanging up). Don't send
+  `authorization`, `x-api-key`, `accept-encoding`, `host`, `content-length` or hop-by-hop
+  headers: they are refused (`header_not_allowed`). The reply is unencoded (the vault asks for
+  `identity`), and a reply that would carry the token is stopped before it does (`echo_blocked`).
+- **`health`** returns `{"ok":true,"credentials":[{"id","name","kind","version","state","checked_at","status","refresh"}]}`
+  for every Claude plan: `state` is `works`, `expired`, `refused` or `unknown` (not used since it
+  was stored), from the last reply that said; `refresh` is `never` (a plan's token lasts a year,
+  and a new sign-in replaces it).
+- **`add_sealed`** stores a value that reached this machine sealed to the vault's intake key (in
+  `vault status --json`, `intake`), so Volgenic's server could carry it without reading it:
+  `{"op":"add_sealed","name":"main","kind":"claude_plan","sealed_base64":"<base64 of an age file>","replace":true}`.
+  What is sealed is `{"v":1,"name","kind","site"?,"rule"?,"username"?,"value"}`; `name` and `kind`
+  must match the request's, and the rule is read only from inside it. `replace` replaces a stored
+  secret of that name and kind (same id, version up). Delete with `delete` by name, as for any secret.
+- **`import_plan`** is the upgrade's move of the host's existing plan tokens into the vault:
+  `{"op":"import_plan","plans":[{"name":"main","value":"sk-ant-oat01-..."}]}` returns each plan's
+  `result` by name: `done` (added, or a different value replaced, version up), `unchanged` (already
+  there with that value) or `failed` (with `error`). Safe to repeat. The host reads its own token
+  files and Keychain items and hands them over; the vault never reads the Keychain.
 - The other requests (`status`, `audit`, `add`, `delete`, `rename`, `confirm-kit`, `reset`, `restore`,
   `backup`, `verify-backup`, `read-backup`, `mirror-plan`, `mirror-report`) are what the
   command-line tool and the mirror send; `src/protocol.rs` lists them.
@@ -178,6 +218,9 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
 ## Build
 
 A Rust (Cargo) project with no native shim: `cargo build` is the gate, on macOS or Linux.
+`cargo build --features test-upstream` is for local evidence only and never released: its
+daemon sends `api.anthropic.com` to `127.0.0.1:$VAULT_TEST_UPSTREAM_PORT` and also trusts the CA in
+`$VAULT_TEST_CA`, so a local test server can stand in for Anthropic over real TLS.
 Release builds (static Linux, and macOS on a Mac): `scripts/release.sh`, described in
 [docs/releasing.md](docs/releasing.md).
 

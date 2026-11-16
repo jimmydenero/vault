@@ -315,9 +315,9 @@ impl Streamer {
             };
             let _ = caller.write_all(b"0\n").and_then(|_| write_line(caller, envelope, &trailer));
         }
-        if ended == "complete" || status >= 400 {
-            outcome.health = plan.classify.and_then(|classify| classify(status, &sample));
-        }
+        // A 2xx head already says the credential was accepted, however the body ends; an error
+        // reply says why from its body.
+        outcome.health = plan.classify.and_then(|classify| classify(status, &sample));
         outcome.took = started.elapsed();
         outcome
     }

@@ -343,10 +343,10 @@ fn list(paths: &Paths) -> Result<(), VaultError> {
         println!("No secrets yet.");
         return Ok(());
     }
-    println!("{:<32}  {:<24} {:<8} {:>3}  SITE", "ID", "NAME", "KIND", "VER");
+    println!("{:<32}  {:<24} {:<11} {:>3}  SITE", "ID", "NAME", "KIND", "VER");
     for secret in reply.secrets {
         println!(
-            "{:<32}  {:<24} {:<8} {:>3}  {}",
+            "{:<32}  {:<24} {:<11} {:>3}  {}",
             secret.id,
             secret.name,
             secret.kind.label(),

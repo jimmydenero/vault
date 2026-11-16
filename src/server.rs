@@ -299,9 +299,11 @@ impl Server {
         }
     }
 
-    /// Best effort, for refusals and for lines after a use that is already recorded.
+    /// Best effort, for refusals and for lines after a use that is already recorded: not waited
+    /// onto the disk, so a call's outcome line doesn't hold up the next call's line (R28 needs
+    /// the line before a use on disk, which `record` flushes).
     fn audit(&self, event: AuditEvent) {
-        if let Err(error) = audit::append(&self.paths.audit_log, event) {
+        if let Err(error) = audit::append_unsynced(&self.paths.audit_log, event) {
             log(&format!("couldn't write the audit log: {}", error.code()));
         }
     }
@@ -598,7 +600,6 @@ impl Server {
                 self.finish(stream, peer, "reset", None, result)
             }
             Request::Restore { recovery_key, backup_len: _, source } => {
-                let payload = payload;
                 let result = (|| {
                     let file = payload.map(|data| (source.unwrap_or_else(|| "a file the person named".into()), data));
                     let mut guard = self.vault.lock().unwrap_or_else(|e| e.into_inner());

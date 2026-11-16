@@ -70,10 +70,22 @@ pub fn hash_line(line: &str) -> String {
     hex::encode(Sha256::digest(line.as_bytes()))
 }
 
-/// Appends an event and returns the new head of the chain. The daemon's threads (and
-/// `vault install`, before the daemon starts) append,
-/// so the file is locked while the last line is read and the new one written.
+/// Appends an event, flushed to disk before it returns (R28: a use is on disk before it happens),
+/// and returns the new head of the chain. The daemon's threads (and `vault install`, before the
+/// daemon starts) append, so the file is locked while the last line is read and the new one
+/// written.
 pub fn append(log: &Path, event: AuditEvent) -> Result<String, VaultError> {
+    append_line(log, event, true)
+}
+
+/// Appends an event without waiting for the disk: for lines that record nothing yet to happen
+/// (a refusal, or the outcome of a use whose line is already on disk). The next flushed line, or
+/// the system, writes it out; a crash in between can lose it, never the chain before it.
+pub fn append_unsynced(log: &Path, event: AuditEvent) -> Result<String, VaultError> {
+    append_line(log, event, false)
+}
+
+fn append_line(log: &Path, event: AuditEvent, sync: bool) -> Result<String, VaultError> {
     let mut file = OpenOptions::new().read(true).append(true).create(true).mode(0o600).open(log)?;
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return Err(VaultError::Io("couldn't lock the audit log".into()));
@@ -85,22 +97,33 @@ pub fn append(log: &Path, event: AuditEvent) -> Result<String, VaultError> {
     let line = AuditLine { t: crate::now_rfc3339(), event, prev };
     let text = serde_json::to_string(&line).map_err(|_| VaultError::Io("audit encoding".into()))?;
     file.write_all(format!("{text}\n").as_bytes())?;
-    file.sync_data()?;
+    if sync {
+        file.sync_data()?;
+    }
     Ok(hash_line(&text))
     // The lock is released when `file` closes.
 }
 
+/// The last line, read from the end in growing windows (a line is a few hundred bytes; the log
+/// grows by two lines per proxied call, so it isn't read whole).
 fn last_line(file: &mut File) -> Result<Option<String>, VaultError> {
     let len = file.metadata()?.len();
     if len == 0 {
         return Ok(None);
     }
-    let window = len.min(256 * 1024);
-    file.seek(SeekFrom::Start(len - window))?;
-    let mut tail = Vec::with_capacity(window as usize);
-    file.read_to_end(&mut tail)?;
-    let text = String::from_utf8_lossy(&tail);
-    Ok(text.trim_end_matches('\n').rsplit('\n').next().map(str::to_string))
+    let mut window = 8 * 1024u64;
+    loop {
+        let window_now = window.min(len);
+        file.seek(SeekFrom::Start(len - window_now))?;
+        let mut tail = Vec::with_capacity(window_now as usize);
+        file.read_to_end(&mut tail)?;
+        let body = tail.strip_suffix(b"\n").unwrap_or(&tail);
+        match memchr::memrchr(b'\n', body) {
+            Some(index) => return Ok(Some(String::from_utf8_lossy(&body[index + 1..]).into_owned())),
+            None if window_now == len => return Ok(Some(String::from_utf8_lossy(body).into_owned())),
+            None => window *= 4,
+        }
+    }
 }
 
 /// Reads the whole log and checks the chain. Returns the lines and the head.

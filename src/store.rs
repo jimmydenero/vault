@@ -293,8 +293,9 @@ pub(crate) fn save(paths: &Paths, key: &SecretValue, doc: &VaultDoc) -> Result<(
 }
 
 /// Reads and decrypts the vault file. Any change to the file, including its id or its format
-/// byte, fails here. Reads every format this build knows (1 and 2); a format-1 document comes
-/// back as it is, and the caller migrates it (`model::migrate`) and writes it back in format 2.
+/// byte, fails here. Reads every format this build knows (1 to 3); an older document comes
+/// back as it is, and the caller migrates it (`model::migrate`, `model::ensure_intake`) and writes
+/// it back in the current format.
 /// A file from a newer build is refused with `NewerFormat`, never guessed at.
 pub(crate) fn load(paths: &Paths, key: &SecretValue) -> Result<VaultDoc, VaultError> {
     let mut data = Vec::new();
