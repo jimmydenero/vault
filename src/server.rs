@@ -32,8 +32,8 @@ use crate::platform::{self, Peer};
 use crate::protocol::{
     self, AddReply, AddSealedReply, AuditReply, BackupReply, ClaimReply, ConfirmKitReply, Envelope, ErrorReply, Framed,
     HealthReply, ImportLoginReply, ImportReply, ImportedLogin, ImportedPlan, ListReply, MirrorPlanReply, OkReply,
-    LeaseReply, LeasedSecret, ProxyReplyOut, ReadBackupReply, RenameReply, Request, ResetReply, RestoreReply, StatusReply, TotpReply,
-    VerifyBackupReply,
+    LeaseReply, LeasedSecret, ProxyReplyOut, ReadBackupReply, RenameReply, Request, ResetReply, RestoreReply, SignReply,
+    SignedTx, StatusReply, TotpReply, VerifyBackupReply, WalletReply,
 };
 use crate::proxy::{self, ProxyRequest};
 use crate::rules;
@@ -42,6 +42,7 @@ use crate::stream::{self, Streamer};
 use crate::vault::{self, ImportOutcome, NewSecret, Vault};
 use crate::intake;
 use crate::lease;
+use crate::wallet::{self, SignArgs};
 
 /// After a renewal that failed (not refused), the vault sends none for that login for this long,
 /// so calls during a token server's outage don't each send one.
@@ -661,6 +662,48 @@ impl Server {
             Request::Lease { job, recipient, secrets, ttl_seconds } => {
                 self.lease(stream, peer, &job, &recipient, &secrets, ttl_seconds)
             }
+            Request::Sign {
+                secret,
+                chain,
+                token,
+                to,
+                amount,
+                nonce,
+                gas_limit,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+                ladder,
+                ladder_max_fee_per_gas,
+                on_behalf_of,
+            } => {
+                let args = SignArgs {
+                    chain: &chain,
+                    token: &token,
+                    to: &to,
+                    amount: &amount,
+                    nonce,
+                    gas_limit,
+                    max_fee_per_gas,
+                    max_priority_fee_per_gas,
+                    ladder,
+                    ladder_max_fee_per_gas,
+                    on_behalf_of: on_behalf_of.as_deref(),
+                };
+                self.sign(stream, peer, &secret, &args)
+            }
+            Request::WalletCreate { name, chain, caps, recovery_key } => {
+                let result = wallet::Chain::parse(&chain).and_then(|chain| {
+                    self.with_vault(|vault| vault.create_wallet(&name, chain, caps, recovery_key))
+                        .map(|(secret, backup)| WalletReply { ok: true, secret, backup })
+                });
+                self.finish(stream, peer, "wallet-create", Some(&name), result)
+            }
+            Request::WalletCaps { secret, caps, recovery_key } => {
+                let result = self
+                    .with_vault(|vault| vault.set_wallet_caps(&secret, caps, recovery_key))
+                    .map(|(secret, backup)| WalletReply { ok: true, secret, backup });
+                self.finish(stream, peer, "wallet-caps", Some(&secret.label()), result)
+            }
             Request::Add { name, kind, site, rule, username, app, leasable, value } => {
                 let result = (|| {
                     let rule = match (kind, rule) {
@@ -855,6 +898,87 @@ impl Server {
                 if let VaultError::NotLeasable(names) = &error {
                     event.name = Some(names.join(", "));
                 }
+                self.audit(with_peer(event, peer));
+                error_reply(out, peer, &error)
+            }
+        }
+    }
+
+    /// `sign` (#7440): one token transfer the vault builds from structured fields, within the
+    /// wallet's caps, signed with its ladder. The `sign` line (chain, token, amount, recipient,
+    /// nonce, fees, hash, the caller) is written with the change that records the payment, and
+    /// the ladder's `sign-ladder` line (how many rungs, the top fee, the worst-case fee, the
+    /// hashes) is flushed to disk after it: both before the answer leaves (R28); no line, no
+    /// signature. A refusal is one `sign denied: <code>` line.
+    fn sign(&self, out: &mut UnixStream, peer: &Caller, secret: &SecretRef, args: &SignArgs<'_>) -> std::io::Result<()> {
+        let result = (|| -> Result<SignReply, VaultError> {
+            let outcome = self.with_vault(|vault| vault.sign_payment(secret, args, |event| with_peer(event, peer)))?;
+            let payment = &outcome.payment;
+            if !outcome.ladder.is_empty() {
+                let mut event = AuditEvent::named("sign-ladder", &outcome.summary.name, "ok");
+                event.secret_id = Some(outcome.summary.id.clone());
+                event.detail = Some(format!(
+                    "{} replacement(s) of {} {} {} to {} at nonce {}: top max fee {} gwei/gas, worst-case fee {} ETH; hashes {}",
+                    outcome.ladder.len(),
+                    payment.chain.label(),
+                    payment.amount_text(),
+                    payment.token.label(),
+                    payment.to_text,
+                    payment.nonce,
+                    wallet::decimal(payment.top().max_fee_per_gas as u128, 9),
+                    wallet::decimal(payment.worst_fee_wei() as u128, 18),
+                    outcome.ladder.iter().map(|(_, signed)| format!("0x{}", hex::encode(signed.hash))).collect::<Vec<_>>().join(", ")
+                ));
+                self.record(with_peer(event, peer))?;
+            }
+            let out_tx = |fees: wallet::Fees, signed: &crate::evm::Signed| SignedTx {
+                raw: format!("0x{}", hex::encode(&signed.raw)),
+                hash: format!("0x{}", hex::encode(signed.hash)),
+                max_fee_per_gas: fees.max_fee_per_gas,
+                max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+            };
+            let wallet = outcome.summary.wallet.as_ref().ok_or(VaultError::VaultFileCorrupt)?;
+            Ok(SignReply {
+                ok: true,
+                id: outcome.summary.id.clone(),
+                name: outcome.summary.name.clone(),
+                chain: payment.chain,
+                chain_id: payment.chain.chain_id(),
+                from: wallet.checksummed.clone(),
+                to: payment.to_text.clone(),
+                token: payment.token,
+                contract: crate::evm::address_text(&payment.contract),
+                amount: payment.amount_text(),
+                nonce: payment.nonce,
+                gas_limit: payment.gas_limit,
+                signed: out_tx(payment.first, &outcome.signed),
+                ladder: outcome.ladder.iter().map(|(fees, signed)| out_tx(*fees, signed)).collect(),
+                worst_fee_wei: payment.worst_fee_wei(),
+                replacement: outcome.counted.replaces.is_some(),
+                counted_micros: outcome.counted.micros,
+                counted_fees_wei: outcome.counted.fee_wei,
+                caps: wallet.caps,
+                spent_today_micros: wallet.spent_today_micros,
+                fees_today_wei: wallet.fees_today_wei,
+                backup: outcome.backup,
+            })
+        })();
+        match result {
+            Ok(reply_value) => reply(out, &peer.envelope, &reply_value),
+            Err(error) => {
+                let mut event = AuditEvent::new("sign", &format!("denied: {}", error.code()));
+                event.name = Some(secret.label());
+                let shown_to: String = args.to.chars().filter(|c| !c.is_control()).take(64).collect();
+                let shown_amount: String = args.amount.chars().filter(|c| !c.is_control()).take(40).collect();
+                let shown_token: String = args.token.chars().filter(|c| !c.is_control()).take(8).collect();
+                let shown_chain: String = args.chain.chars().filter(|c| !c.is_control()).take(16).collect();
+                let shown_for: String =
+                    args.on_behalf_of.unwrap_or("").chars().filter(|c| !c.is_control()).take(wallet::MAX_LABEL_CHARS).collect();
+                event.detail = Some(format!(
+                    "{shown_chain} {shown_amount} {shown_token} to {shown_to} at nonce {}{}: {error}",
+                    args.nonce,
+                    if shown_for.is_empty() { String::new() } else { format!(", for {shown_for}") }
+                ));
                 self.audit(with_peer(event, peer));
                 error_reply(out, peer, &error)
             }

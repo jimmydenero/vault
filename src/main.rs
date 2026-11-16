@@ -90,6 +90,12 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Make a wallet, or change its caps. The vault makes the wallet's key itself and never
+    /// shows it; both ask for the recovery key, since only you may set what a wallet can spend.
+    Wallet {
+        #[command(subcommand)]
+        action: WalletCommand,
+    },
     /// Rename a secret. It keeps its id, rule and value; its version goes up by one.
     Rename { name: String, new_name: String },
     /// List secrets: ids, names, kinds, sites and versions only.
@@ -127,6 +133,42 @@ enum Command {
     /// Copy backups to the mirror folder (run by the owner's LaunchAgent).
     #[command(hide = true)]
     Mirror,
+}
+
+#[derive(Subcommand)]
+enum WalletCommand {
+    /// Make a wallet: a new key, made in this vault and never shown, and its address to fund.
+    /// Its only use is signing token payments within the caps you set here.
+    Create {
+        name: String,
+        /// ethereum, or sepolia (a test network) for a dry run.
+        #[arg(long, default_value = "ethereum")]
+        chain: String,
+        /// The most one payment may move, in US dollars (USDC and USDT count one for one).
+        #[arg(long)]
+        per_payment: String,
+        /// The most the payments of any 24 hours may move, in US dollars.
+        #[arg(long)]
+        daily: String,
+        /// The highest fee per gas any signed transaction may offer, in gwei.
+        #[arg(long, default_value = "100")]
+        max_fee_gwei: String,
+        /// The most the fees of any 24 hours could come to, in ETH, each payment counted at its worst.
+        #[arg(long, default_value = "0.02")]
+        daily_fees_eth: String,
+    },
+    /// Change a wallet's caps. Caps you leave out stay as they are.
+    Caps {
+        name: String,
+        #[arg(long)]
+        per_payment: Option<String>,
+        #[arg(long)]
+        daily: Option<String>,
+        #[arg(long)]
+        max_fee_gwei: Option<String>,
+        #[arg(long)]
+        daily_fees_eth: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -168,6 +210,12 @@ fn main() -> ExitCode {
         }
         Command::Delete { name, yes } => delete(&paths, &name, yes),
         Command::Rename { name, new_name } => rename(&paths, &name, &new_name),
+        Command::Wallet { action: WalletCommand::Create { name, chain, per_payment, daily, max_fee_gwei, daily_fees_eth } } => {
+            wallet_create(&paths, &name, &chain, &per_payment, &daily, &max_fee_gwei, &daily_fees_eth)
+        }
+        Command::Wallet { action: WalletCommand::Caps { name, per_payment, daily, max_fee_gwei, daily_fees_eth } } => {
+            wallet_caps(&paths, &name, per_payment, daily, max_fee_gwei, daily_fees_eth)
+        }
         Command::List => list(&paths),
         Command::Health => health(&paths),
         Command::Status { json: true } => status_json(&paths),
@@ -405,7 +453,95 @@ fn prompt_for(kind: Kind) -> &'static str {
         Kind::GrokLogin => "Grok auth.json, whole (hidden; or pipe the file in with --yes): ",
         Kind::PersonalDetails => "Personal details, a JSON object (hidden; or pipe it in with --yes): ",
         Kind::AppSecret => "App secret's value (hidden; or pipe it in with --yes): ",
+        Kind::Wallet => "",
     }
+}
+
+/// A cap as typed: a decimal in dollars, gwei or ETH, into its whole units.
+fn cap_units(text: &str, decimals: u32, what: &str) -> Result<u64, VaultError> {
+    let units = vault::wallet::parse_amount(text.trim().trim_start_matches('$'), decimals)
+        .map_err(|_| VaultError::InvalidSecret(format!("{what} is a number with at most {decimals} decimal places")))?;
+    u64::try_from(units).map_err(|_| VaultError::InvalidSecret(format!("{what} is too large")))
+}
+
+fn caps_from(per_payment: &str, daily: &str, max_fee_gwei: &str, daily_fees_eth: &str) -> Result<vault::wallet::Caps, VaultError> {
+    let caps = vault::wallet::Caps {
+        per_payment_micros: cap_units(per_payment, 6, "--per-payment")?,
+        daily_micros: cap_units(daily, 6, "--daily")?,
+        max_fee_per_gas: cap_units(max_fee_gwei, 9, "--max-fee-gwei")?,
+        daily_fees_wei: cap_units(daily_fees_eth, 18, "--daily-fees-eth")?,
+    };
+    caps.validate()?;
+    Ok(caps)
+}
+
+fn print_wallet(secret: &vault::model::SecretSummary) {
+    if let Some(wallet) = &secret.wallet {
+        println!("  chain:            {} (chain id {})", wallet.chain.label(), wallet.chain.chain_id());
+        println!("  address:          {}", wallet.checksummed);
+        println!("  caps:             {}", wallet.caps.describe());
+        println!(
+            "  last 24 hours:    ${} paid, {} ETH in fees at most",
+            vault::wallet::decimal(wallet.spent_today_micros as u128, 6),
+            vault::wallet::decimal(wallet.fees_today_wei as u128, 18)
+        );
+    }
+}
+
+fn wallet_create(
+    paths: &Paths,
+    name: &str,
+    chain: &str,
+    per_payment: &str,
+    daily: &str,
+    max_fee_gwei: &str,
+    daily_fees_eth: &str,
+) -> Result<(), VaultError> {
+    vault::model::validate_name(name)?;
+    let chain = vault::wallet::Chain::parse(chain)?;
+    let caps = caps_from(per_payment, daily, max_fee_gwei, daily_fees_eth)?;
+    println!("Making wallet {name:?} on {}", chain.label());
+    println!("  caps:             {}", caps.describe());
+    println!("  its key is made in this vault and never shown or exported; it signs token payments only");
+    println!("  only the recovery key can change the caps later");
+    let typed = read_hidden("Paste the recovery key from the kit (AGE-SECRET-KEY-1...), hidden: ")?;
+    let reply = client::wallet_create(paths, name, chain.label(), &caps, &typed)?;
+    drop(typed);
+    println!("Made wallet {:?} (id {}).", reply.secret.name, reply.secret.id);
+    print_wallet(&reply.secret);
+    println!("Fund it by sending USDC or USDT, and a little ETH for fees, to the address above.");
+    print_backup(&reply.backup);
+    Ok(())
+}
+
+fn wallet_caps(
+    paths: &Paths,
+    name: &str,
+    per_payment: Option<String>,
+    daily: Option<String>,
+    max_fee_gwei: Option<String>,
+    daily_fees_eth: Option<String>,
+) -> Result<(), VaultError> {
+    let listed = client::list(paths)?;
+    let secret = listed.secrets.iter().find(|secret| secret.name == name).ok_or_else(|| VaultError::UnknownSecret(name.into()))?;
+    let current = secret.wallet.as_ref().ok_or(VaultError::WrongKind)?.caps;
+    let keep = |units: u64, decimals: u32| vault::wallet::decimal(units as u128, decimals);
+    let caps = caps_from(
+        &per_payment.unwrap_or_else(|| keep(current.per_payment_micros, 6)),
+        &daily.unwrap_or_else(|| keep(current.daily_micros, 6)),
+        &max_fee_gwei.unwrap_or_else(|| keep(current.max_fee_per_gas, 9)),
+        &daily_fees_eth.unwrap_or_else(|| keep(current.daily_fees_wei, 18)),
+    )?;
+    println!("Changing the caps of wallet {name:?}");
+    println!("  now:              {}", current.describe());
+    println!("  new:              {}", caps.describe());
+    let typed = read_hidden("Paste the recovery key from the kit (AGE-SECRET-KEY-1...), hidden: ")?;
+    let reply = client::wallet_caps(paths, &SecretRef::Name(name.into()), &caps, &typed)?;
+    drop(typed);
+    println!("Caps changed; {:?} is now version {}.", reply.secret.name, reply.secret.version);
+    print_wallet(&reply.secret);
+    print_backup(&reply.backup);
+    Ok(())
 }
 
 fn delete(paths: &Paths, name: &str, yes: bool) -> Result<(), VaultError> {
@@ -443,6 +579,16 @@ fn list(paths: &Paths) -> Result<(), VaultError> {
         if let Some(app) = &secret.app {
             let lease = if secret.leasable == Some(true) { "leasable" } else { "not leasable" };
             fields = format!("  (app {app}, {lease})");
+        }
+        // Wallets: the address and the caps; never the key.
+        if let Some(wallet) = &secret.wallet {
+            fields = format!(
+                "  ({} ${}/payment, ${}/day; ${} today)",
+                wallet.checksummed,
+                vault::wallet::decimal(wallet.caps.per_payment_micros as u128, 6),
+                vault::wallet::decimal(wallet.caps.daily_micros as u128, 6),
+                vault::wallet::decimal(wallet.spent_today_micros as u128, 6)
+            );
         }
         println!(
             "{:<32}  {:<24} {:<16} {:>3}  {}{}",
