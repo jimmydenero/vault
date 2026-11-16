@@ -38,6 +38,10 @@ pub enum Kind {
     /// the vault.
     #[serde(rename = "grok_login")]
     GrokLogin,
+    /// A person's real details (name, address, birthday, phone), filled per field (`details`,
+    /// #7435). Stored and listed only, for now: no request gives a value back.
+    #[serde(rename = "personal_details")]
+    PersonalDetails,
 }
 
 impl Kind {
@@ -49,12 +53,28 @@ impl Kind {
             Kind::ClaudePlan => "claude_plan",
             Kind::CodexLogin => "codex_login",
             Kind::GrokLogin => "grok_login",
+            Kind::PersonalDetails => "personal_details",
         }
     }
 
     /// Every kind, in the order listings count them.
-    pub const ALL: [Kind; 6] =
-        [Kind::ApiKey, Kind::Login, Kind::TwoFactor, Kind::ClaudePlan, Kind::CodexLogin, Kind::GrokLogin];
+    pub const ALL: [Kind; 7] = [
+        Kind::ApiKey,
+        Kind::Login,
+        Kind::TwoFactor,
+        Kind::ClaudePlan,
+        Kind::CodexLogin,
+        Kind::GrokLogin,
+        Kind::PersonalDetails,
+    ];
+
+    /// The site a secret of this kind gets when none is given, for a kind not tied to one site.
+    pub fn default_site(self) -> Option<&'static str> {
+        match self {
+            Kind::PersonalDetails => Some(crate::details::DEFAULT_SITE),
+            kind => crate::kinds::spec(kind).map(|spec| spec.default_site),
+        }
+    }
 }
 
 /// What a listing shows: the secret's stable id and version, name, kind and site, nothing else.
@@ -70,6 +90,9 @@ pub struct SecretSummary {
     /// 1 when added, plus one for every change to this secret (a rename, today).
     #[serde(default)]
     pub version: u64,
+    /// Personal details only: which fields are filled (`details::FIELDS`), never their values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
 }
 
 /// One stored secret.
@@ -102,6 +125,10 @@ pub(crate) struct Record {
     /// For a kind the vault renews (a Codex or Grok login): whose it is to renew (#7380).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handover: Option<Handover>,
+    /// For personal details: the names of the filled fields, so a listing can say which a form
+    /// may use without opening the value (#7435).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
     #[serde(with = "secret_bytes")]
     pub value: SecretValue,
 }
@@ -132,6 +159,7 @@ impl Record {
             kind: self.kind,
             site: self.site.clone(),
             version: self.version,
+            fields: self.fields.clone(),
         }
     }
 }
@@ -190,10 +218,11 @@ pub(crate) struct VaultDoc {
 ///   build can't read a Claude plan, so the format number tells it this file is newer instead
 ///   of letting it call the file damaged (R36).
 /// - **4**: the `codex_login` and `grok_login` kinds and a record's `handover` (#7380).
-pub(crate) const VAULT_FORMAT: u32 = 4;
+/// - **5**: the `personal_details` kind and a record's `fields` (#7435).
+pub(crate) const VAULT_FORMAT: u32 = 5;
 
 /// Every format this build reads. Older ones are migrated to `VAULT_FORMAT` when read.
-pub(crate) const READABLE_FORMATS: [u32; 4] = [1, 2, 3, 4];
+pub(crate) const READABLE_FORMATS: [u32; 5] = [1, 2, 3, 4, 5];
 
 /// A secret as a request names it: by its name, or by its stable id.
 #[derive(Clone, Debug, PartialEq, Eq)]

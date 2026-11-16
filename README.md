@@ -1,7 +1,7 @@
 # volgenic/vault
 
-Volgenic's vault keeps your agents' secrets (API keys, website logins, 2FA seeds and Claude plan
-tokens) on your own
+Volgenic's vault keeps your agents' secrets (API keys, website logins, 2FA seeds, Claude plan
+tokens, Codex and Grok logins, and your personal details) on your own
 machine (a Mac, or a Linux box such as the always-on primary host), and lets agents **use** them
 without ever **seeing** them. An agent asks the vault to make
 an API call and gets the API's reply; the vault adds the key on the way out. An agent asks for a
@@ -118,9 +118,9 @@ Or restore a backup: `vault install --for-restore`, then `vault restore FILE`.
   recovery key does, and never names a machine. Its first 12 digits are the recovery-key
   fingerprint on the kit. The `vault_id` is the copy: new at every restore, and the prefix of
   the backup files' names.
-- **The vault file and backups are format 4** (format 2 plus the `claude_plan` kind and the
-  intake key in format 3, and the `codex_login` and `grok_login` kinds and a login's handover
-  state in format 4). An older vault file is migrated at the daemon's first start, as a change of
+- **The vault file and backups are format 5** (format 2 plus the `claude_plan` kind and the
+  intake key in format 3, the `codex_login` and `grok_login` kinds and a login's handover
+  state in format 4, and the `personal_details` kind in format 5). An older vault file is migrated at the daemon's first start, as a change of
   its own (audited and backed up): a format-1 file's secrets get their ids, and a format-2 file
   gets its intake key. Older backups restore too. An older build refuses a newer file or backup
   as newer (`newer_format`); don't go back to an older build after upgrading.
@@ -137,9 +137,10 @@ The `vault` tool can't print a secret, so it is safe for any agent on the machin
 | `vault add NAME --kind 2fa --site SITE` | Adds a 2FA seed: base32, or an `otpauth://` link. |
 | `vault add NAME --kind claude_plan` | Adds a Claude plan's token (from `claude setup-token`). Used only by `stream`, only to `api.anthropic.com`. The host's daemon normally stores plans itself (`import_plan`, `add_sealed`). |
 | `vault add NAME --kind codex_login --yes < auth.json` | Adds a Codex login (its `auth.json`, whole), which the vault alone renews from then on. Used only by `stream`, only to `chatgpt.com`. `grok_login` likewise for Grok Build, to `cli-chat-proxy.grok.com`. The host's daemon normally hands logins over itself (`import_login` and `claim_refresh`, or `add_sealed`). |
+| `vault add NAME --kind personal_details` | Adds your real details (name, address, birthday, phone), asked one field at a time; leave any empty. Or `--yes` with v1's JSON object on standard input (`{"name","address","birthday","phone"}`). Stored and listed only, for now: `list` says which fields are filled, never what they say. See "Personal details" below. |
 | `vault delete NAME` | Deletes a secret. Earlier backups keep it. |
 | `vault rename NAME NEW` | Renames a secret; its id, rule and value stay, its version goes up. |
-| `vault list` | Ids, names, kinds, versions and sites. |
+| `vault list` | Ids, names, kinds, versions and sites; for personal details, which fields are filled. |
 | `vault health` | For each Claude plan, Codex login and Grok login, by name: whether it works, has expired or was refused (sign in again), and who renews it. |
 | `vault status [--json]` | The program, the daemon, backups and the audit chain. `--json`: one JSON object for a program, with a `problems` list and the command for each ([docs/json.md](docs/json.md)); no secret names. |
 | `vault --version` | The version, the commit it was built from and the target. |
@@ -168,7 +169,8 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   `"protocol": 2` and echoes the `request_id` as sent. A request without `protocol` is protocol 1
   and is served the same way. A newer protocol is refused with `unsupported_protocol`.
 - **Naming a secret:** `totp`, `proxy`, `delete` and `rename` take `"name"` or `"id"`, one of them.
-- `list` returns `{"ok":true,"secrets":[{"id","name","kind","site","version"}]}`.
+- `list` returns `{"ok":true,"secrets":[{"id","name","kind","site","version"}]}`; a
+  `personal_details` secret also has `"fields":["name","address",...]`, the filled ones.
 - `totp` returns `{"ok":true,"id":"...","name":"github-2fa","code":"123456","seconds_left":17}`.
 - `proxy` takes `method`, `path` (with query), optional `headers` (an object) and `body` or
   `body_base64`. It returns `{"ok":true,"status":200,"headers":[[name,value]],"body":"..."}`.
@@ -223,6 +225,10 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   `grok_login` only, whose hosts the vault fixes; a sealed login's `value` is its `auth.json`,
   whole, and it is the vault's alone to renew from the start (a new sign-in); a sealed API key can only be added under a new name, never replace a stored one
   (`sealed_invalid`), since that would let whoever sealed it change where the key is sent. Delete with `delete` by name, as for any secret.
+  Sealed personal details carry v1's object as a JSON string in `value`
+  (`{"v":1,"name":"v1-details","kind":"personal_details","value":"{\"name\":\"...\",\"address\":\"...\"}"}`);
+  they are added under a new name only, like an API key (whoever seals could otherwise change
+  the address a form is filled with): delete, then add, to change them.
 - **`import_plan`** is the upgrade's move of the host's existing plan tokens into the vault:
   `{"op":"import_plan","plans":[{"name":"main","value":"sk-ant-oat01-..."}]}` returns each plan's
   `result` by name: `done` (added, or a different value replaced, version up), `unchanged` (already
@@ -271,6 +277,24 @@ A renewal stores the new tokens, the rotated refresh token with them, in the vau
 call uses the new access token. Two calls that find a login due at once wait for one renewal
 between them, so the same refresh token is never sent twice. Renewals go to `auth.openai.com`
 and `auth.x.ai` only, which no caller can reach through `stream`.
+
+## Personal details
+
+A `personal_details` secret holds a person's real name, address, birthday and phone, for the few
+sites that need the real person (work item #7435). v1 kept them on Volgenic's server
+(`personal_details.ciphertext`, one JSON object); core hands them to their owner's vault with
+`add_sealed`, as it does v1's logins.
+
+- **Given** as v1's object: `{"name","address","birthday","phone"}`, each a string; any may be
+  missing, `null` or empty, at least one filled, no other key. Each field is trimmed text of at
+  most 500 characters, with no control character but a line break. Nothing parses the birthday
+  or the phone: they are kept as typed.
+- **Stored** as the vault's own object with the filled fields only (`src/details.rs`). The
+  record also names its filled fields, which `list`, `add`'s reply and the audit line show;
+  never a value.
+- **Used** by nothing yet: no request gives a value back, `proxy`, `stream` and `totp` refuse it
+  (`wrong_kind`). A way for a form-filling agent to fill one field without Volgenic's server
+  seeing it is a later step. Today: add, list, rename, delete.
 
 ## Build
 

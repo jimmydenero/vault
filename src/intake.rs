@@ -10,7 +10,12 @@
 //! {"v":1,"name":"main","kind":"claude_plan","site":"api.anthropic.com","value":"sk-ant-oat01-..."}
 //! {"v":1,"name":"openai","kind":"api-key","rule":{"host":"api.openai.com","methods":["POST"],
 //!  "path":"/v1","header":"Authorization: Bearer {key}"},"value":"sk-..."}
+//! {"v":1,"name":"v1-details","kind":"personal_details",
+//!  "value":"{\"name\":\"Ada Lovelace\",\"address\":\"...\",\"birthday\":\"\",\"phone\":\"\"}"}
 //! ```
+//!
+//! A value whose kind has a stored form of its own (a login's `auth.json`, personal details'
+//! object) is carried as a string and read into that form when it is stored (`kinds`, `details`).
 //!
 //! A server that relays the ciphertext can't read the value, and can't change the rule, the kind
 //! or the name it is stored under: the request's own `name` and `kind`, which the server and the
