@@ -13,7 +13,7 @@ use crate::backup;
 use crate::error::VaultError;
 use crate::keyprotect;
 use crate::kinds::{self, Renewed};
-use crate::model::{self, BackupStatus, Kind, Record, SecretRef, SecretSummary, VAULT_FORMAT, VaultDoc};
+use crate::model::{self, BackupStatus, Handover, Kind, Record, SecretRef, SecretSummary, VAULT_FORMAT, VaultDoc};
 use crate::protocol::{BackupCheck, OpenedStatus};
 use crate::rules::ProxyRule;
 use crate::secret::SecretValue;
@@ -399,12 +399,18 @@ impl Vault {
         let spec = kinds::spec(new.kind);
         let site = match (new.site.is_empty(), spec) {
             (true, Some(spec)) => spec.default_site.to_string(),
-            _ => new.site,
+            _ => new.site.clone(),
         };
         model::validate_site(&site)?;
         if new.value.is_empty() || new.value.len() > 16 * 1024 {
             return Err(VaultError::InvalidSecret("the value must be 1 byte to 16 KiB".into()));
         }
+        // A login's auth.json becomes the vault's own stored form (`logins`).
+        let (new_value, expires_at) = match spec.and_then(|spec| spec.intake) {
+            Some(intake) => intake(&new.value)?,
+            None => (new.value, None),
+        };
+        let new = NewSecret { value: new_value, ..new };
         let (value, totp_params) = match new.kind {
             Kind::TwoFactor => {
                 let (seed, params) = totp::parse_seed_input(&new.value)?;
@@ -441,7 +447,14 @@ impl Vault {
             rule: if new.kind == Kind::ApiKey { new.rule } else { None },
             username: if new.kind == Kind::Login { new.username } else { None },
             totp: totp_params,
-            expires_at: None,
+            expires_at,
+            // A login the vault renews arrives claimed: a new sign-in (sealed) or one a person
+            // typed in is the vault's alone. An import says otherwise (`import_logins`).
+            handover: spec.and_then(|spec| spec.refresher).map(|_| Handover {
+                claimed: true,
+                claimed_at: Some(crate::now_rfc3339()),
+                imported: None,
+            }),
             value,
         })
     }
@@ -545,11 +558,19 @@ impl Vault {
         }
     }
 
-    /// Stores what a kind's refresher renewed (token upkeep): a new version of the same secret.
-    pub fn renew(&mut self, id: &str, renewed: Renewed) -> Result<(SecretSummary, BackupStatus), VaultError> {
+    /// Stores what a kind's refresher renewed (token upkeep): a new version of the same secret,
+    /// written to the vault file before the caller uses the new token. Only onto version `seen`,
+    /// the one that was renewed: if the secret changed meanwhile (a new sign-in replaced it), the
+    /// renewal belongs to a value no longer stored and is dropped (`VersionMismatch`).
+    ///
+    /// No `ready_for_change` check: the provider has already retired the old refresh token, so
+    /// not storing the new one would lose the login. A failed backup is still the alarm of R19.
+    pub fn renew(&mut self, id: &str, seen: u64, renewed: Renewed) -> Result<(SecretSummary, Result<BackupStatus, VaultError>), VaultError> {
         self.reload()?;
-        self.ready_for_change()?;
         let record = self.doc.records.iter_mut().find(|record| record.id == id).ok_or_else(|| VaultError::UnknownSecret(format!("id {id}")))?;
+        if record.version != seen {
+            return Err(VaultError::VersionMismatch(record.version));
+        }
         record.value = renewed.value;
         record.expires_at = renewed.expires_at;
         record.version += 1;
@@ -558,8 +579,158 @@ impl Vault {
         let mut event = AuditEvent::named("renew", &summary.name, "ok");
         event.secret_id = Some(summary.id.clone());
         event.detail = Some(format!("renewed by the vault, version {}", summary.version));
+        self.doc.generation += 1;
+        self.doc.audit_head = self.audit(event)?;
+        store::save(&self.paths, &self.key, &self.doc)?;
+        let status = self.backup_now();
+        let backup = if status.ok { Ok(status) } else { Err(VaultError::BackupFailed(status.detail)) };
+        Ok((summary, backup))
+    }
+
+    /// Imports the host's existing Codex and Grok logins (`auth.json`, whole) on an upgrade
+    /// (#7380), in one change. Each login is stored *unclaimed*: the vault uses its access token
+    /// but never renews it until `claim_refresh`, because the host's daemon may still be renewing
+    /// it. By name:
+    ///
+    /// - not stored yet: added, unclaimed (`done`, version 1);
+    /// - stored, and this is the `auth.json` the last import stored (whatever the vault did with
+    ///   it since): `unchanged`;
+    /// - stored, unclaimed, a different `auth.json` (the daemon renewed it meanwhile): replaced,
+    ///   version up, still unclaimed (`done`);
+    /// - stored and claimed, a different `auth.json`: `failed` with `login_claimed`. The vault
+    ///   renews it now, so a file's tokens are older than the vault's and may be dead; only a new
+    ///   sign-in (`add_sealed` with `replace`) replaces it;
+    /// - a name held by another kind: `failed`, and the others go ahead.
+    pub fn import_logins(
+        &mut self,
+        logins: Vec<(String, Kind, SecretValue)>,
+    ) -> Result<(Vec<(String, Kind, ImportOutcome, bool)>, Option<BackupStatus>), VaultError> {
+        self.reload()?;
+        self.ready_for_change()?;
+        let mut results = Vec::with_capacity(logins.len());
+        let mut changed = Vec::new();
+        for (name, kind, given) in logins {
+            let outcome = match self.import_login(&name, kind, given) {
+                Ok((outcome, change)) => {
+                    if let Some(change) = change {
+                        changed.push(change);
+                    }
+                    outcome
+                }
+                Err(error) => ImportOutcome::Failed(error),
+            };
+            let claimed = self.doc.find(&name).filter(|record| record.kind == kind).and_then(|record| record.handover.as_ref()).is_some_and(|h| h.claimed);
+            results.push((name, kind, outcome, claimed));
+        }
+        if changed.is_empty() {
+            return Ok((results, None));
+        }
+        self.check_fits()?;
+        for (name, id, what) in &changed {
+            let mut event = AuditEvent::named("import-login", name, "ok");
+            event.secret_id = Some(id.clone());
+            event.detail = Some(what.clone());
+            self.audit(event)?;
+        }
+        let mut event = AuditEvent::new("import-login", "ok");
+        event.detail = Some(format!("{} of {} logins added or replaced, unclaimed", changed.len(), results.len()));
         let status = self.commit(event)?;
-        Ok((summary, status))
+        Ok((results, Some(status)))
+    }
+
+    fn import_login(
+        &mut self,
+        name: &str,
+        kind: Kind,
+        given: SecretValue,
+    ) -> Result<(ImportOutcome, Option<(String, String, String)>), VaultError> {
+        model::validate_name(name)?;
+        let spec = kinds::spec(kind).filter(|spec| spec.refresher.is_some()).ok_or(VaultError::WrongKind)?;
+        let intake = spec.intake.ok_or(VaultError::WrongKind)?;
+        let (stored, expires_at) = intake(&given)?;
+        (spec.validate)(&stored)?;
+        let digest = crate::logins::digest(&stored);
+        let unclaimed = Handover { claimed: false, claimed_at: None, imported: Some(digest.clone()) };
+        match self.doc.records.iter().position(|record| record.name == name) {
+            None => {
+                drop(stored);
+                // `new_record` reads the auth.json again, into the same stored form.
+                let mut record = self.new_record(NewSecret {
+                    name: name.to_string(),
+                    kind,
+                    site: String::new(),
+                    rule: None,
+                    username: None,
+                    value: given,
+                })?;
+                record.handover = Some(unclaimed);
+                let change = (record.name.clone(), record.id.clone(), format!("{} added, unclaimed", kind.label()));
+                self.doc.records.push(record);
+                Ok((ImportOutcome::Done(1), Some(change)))
+            }
+            Some(index) => {
+                drop(given);
+                let record = &mut self.doc.records[index];
+                if record.kind != kind {
+                    return Err(VaultError::NameTaken(name.to_string()));
+                }
+                let handover = record.handover.clone().unwrap_or(Handover { claimed: true, claimed_at: None, imported: None });
+                if handover.imported.as_deref() == Some(digest.as_str()) {
+                    return Ok((ImportOutcome::Unchanged(record.version), None));
+                }
+                if handover.claimed {
+                    return Err(VaultError::LoginClaimed(name.to_string()));
+                }
+                record.value = stored;
+                record.expires_at = expires_at;
+                record.handover = Some(unclaimed);
+                record.version += 1;
+                record.updated_at = Some(crate::now_rfc3339());
+                let change = (record.name.clone(), record.id.clone(), format!("value replaced, version {}, unclaimed", record.version));
+                Ok((ImportOutcome::Done(record.version), Some(change)))
+            }
+        }
+    }
+
+    /// The host's daemon says it has stopped renewing an imported login (`claim_refresh`): from
+    /// now on the vault alone renews it. Only onto `version`, the one the daemon's import stored
+    /// (`import_login`'s reply): a different version means the vault holds another `auth.json`
+    /// than the one the daemon handed over, and nothing is claimed (`version_mismatch`; import the
+    /// file again, then claim that). Claiming a login already claimed changes nothing. Returns the
+    /// secret, whether it was claimed already, and the backup of the change.
+    pub fn claim_refresh(
+        &mut self,
+        secret: &SecretRef,
+        version: u64,
+    ) -> Result<(SecretSummary, bool, Option<BackupStatus>), VaultError> {
+        self.reload()?;
+        let record = self.doc.find_ref(secret).ok_or_else(|| secret.not_found())?;
+        if kinds::spec(record.kind).and_then(|spec| spec.refresher).is_none() {
+            return Err(VaultError::WrongKind);
+        }
+        if record.handover.as_ref().is_none_or(|handover| handover.claimed) {
+            return Ok((record.summary(), true, None));
+        }
+        if record.version != version {
+            return Err(VaultError::VersionMismatch(record.version));
+        }
+        let id = record.id.clone();
+        self.ready_for_change()?;
+        let record = self.doc.records.iter_mut().find(|record| record.id == id).ok_or(VaultError::VaultFileCorrupt)?;
+        let handover = record.handover.get_or_insert(Handover { claimed: false, claimed_at: None, imported: None });
+        handover.claimed = true;
+        handover.claimed_at = Some(crate::now_rfc3339());
+        record.version += 1;
+        record.updated_at = Some(crate::now_rfc3339());
+        let summary = record.summary();
+        let mut event = AuditEvent::named("claim-refresh", &summary.name, "ok");
+        event.secret_id = Some(summary.id.clone());
+        event.detail = Some(format!(
+            "the host's daemon stopped renewing it at version {version}; the vault alone renews it now (version {})",
+            summary.version
+        ));
+        let status = self.commit(event)?;
+        Ok((summary, false, Some(status)))
     }
 
     /// Deletes a secret. Earlier backup generations still hold it (R18).
@@ -756,6 +927,7 @@ pub(crate) fn same_records(a: &[Record], b: &[Record]) -> bool {
                     && x.username == y.username
                     && x.totp == y.totp
                     && x.expires_at == y.expires_at
+                    && x.handover == y.handover
                     && x.value.same_as(&y.value)
             })
         })

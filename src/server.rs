@@ -5,6 +5,7 @@
 //! the local backups (R32). Callers must be the owner's own user ID (R22): `getpeereid` on
 //! macOS, `SO_PEERCRED` on Linux (`platform::peer_of`).
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -25,13 +26,14 @@ use crate::secret::WipingBuf;
 use crate::error::VaultError;
 use crate::health::HealthBook;
 use crate::keyprotect;
-use crate::kinds::{self, HealthState};
+use crate::kinds::{self, HealthState, Refresher, Renewed};
 use crate::model::{Kind, MirrorState, Record, SecretRef, VaultDoc};
 use crate::platform::{self, Peer};
 use crate::protocol::{
-    self, AddReply, AddSealedReply, AuditReply, BackupReply, ConfirmKitReply, Envelope, ErrorReply, Framed, HealthReply,
-    ImportReply, ImportedPlan, ListReply, MirrorPlanReply, OkReply, ProxyReplyOut, ReadBackupReply, RenameReply,
-    Request, ResetReply, RestoreReply, StatusReply, TotpReply, VerifyBackupReply,
+    self, AddReply, AddSealedReply, AuditReply, BackupReply, ClaimReply, ConfirmKitReply, Envelope, ErrorReply, Framed,
+    HealthReply, ImportLoginReply, ImportReply, ImportedLogin, ImportedPlan, ListReply, MirrorPlanReply, OkReply,
+    ProxyReplyOut, ReadBackupReply, RenameReply, Request, ResetReply, RestoreReply, StatusReply, TotpReply,
+    VerifyBackupReply,
 };
 use crate::proxy::{self, ProxyRequest};
 use crate::rules;
@@ -61,6 +63,9 @@ struct Server {
     /// How far the audit chain has been checked (R29), so `vault status`, which the host polls,
     /// checks only the lines written since. Taken after `vault`, never before it.
     audit_check: Mutex<audit::Checkpoint>,
+    /// One lock per login the vault renews, by secret id: one renewal of a login at a time, so
+    /// two calls that find it due never spend the same refresh token twice (`renew_login`).
+    renewing: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     active: AtomicUsize,
 }
 
@@ -148,6 +153,7 @@ pub fn run() -> Result<(), VaultError> {
         streamer,
         health: Mutex::new(health),
         audit_check: Mutex::new(audit_check),
+        renewing: Mutex::new(HashMap::new()),
         active: AtomicUsize::new(0),
     });
     let mut event = AuditEvent::new("daemon", "started");
@@ -169,7 +175,8 @@ pub fn run() -> Result<(), VaultError> {
         Ok(())
     });
 
-    // Token upkeep (R39): only kinds with a refresher need it, and a Claude plan has none.
+    // Token upkeep (R39): only kinds with a refresher need it (Codex and Grok logins; a Claude
+    // plan has none).
     if kinds::any_refresher() {
         let server = Arc::clone(&server);
         std::thread::spawn(move || {
@@ -488,19 +495,20 @@ impl Server {
                 let result = self.snapshot().and_then(|doc| {
                     self.record(with_peer(AuditEvent::new("health", "ok"), peer))?;
                     let book = self.health.lock().unwrap_or_else(|e| e.into_inner());
-                    Ok(HealthReply { ok: true, credentials: book.report(&doc) })
+                    Ok(HealthReply { ok: true, credentials: book.report(&doc, crate::now_unix()) })
                 });
                 self.finish(stream, peer, "health", None, result)
             }
             Request::AddSealed { name, kind, sealed_base64, replace } => {
                 let result = (|| {
                     // R40: a sealed value may replace a stored one only for a kind whose hosts and
-                    // headers the kind table fixes (`claude_plan`). Anyone can seal to the intake
-                    // key, so replacing an API key's value would also replace its rule and could
-                    // send that name's agent traffic to another host.
+                    // headers the kind table fixes (`claude_plan`, `codex_login`, `grok_login`).
+                    // Anyone can seal to the intake key, so replacing an API key's value would also
+                    // replace its rule and could send that name's agent traffic to another host.
+                    // A sealed login (a new sign-in) is the vault's to renew from the start.
                     if replace && kinds::spec(kind).is_none() {
                         return Err(VaultError::SealedInvalid(format!(
-                            "a sealed value can't replace a stored {}; only a kind with fixed hosts (claude_plan) can be replaced this way",
+                            "a sealed value can't replace a stored {}; only a kind with fixed hosts (claude_plan, codex_login, grok_login) can be replaced this way",
                             kind.label()
                         )));
                     }
@@ -564,6 +572,34 @@ impl Server {
                     ImportReply { ok: true, plans, backup }
                 });
                 self.finish(stream, peer, "import_plan", None, result)
+            }
+            Request::ImportLogin { logins } => {
+                let result = self.with_vault(|vault| vault.import_logins(logins)).map(|(results, backup)| {
+                    let logins = results
+                        .into_iter()
+                        .map(|(name, kind, outcome, claimed)| {
+                            let (result, version, error, message) = match outcome {
+                                ImportOutcome::Done(version) => ("done", Some(version), None, None),
+                                ImportOutcome::Unchanged(version) => ("unchanged", Some(version), None, None),
+                                ImportOutcome::Failed(error) => ("failed", None, Some(error.code().to_string()), Some(error.to_string())),
+                            };
+                            ImportedLogin { name, kind, result: result.into(), version, claimed, error, message }
+                        })
+                        .collect();
+                    ImportLoginReply { ok: true, logins, backup }
+                });
+                self.finish(stream, peer, "import_login", None, result)
+            }
+            Request::ClaimRefresh { secret, version } => {
+                let result = self.with_vault(|vault| vault.claim_refresh(&secret, version)).map(|(secret, already, backup)| {
+                    if already {
+                        let mut event = AuditEvent::named("claim-refresh", &secret.name, "ok: already claimed");
+                        event.secret_id = Some(secret.id.clone());
+                        self.audit(with_peer(event, peer));
+                    }
+                    ClaimReply { ok: true, secret, claimed: true, already, backup }
+                });
+                self.finish(stream, peer, "claim_refresh", Some(&secret.label()), result)
             }
             Request::Status => {
                 let guard = self.vault.lock().unwrap_or_else(|e| e.into_inner());
@@ -748,9 +784,11 @@ impl Server {
     }
 
     /// `stream` (R39): checks, the audit line before the credential leaves the vault (R28), the
-    /// call, and the line after it with what happened.
+    /// call, and the line after it with what happened. For a login the vault renews (claimed,
+    /// and not refused): renewed first when it is due, and when the upstream answers 401, the
+    /// 401 is held back, the login renewed and the call made once more with the new token.
     fn stream(&self, out: &mut UnixStream, peer: &Caller, call: StreamCall) -> std::io::Result<()> {
-        let doc = match self.snapshot() {
+        let mut doc = match self.snapshot() {
             Ok(doc) => doc,
             Err(error) => return self.finish::<OkReply>(out, peer, "stream", Some(&call.secret.label()), Err(error)),
         };
@@ -763,7 +801,7 @@ impl Server {
         let mut event = with_peer(event, peer);
         let refuse = |error: VaultError, mut event: AuditEvent, out: &mut UnixStream| {
             event.outcome = format!("denied: {}", error.code());
-            if let VaultError::RuleMismatch(why) | VaultError::BadRequest(why) = &error {
+            if let VaultError::RuleMismatch(why) | VaultError::BadRequest(why) | VaultError::UpstreamFailed(why) = &error {
                 event.detail = Some(why.clone());
             }
             self.audit(event);
@@ -772,42 +810,188 @@ impl Server {
         let Some(record) = record else {
             return refuse(call.secret.not_found(), event, out);
         };
+        let id = record.id.clone();
         let plan = match stream::plan(record, call.host.as_deref(), &call.method, &call.path, &call.headers) {
             Ok(plan) => plan,
             Err(error) => return refuse(error, event, out),
         };
         event.host = Some(plan.host.clone());
-        // R28: the use is on disk before the credential leaves the vault. No line, no request.
-        let mut attempt = event.clone();
-        attempt.outcome = "sending".into();
-        if let Err(error) = self.record(attempt) {
-            return error_reply(out, peer, &error);
-        }
-        let outcome = self.streamer.run(&plan, &record.value, call.body, Duration::from_secs(call.idle), out, &peer.envelope);
-        event.status = outcome.status;
-        event.outcome = match (&outcome.error, outcome.head_sent, outcome.end) {
-            (_, true, "complete") => "ok".into(),
-            (_, true, end) => format!("ended: {end}"),
-            (Some(error), false, _) => format!("denied: {}", error.code()),
-            (None, false, end) => format!("ended: {end}"),
-        };
-        event.detail = Some(format!(
-            "{} body bytes, head after {}, {} ms in all{}",
-            outcome.bytes,
-            outcome.head_after.map_or("none".into(), |d| format!("{} ms", d.as_millis())),
-            outcome.took.as_millis(),
-            match &outcome.error {
-                Some(VaultError::UpstreamFailed(why)) => format!("; {why}"),
-                _ => String::new(),
+        // Token upkeep before the call: a login that is due is renewed first.
+        if let Some(refresher) = self.renewable(record) {
+            let now = crate::now_unix();
+            if refresher.due(record.expires_at, now) {
+                match self.renew_login(&id, record.version, "due, before a call") {
+                    Ok(fresh) => doc = fresh,
+                    Err(VaultError::CredentialRefused) => return refuse(VaultError::CredentialRefused, event, out),
+                    // The token it has may still work; the upkeep pass tries again.
+                    Err(error) => log(&format!("couldn't renew a login before a call: {}", error.code())),
+                }
             }
-        ));
-        self.audit(event);
-        if let Some(state) = outcome.health {
-            self.observe(record, state, outcome.status);
         }
-        match (outcome.head_sent, &outcome.error) {
-            (false, Some(error)) if outcome.end != "cancelled" => error_reply(out, peer, error),
-            _ => Ok(()),
+        let mut renewed_after_401 = false;
+        loop {
+            let Some(record) = doc.records.iter().find(|record| record.id == id) else {
+                return refuse(call.secret.not_found(), event, out);
+            };
+            let credential = match stream::Credential::of(record) {
+                Ok(credential) => credential,
+                Err(error) => return refuse(error, event, out),
+            };
+            let hold_auth_error = !renewed_after_401 && self.renewable(record).is_some();
+            // R28: the use is on disk before the credential leaves the vault. No line, no request.
+            let mut attempt = event.clone();
+            attempt.outcome = "sending".into();
+            if let Err(error) = self.record(attempt) {
+                return error_reply(out, peer, &error);
+            }
+            let outcome = self.streamer.run(
+                &plan,
+                &credential,
+                &call.body,
+                Duration::from_secs(call.idle),
+                out,
+                &peer.envelope,
+                hold_auth_error,
+            );
+            drop(credential);
+            if outcome.end == "auth_error" {
+                // Nothing reached the caller: renew the login and make the call once more.
+                let mut held = event.clone();
+                held.status = Some(401);
+                held.outcome = "held: auth_error".into();
+                held.detail = Some("the upstream answered 401; renewing the login and trying once more".into());
+                self.audit(held);
+                renewed_after_401 = true;
+                match self.renew_login(&id, record.version, "the upstream answered 401") {
+                    Ok(fresh) => {
+                        doc = fresh;
+                        continue;
+                    }
+                    Err(error) => return refuse(error, event, out),
+                }
+            }
+            event.status = outcome.status;
+            event.outcome = match (&outcome.error, outcome.head_sent, outcome.end) {
+                (_, true, "complete") => "ok".into(),
+                (_, true, end) => format!("ended: {end}"),
+                (Some(error), false, _) => format!("denied: {}", error.code()),
+                (None, false, end) => format!("ended: {end}"),
+            };
+            event.detail = Some(format!(
+                "{} body bytes, head after {}, {} ms in all{}",
+                outcome.bytes,
+                outcome.head_after.map_or("none".into(), |d| format!("{} ms", d.as_millis())),
+                outcome.took.as_millis(),
+                match &outcome.error {
+                    Some(VaultError::UpstreamFailed(why)) => format!("; {why}"),
+                    _ => String::new(),
+                }
+            ));
+            self.audit(event);
+            if let Some(state) = outcome.health {
+                self.observe(record, state, outcome.status);
+            }
+            return match (outcome.head_sent, &outcome.error) {
+                (false, Some(error)) if outcome.end != "cancelled" => error_reply(out, peer, error),
+                _ => Ok(()),
+            };
+        }
+    }
+
+    /// The refresher of a login the vault may renew now: a kind with one, claimed (an imported
+    /// login stays the host daemon's until `claim_refresh`), and not refused at this version (a
+    /// dead refresh token isn't tried again until a new sign-in replaces it).
+    fn renewable(&self, record: &Record) -> Option<Refresher> {
+        let refresher = kinds::spec(record.kind)?.refresher?;
+        if record.handover.as_ref().is_some_and(|handover| !handover.claimed) {
+            return None;
+        }
+        let book = self.health.lock().unwrap_or_else(|e| e.into_inner());
+        if book.state_of(&record.id, record.version) == Some(HealthState::Refused) {
+            return None;
+        }
+        Some(refresher)
+    }
+
+    /// Renews login `id` (token upkeep, R39) and returns the vault as it is afterwards. One
+    /// renewal per login at a time: `seen` is the version the caller found due or refused, and
+    /// if the login is at another version once this call holds the login's lock, another call
+    /// renewed it (or a new sign-in replaced it) meanwhile. Then nothing is sent: the refresh
+    /// token `seen` held is already spent, and the caller uses the new version.
+    ///
+    /// The renewed tokens are written to the vault file (the rotated refresh token with them)
+    /// before this returns, so before any call uses the new access token. No token is returned
+    /// or logged; the audit log names the login only.
+    fn renew_login(&self, id: &str, seen: u64, why: &str) -> Result<Arc<VaultDoc>, VaultError> {
+        let lock = {
+            let mut locks = self.renewing.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(locks.entry(id.to_string()).or_default())
+        };
+        let _one_at_a_time = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let doc = self.snapshot()?;
+        let record = doc
+            .records
+            .iter()
+            .find(|record| record.id == id)
+            .ok_or_else(|| VaultError::UnknownSecret(format!("id {id}")))?;
+        if record.version != seen {
+            return Ok(Arc::clone(&doc));
+        }
+        let Some(refresher) = self.renewable(record) else {
+            return Ok(Arc::clone(&doc));
+        };
+        let request = (refresher.call)(&record.value)?;
+        let mut event = AuditEvent::named("renew", &record.name, "sending");
+        event.secret_id = Some(record.id.clone());
+        event.host = Some(refresher.host.to_string());
+        event.detail = Some(format!("version {seen}: {why}"));
+        self.record(event.clone())?; // R28
+        let result = self
+            .streamer
+            .refresh(&request)
+            .and_then(|(status, body)| (refresher.parse)(&record.value, status, &body, crate::now_unix()));
+        drop(request);
+        match result {
+            Ok((value, expires_at)) => {
+                match self.with_vault(|vault| vault.renew(id, seen, Renewed { value, expires_at })) {
+                    Ok((summary, backup)) => {
+                        if let Err(error) = backup {
+                            log(&format!("renewed {} (version {}), but its backup failed: {error}", summary.name, summary.version));
+                        }
+                        let mut book = self.health.lock().unwrap_or_else(|e| e.into_inner());
+                        book.observe(&summary.id, summary.version, HealthState::Works, None, crate::now_rfc3339());
+                        drop(book);
+                        log(&format!("renewed {} (version {})", summary.name, summary.version));
+                    }
+                    // A new sign-in replaced it while the renewal ran: the new one stands.
+                    Err(VaultError::VersionMismatch(_)) => {}
+                    Err(error) => {
+                        log(&format!(
+                            "RENEWED {} BUT COULDN'T STORE IT ({error}): the provider has retired the stored refresh token",
+                            record.name
+                        ));
+                        event.outcome = format!("failed: {}", error.code());
+                        self.audit(event);
+                        return Err(error);
+                    }
+                }
+                self.snapshot()
+            }
+            Err(VaultError::CredentialRefused) => {
+                event.outcome = "denied: credential_refused".into();
+                event.detail = Some(format!("version {seen}: the token server refused it; sign in again"));
+                self.audit(event);
+                self.observe(record, HealthState::Refused, None);
+                Err(VaultError::CredentialRefused)
+            }
+            Err(error) => {
+                event.outcome = format!("failed: {}", error.code());
+                if let VaultError::UpstreamFailed(detail) = &error {
+                    event.detail = Some(format!("version {seen}: {detail}"));
+                }
+                self.audit(event);
+                Err(error)
+            }
         }
     }
 
@@ -825,39 +1009,19 @@ impl Server {
         }
     }
 
-    /// Token upkeep (R39): renews every credential whose kind's refresher says it is due, and
-    /// stores the result as a new version. A refusal marks it refused, for the person to sign in
-    /// again; any other failure is tried again at the next pass.
+    /// Token upkeep (R39): renews every login the vault may renew (`renewable`) whose refresher
+    /// says it is due. A refusal marks it refused, for the person to sign in again; any other
+    /// failure is tried again at the next pass.
     fn upkeep(&self) {
         let Ok(doc) = self.snapshot() else { return };
         let now = crate::now_unix();
         for record in &doc.records {
-            let Some(refresher) = kinds::spec(record.kind).and_then(|spec| spec.refresher) else { continue };
-            if !(refresher.due)(record.expires_at, now) {
+            let Some(refresher) = self.renewable(record) else { continue };
+            if !refresher.due(record.expires_at, now) {
                 continue;
             }
-            let mut event = AuditEvent::named("renew", &record.name, "sending");
-            event.secret_id = Some(record.id.clone());
-            if self.record(event.clone()).is_err() {
-                return;
-            }
-            match (refresher.renew)(&self.client, &record.value) {
-                Ok(renewed) => match self.with_vault(|vault| vault.renew(&record.id, renewed)) {
-                    Ok((summary, _)) => {
-                        let mut book = self.health.lock().unwrap_or_else(|e| e.into_inner());
-                        book.observe(&summary.id, summary.version, HealthState::Works, None, crate::now_rfc3339());
-                    }
-                    Err(error) => log(&format!("couldn't store the renewed {}: {}", record.name, error.code())),
-                },
-                Err(VaultError::CredentialRefused) => {
-                    event.outcome = "denied: credential_refused".into();
-                    self.audit(event);
-                    self.observe(record, HealthState::Refused, None);
-                }
-                Err(error) => {
-                    event.outcome = format!("failed: {}", error.code());
-                    self.audit(event);
-                }
+            if let Err(error) = self.renew_login(&record.id, record.version, "due (upkeep)") {
+                log(&format!("couldn't renew {}: {}", record.name, error.code()));
             }
         }
     }

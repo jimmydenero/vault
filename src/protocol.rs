@@ -26,6 +26,8 @@
 //! For the host daemon and Volgenic's app (R40, R41):
 //!   {"op":"add_sealed","name":"main","kind":"claude_plan","sealed_base64":"...","replace":true}
 //!   {"op":"import_plan","plans":[{"name":"main","value":"sk-ant-oat01-..."}]}
+//!   {"op":"import_login","logins":[{"name":"codex","kind":"codex_login","auth_json":"{...}"}]}
+//!   {"op":"claim_refresh","name":"codex","version":1}                (or "id")
 //!
 //! **`stream`** (R39) sends one request with a credential whose kind (`kinds`) or rule (an API key)
 //! decides the host, the methods, the paths and the headers the vault sets, and streams the reply
@@ -212,6 +214,15 @@ pub enum Request {
     ImportPlan {
         plans: Vec<(String, SecretValue)>,
     },
+    /// The host's Codex and Grok `auth.json` files, whole: name, kind, contents.
+    ImportLogin {
+        logins: Vec<(String, Kind, SecretValue)>,
+    },
+    ClaimRefresh {
+        secret: SecretRef,
+        /// The version `import_login` gave the login.
+        version: u64,
+    },
     Status,
     Audit {
         all: bool,
@@ -350,6 +361,26 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
     }
 
     #[derive(Deserialize)]
+    struct LoginWire {
+        name: String,
+        kind: Kind,
+        /// The auth.json's text as a JSON string (or an array of its bytes), read straight into a
+        /// wiping buffer (R1).
+        #[serde(deserialize_with = "secret_bytes::deserialize")]
+        auth_json: SecretValue,
+    }
+
+    #[derive(Deserialize)]
+    struct ImportLoginWire {
+        logins: Vec<LoginWire>,
+    }
+
+    #[derive(Deserialize)]
+    struct ClaimWire {
+        version: u64,
+    }
+
+    #[derive(Deserialize)]
     struct AuditWire {
         #[serde(default)]
         all: bool,
@@ -472,6 +503,14 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
             let w: ImportWire = serde_json::from_slice(line)?;
             Request::ImportPlan { plans: w.plans.into_iter().map(|plan| (plan.name, plan.value)).collect() }
         }
+        "import_login" => {
+            let w: ImportLoginWire = serde_json::from_slice(line)?;
+            Request::ImportLogin { logins: w.logins.into_iter().map(|login| (login.name, login.kind, login.auth_json)).collect() }
+        }
+        "claim_refresh" => Request::ClaimRefresh {
+            secret: named(line)?,
+            version: serde_json::from_slice::<ClaimWire>(line)?.version,
+        },
         "audit" => Request::Audit { all: serde_json::from_slice::<AuditWire>(line)?.all },
         "add" => {
             let w: AddWire = serde_json::from_slice(line)?;
@@ -606,7 +645,9 @@ pub struct CredentialHealth {
     /// The upstream status that said so.
     pub status: Option<u16>,
     /// `never`: the vault doesn't renew this kind (a Claude plan's token lasts a year; a new
-    /// sign-in replaces it). `by_vault`: the vault renews it before it expires.
+    /// sign-in replaces it). `by_vault`: the vault renews it before it expires and on an auth
+    /// error. `awaiting_claim`: an imported login the host's daemon may still be renewing; the
+    /// vault uses it but renews it only after `claim_refresh`.
     pub refresh: String,
     pub expires_at: Option<u64>,
 }
@@ -638,6 +679,42 @@ pub struct ImportedPlan {
     /// For failed: the error code and message.
     pub error: Option<String>,
     pub message: Option<String>,
+}
+
+/// One login of an `import_login`, by name only.
+#[derive(Serialize, Deserialize)]
+pub struct ImportedLogin {
+    pub name: String,
+    pub kind: Kind,
+    /// `done` (added, or a different auth.json replaced an unclaimed one), `unchanged` (the
+    /// auth.json the last import stored) or `failed`.
+    pub result: String,
+    /// The version it has now (for done and unchanged): what `claim_refresh` takes.
+    pub version: Option<u64>,
+    /// Whether the vault alone renews it already.
+    pub claimed: bool,
+    pub error: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ImportLoginReply {
+    pub ok: bool,
+    pub logins: Vec<ImportedLogin>,
+    /// The backup of the change, or null when nothing changed.
+    pub backup: Option<BackupStatus>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ClaimReply {
+    pub ok: bool,
+    pub secret: SecretSummary,
+    /// True from now on: only the vault renews it.
+    pub claimed: bool,
+    /// It was claimed before this request; nothing changed.
+    pub already: bool,
+    /// The backup of the change, or null when nothing changed.
+    pub backup: Option<BackupStatus>,
 }
 
 #[derive(Serialize, Deserialize)]

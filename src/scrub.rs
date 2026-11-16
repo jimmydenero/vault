@@ -36,6 +36,11 @@ pub(crate) fn needles(key: &SecretValue) -> Vec<Zeroizing<Vec<u8>>> {
     forms
 }
 
+/// The forms of every one of `keys` (a login's access and refresh tokens).
+pub(crate) fn needles_of(keys: &[&SecretValue]) -> Vec<Zeroizing<Vec<u8>>> {
+    keys.iter().flat_map(|key| needles(key)).collect()
+}
+
 /// Whether `haystack` contains any of the forms.
 pub(crate) fn contains_any(haystack: &[u8], forms: &[Zeroizing<Vec<u8>>]) -> bool {
     forms.iter().any(|form| memchr::memmem::find(haystack, form).is_some())
@@ -57,8 +62,9 @@ pub(crate) struct StreamScrub {
 pub(crate) struct Echo;
 
 impl StreamScrub {
-    pub(crate) fn new(key: &SecretValue) -> StreamScrub {
-        let forms = needles(key);
+    /// A scrub for every form of each of `keys`.
+    pub(crate) fn new(keys: &[&SecretValue]) -> StreamScrub {
+        let forms = needles_of(keys);
         let finders = forms.iter().map(|form| memchr::memmem::Finder::new(form.as_slice()).into_owned()).collect();
         StreamScrub { finders, forms, held: Zeroizing::new(Vec::new()) }
     }
