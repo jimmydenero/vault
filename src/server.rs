@@ -29,7 +29,7 @@ use crate::kinds::{self, HealthState};
 use crate::model::{Kind, MirrorState, Record, SecretRef, VaultDoc};
 use crate::platform::{self, Peer};
 use crate::protocol::{
-    self, AddReply, AddSealedReply, BackupReply, ConfirmKitReply, Envelope, ErrorReply, Framed, HealthReply,
+    self, AddReply, AddSealedReply, AuditReply, BackupReply, ConfirmKitReply, Envelope, ErrorReply, Framed, HealthReply,
     ImportReply, ImportedPlan, ListReply, MirrorPlanReply, OkReply, ProxyReplyOut, ReadBackupReply, RenameReply,
     Request, ResetReply, RestoreReply, StatusReply, TotpReply, VerifyBackupReply,
 };
@@ -58,6 +58,9 @@ struct Server {
     streamer: Streamer,
     /// What upstream replies said about each credential (`health`).
     health: Mutex<HealthBook>,
+    /// How far the audit chain has been checked (R29), so `vault status`, which the host polls,
+    /// checks only the lines written since. Taken after `vault`, never before it.
+    audit_check: Mutex<audit::Checkpoint>,
     active: AtomicUsize,
 }
 
@@ -122,6 +125,19 @@ pub fn run() -> Result<(), VaultError> {
         Some(vault) => Some(Arc::new(vault.read_copy()?)),
         None => None,
     };
+    // The full check of the audit chain, across every rotated file, once at the start; from
+    // here on `status` and `audit` check only what was written since (`audit::check`).
+    let mut audit_check = audit::Checkpoint::default();
+    let started = std::time::Instant::now();
+    match audit::check(&paths.audit_log, &mut audit_check, opened.as_ref().map(Vault::audit_head)) {
+        Ok(()) => log(&format!(
+            "audit log: {} lines in {} file(s), hash chain intact (checked in {} ms)",
+            audit_check.lines(),
+            audit_check.files(),
+            started.elapsed().as_millis()
+        )),
+        Err(error) => log(&format!("AUDIT LOG PROBLEM: {error}")),
+    }
     let server = Arc::new(Server {
         paths: paths.clone(),
         owner_uid,
@@ -131,6 +147,7 @@ pub fn run() -> Result<(), VaultError> {
         client,
         streamer,
         health: Mutex::new(health),
+        audit_check: Mutex::new(audit_check),
         active: AtomicUsize::new(0),
     });
     let mut event = AuditEvent::new("daemon", "started");
@@ -296,6 +313,29 @@ impl Server {
         let fresh = guard.as_ref().and_then(|vault| vault.read_copy().ok()).map(Arc::new);
         if let Ok(mut snapshot) = self.snapshot.write() {
             *snapshot = fresh;
+        }
+    }
+
+    /// The audit log for `vault audit`, its chain checked up to the head the vault file records
+    /// (R29): the last lines from the checkpoint, or with `all` every line and a full check of
+    /// every file, which also renews the checkpoint. Lines hold no values (R28).
+    fn audit_report(&self, all: bool) -> AuditReply {
+        let recorded = self.snapshot().ok().map(|doc| doc.audit_head.clone());
+        let recorded = recorded.as_deref();
+        let log = &self.paths.audit_log;
+        let result = if all {
+            audit::read_all(log, recorded).map(|(lines, checkpoint)| {
+                let total = checkpoint.lines();
+                *self.audit_check.lock().unwrap_or_else(|e| e.into_inner()) = checkpoint;
+                (total, lines)
+            })
+        } else {
+            let mut checkpoint = self.audit_check.lock().unwrap_or_else(|e| e.into_inner());
+            audit::check(log, &mut checkpoint, recorded).map(|()| (checkpoint.lines(), checkpoint.tail()))
+        };
+        match result {
+            Ok((total, lines)) => AuditReply { ok: true, total, lines, problem: None },
+            Err(error) => AuditReply { ok: true, total: 0, lines: Vec::new(), problem: Some(error.to_string()) },
         }
     }
 
@@ -527,7 +567,13 @@ impl Server {
             }
             Request::Status => {
                 let guard = self.vault.lock().unwrap_or_else(|e| e.into_inner());
-                let opened = guard.as_ref().map(Vault::status);
+                let opened = guard.as_ref().map(|vault| {
+                    let mut checkpoint = self.audit_check.lock().unwrap_or_else(|e| e.into_inner());
+                    match audit::check(&self.paths.audit_log, &mut checkpoint, Some(vault.audit_head())) {
+                        Ok(()) => vault.status(Ok(&checkpoint)),
+                        Err(error) => vault.status(Err(error.to_string())),
+                    }
+                });
                 drop(guard);
                 let mirror = fs::read(&self.paths.mirror_state)
                     .ok()
@@ -551,7 +597,7 @@ impl Server {
                 )
             }
             Request::Audit { all } => {
-                let report = vault::audit_report(&self.paths, all);
+                let report = self.audit_report(all);
                 self.audit(with_peer(AuditEvent::new("audit", "ok"), peer));
                 reply(stream, &peer.envelope, &report)
             }

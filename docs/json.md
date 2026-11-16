@@ -118,7 +118,7 @@ A list of `{code, severity, sentence, how}`, errors first:
     "service_enabled": false,          // Linux only (default.target.wants link), else null
     "launch_agent_loaded": null        // macOS only (launchctl print), else null
   },
-  "audit": { "intact": true, "lines": 12, "problem": null },   // null unless the daemon answered with a vault
+  "audit": { "intact": true, "lines": 12, "files": 1, "problem": null },   // null unless the daemon answered with a vault; files: audit.log and its rotated audit.log.<n>
   "intake": {                          // the vault's intake key (sealed intake, `add_sealed`); null unless the daemon answered with a vault
     "public_key": "age1qmgamyp4yjfrk0f0nc0hh3pw03zf76y7kr2j20m52wc80f6lc57s55uukl",   // an age X25519 recipient
     "fingerprint": "732e-1fdf-6b84"    // first 12 hex digits of its SHA-256, the recovery key's form
