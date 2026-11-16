@@ -52,6 +52,12 @@ pub enum VaultError {
     SealedKey(String),
     UnsupportedProtocol(u32),
     ReplyMismatch(String),
+    /// A sealed value that doesn't open with the intake key, or isn't what `add_sealed` takes.
+    SealedInvalid(String),
+    /// The provider refused the credential: the person signs in again.
+    CredentialRefused,
+    /// The upstream sent nothing for the idle timeout.
+    IdleTimeout(u64),
 }
 
 impl VaultError {
@@ -97,6 +103,9 @@ impl VaultError {
             SealedKey(_) => "sealed_key_error",
             UnsupportedProtocol(_) => "unsupported_protocol",
             ReplyMismatch(_) => "reply_mismatch",
+            SealedInvalid(_) => "sealed_invalid",
+            CredentialRefused => "credential_refused",
+            IdleTimeout(_) => "idle_timeout",
         }
     }
 }
@@ -159,6 +168,9 @@ impl fmt::Display for VaultError {
                 crate::protocol::PROTOCOL_VERSION
             ),
             ReplyMismatch(why) => write!(f, "the daemon's reply doesn't belong to this request: {why}"),
+            SealedInvalid(why) => write!(f, "sealed value refused: {why}"),
+            CredentialRefused => write!(f, "the provider refused the credential; sign in again"),
+            IdleTimeout(seconds) => write!(f, "the API sent nothing for {seconds} seconds"),
         }
     }
 }

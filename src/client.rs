@@ -25,7 +25,7 @@ use crate::error::VaultError;
 use crate::model::{Kind, SecretRef};
 use crate::platform;
 use crate::protocol::{
-    self, AddReply, AuditReply, BackupCheck, BackupReply, ConfirmKitReply, ErrorReply, ListReply, MirrorPlanReply,
+    self, AddReply, AuditReply, BackupCheck, BackupReply, ConfirmKitReply, ErrorReply, HealthReply, ListReply, MirrorPlanReply,
     OkReply, Outgoing, ReadBackupReply, RenameReply, ReplyFrame, ResetReply, RestoreReply, RuleInput, SecretRequest,
     StatusReply, VerifyBackupReply,
 };
@@ -138,6 +138,10 @@ pub fn status(paths: &Paths) -> Result<StatusReply, VaultError> {
 
 pub fn list(paths: &Paths) -> Result<ListReply, VaultError> {
     call(paths, json!({"op": "list"}), SHORT_WAIT)
+}
+
+pub fn health(paths: &Paths) -> Result<HealthReply, VaultError> {
+    call(paths, json!({"op": "health"}), SHORT_WAIT)
 }
 
 pub fn audit(paths: &Paths, all: bool) -> Result<AuditReply, VaultError> {

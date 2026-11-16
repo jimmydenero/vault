@@ -12,6 +12,7 @@ use crate::audit::{self, AuditEvent};
 use crate::backup;
 use crate::error::VaultError;
 use crate::keyprotect;
+use crate::kinds::{self, Renewed};
 use crate::model::{self, BackupStatus, Kind, Record, SecretRef, SecretSummary, VAULT_FORMAT, VaultDoc};
 use crate::protocol::{AuditReply, BackupCheck, OpenedStatus};
 use crate::rules::ProxyRule;
@@ -30,6 +31,7 @@ pub struct Vault {
 pub struct NewSecret {
     pub name: String,
     pub kind: Kind,
+    /// Empty for a kind with a default site (a Claude plan), which then gets it.
     pub site: String,
     pub rule: Option<ProxyRule>,
     pub username: Option<String>,
@@ -55,6 +57,15 @@ pub struct RestoreReport {
     pub from_format: u32,
     pub secrets: Vec<SecretSummary>,
     pub from_generation: u64,
+}
+
+/// What `import_plan` did with one plan.
+pub enum ImportOutcome {
+    /// Added, or its value replaced (the version it has now).
+    Done(u64),
+    /// Already there with the same value.
+    Unchanged(u64),
+    Failed(VaultError),
 }
 
 /// What `reset` did: removed an unused vault, or proved the key and kept a restore point.
@@ -102,6 +113,7 @@ pub fn init(paths: &Paths, kit_path: &Path, mirror_dir: &Path) -> Result<InitRep
         kit_path: Some(kit_path.display().to_string()),
         mirror_dir: mirror_dir.display().to_string(),
         check_identity: check_secret,
+        intake_identity: Some(backup::new_identity().0),
         audit_head: audit::GENESIS.into(),
         generation: 1,
         last_backup: None,
@@ -200,14 +212,21 @@ impl Vault {
         let doc = store::load(paths, &key)?;
         let from = doc.format;
         let mut vault = Vault { paths: paths.clone(), key, doc };
-        let Some(given) = model::migrate(&mut vault.doc, store::new_random_id)? else {
+        let given = model::migrate(&mut vault.doc, store::new_random_id)?;
+        let made_intake = model::ensure_intake(&mut vault.doc);
+        if given.is_none() && !made_intake {
             return Ok((vault, None));
-        };
+        }
+        let what = format!(
+            "{} secrets given ids{}",
+            given.unwrap_or(0),
+            if made_intake { ", intake key made" } else { "" }
+        );
         let mut event = AuditEvent::new("migrate", "ok");
-        event.detail = Some(format!("vault file format {from} to {VAULT_FORMAT}: {given} secrets given ids"));
+        event.detail = Some(format!("vault file format {from} to {VAULT_FORMAT}: {what}"));
         let note = match vault.commit(event) {
             Ok(backup) => format!(
-                "migrated the vault file from format {from} to {VAULT_FORMAT} ({given} secrets given ids); backup generation {} OK",
+                "migrated the vault file from format {from} to {VAULT_FORMAT} ({what}); backup generation {} OK",
                 backup.generation
             ),
             // The migrated file is on disk; a failed backup is the alarm of R19, as for any change.
@@ -334,13 +353,55 @@ impl Vault {
 
     /// Stores a new secret (R5, R7, R17, R27).
     pub fn add(&mut self, new: NewSecret) -> Result<(SecretSummary, BackupStatus), VaultError> {
+        self.put(new, false).map(|(summary, status, _)| (summary, status))
+    }
+
+    /// Stores a secret, or with `replace`, replaces the value (and rule, site or username) of the
+    /// secret already stored under that name, which must be of the same kind: its id stays, and
+    /// its version goes up by one. Returns whether it replaced one (`add_sealed`, R40).
+    pub fn put(&mut self, new: NewSecret, replace: bool) -> Result<(SecretSummary, BackupStatus, bool), VaultError> {
         self.reload()?;
         self.ready_for_change()?;
+        let name = new.name.clone();
+        let existing = self.doc.records.iter().position(|record| record.name == name);
+        let replaced = match existing {
+            Some(_) if !replace => return Err(VaultError::NameTaken(new.name)),
+            Some(index) if self.doc.records[index].kind != new.kind => return Err(VaultError::WrongKind),
+            Some(index) => {
+                let mut record = self.new_record(new)?;
+                let old = &self.doc.records[index];
+                record.id = old.id.clone();
+                record.version = old.version + 1;
+                record.created_at = old.created_at.clone();
+                self.doc.records[index] = record;
+                true
+            }
+            None => {
+                let record = self.new_record(new)?;
+                self.doc.records.push(record);
+                false
+            }
+        };
+        self.check_fits()?;
+        let record = self.doc.find(&name).ok_or(VaultError::VaultFileCorrupt)?;
+        let summary = record.summary();
+        let mut event = AuditEvent::named(if replaced { "replace" } else { "add" }, &record.name, "ok");
+        event.secret_id = Some(record.id.clone());
+        event.detail = Some(describe(record));
+        let status = self.commit(event)?;
+        Ok((summary, status, replaced))
+    }
+
+    /// Checks a new secret as the person (or a sealed value) gave it, and makes its record with
+    /// a fresh id and version 1 (R5, R7). Whether the name is free is the caller's check.
+    fn new_record(&mut self, new: NewSecret) -> Result<Record, VaultError> {
         model::validate_name(&new.name)?;
-        model::validate_site(&new.site)?;
-        if self.doc.find(&new.name).is_some() {
-            return Err(VaultError::NameTaken(new.name));
-        }
+        let spec = kinds::spec(new.kind);
+        let site = match (new.site.is_empty(), spec) {
+            (true, Some(spec)) => spec.default_site.to_string(),
+            _ => new.site,
+        };
+        model::validate_site(&site)?;
         if new.value.is_empty() || new.value.len() > 16 * 1024 {
             return Err(VaultError::InvalidSecret("the value must be 1 byte to 16 KiB".into()));
         }
@@ -361,38 +422,38 @@ impl Vault {
             Kind::Login => model::validate_username(new.username.as_deref().unwrap_or(""))?,
             _ => {}
         }
+        if let Some(spec) = spec {
+            (spec.validate)(&value)?;
+        }
         let mut id = store::new_random_id()?;
         while self.doc.records.iter().any(|record| record.id == id) {
             id = store::new_random_id()?;
         }
         let created_at = crate::now_rfc3339();
-        let record = Record {
+        Ok(Record {
             id,
             version: 1,
-            name: new.name.clone(),
+            name: new.name,
             kind: new.kind,
-            site: new.site,
+            site,
             updated_at: Some(created_at.clone()),
             created_at,
             rule: if new.kind == Kind::ApiKey { new.rule } else { None },
             username: if new.kind == Kind::Login { new.username } else { None },
             totp: totp_params,
+            expires_at: None,
             value,
-        };
-        let summary = record.summary();
-        let mut event = AuditEvent::named("add", &record.name, "ok");
-        event.secret_id = Some(record.id.clone());
-        event.detail = Some(match &record.rule {
-            Some(rule) => format!("{}; rule {}", record.kind.label(), rule.describe()),
-            None => format!("{} for {}", record.kind.label(), record.site),
-        });
-        // Every backup must stay small enough for `vault restore FILE` to take back. Measured
-        // exactly, with the new record in place; 4 KiB covers what the next commit changes (the
-        // audit head, the generation, the timestamp).
-        self.doc.records.push(record);
+        })
+    }
+
+    /// Every backup must stay small enough for `vault restore FILE` to take back. Measured
+    /// exactly, with the change in place; 4 KiB covers what the next commit changes (the audit
+    /// head, the generation, the timestamp). A change that doesn't fit is dropped: the vault goes
+    /// back to what is on disk.
+    fn check_fits(&mut self) -> Result<(), VaultError> {
         let measured = backup::plaintext_size(&self.doc, &self.doc.records);
         if measured.as_ref().map_or(true, |size| size.saturating_add(4096) > backup::MAX_VAULT_PLAINTEXT) {
-            drop(self.doc.records.pop());
+            self.reload()?;
             return Err(match measured {
                 Err(e) => e,
                 Ok(_) => VaultError::InvalidSecret(format!(
@@ -401,6 +462,102 @@ impl Vault {
                 )),
             });
         }
+        Ok(())
+    }
+
+    /// Imports the host's existing Claude plan tokens on an upgrade (R41), in one change: a plan
+    /// not stored yet is added, one stored with the same value is left alone, one stored with a
+    /// different value gets the new value and its version goes up. A name held by another kind
+    /// fails, and the others go ahead. Safe to repeat. Each plan's result is by name only.
+    pub fn import_plans(
+        &mut self,
+        plans: Vec<(String, SecretValue)>,
+    ) -> Result<(Vec<(String, ImportOutcome)>, Option<BackupStatus>), VaultError> {
+        self.reload()?;
+        self.ready_for_change()?;
+        let mut results = Vec::with_capacity(plans.len());
+        let mut changed = Vec::new();
+        for (name, value) in plans {
+            let outcome = match self.import_one(&name, value) {
+                Ok((outcome, change)) => {
+                    if let Some(change) = change {
+                        changed.push(change);
+                    }
+                    outcome
+                }
+                Err(error) => ImportOutcome::Failed(error),
+            };
+            results.push((name, outcome));
+        }
+        if changed.is_empty() {
+            return Ok((results, None));
+        }
+        self.check_fits()?;
+        for (name, id, what) in &changed {
+            let mut event = AuditEvent::named("import-plan", name, "ok");
+            event.secret_id = Some(id.clone());
+            event.detail = Some(what.clone());
+            self.audit(event)?;
+        }
+        let mut event = AuditEvent::new("import-plan", "ok");
+        event.detail = Some(format!("{} of {} plans added or replaced", changed.len(), results.len()));
+        let status = self.commit(event)?;
+        Ok((results, Some(status)))
+    }
+
+    /// One plan of an import: its outcome, and what changed (name, id, a description) if anything.
+    fn import_one(
+        &mut self,
+        name: &str,
+        value: SecretValue,
+    ) -> Result<(ImportOutcome, Option<(String, String, String)>), VaultError> {
+        model::validate_name(name)?;
+        (kinds::CLAUDE_PLAN.validate)(&value)?;
+        match self.doc.records.iter().position(|record| record.name == name) {
+            None => {
+                let new = NewSecret {
+                    name: name.to_string(),
+                    kind: Kind::ClaudePlan,
+                    site: String::new(),
+                    rule: None,
+                    username: None,
+                    value,
+                };
+                let record = self.new_record(new)?;
+                let change = (record.name.clone(), record.id.clone(), "claude_plan added".to_string());
+                self.doc.records.push(record);
+                Ok((ImportOutcome::Done(1), Some(change)))
+            }
+            Some(index) => {
+                let record = &mut self.doc.records[index];
+                if record.kind != Kind::ClaudePlan {
+                    return Err(VaultError::NameTaken(name.to_string()));
+                }
+                if record.value.same_as(&value) {
+                    return Ok((ImportOutcome::Unchanged(record.version), None));
+                }
+                record.value = value;
+                record.version += 1;
+                record.updated_at = Some(crate::now_rfc3339());
+                let change = (record.name.clone(), record.id.clone(), format!("value replaced, version {}", record.version));
+                Ok((ImportOutcome::Done(record.version), Some(change)))
+            }
+        }
+    }
+
+    /// Stores what a kind's refresher renewed (token upkeep): a new version of the same secret.
+    pub fn renew(&mut self, id: &str, renewed: Renewed) -> Result<(SecretSummary, BackupStatus), VaultError> {
+        self.reload()?;
+        self.ready_for_change()?;
+        let record = self.doc.records.iter_mut().find(|record| record.id == id).ok_or_else(|| VaultError::UnknownSecret(format!("id {id}")))?;
+        record.value = renewed.value;
+        record.expires_at = renewed.expires_at;
+        record.version += 1;
+        record.updated_at = Some(crate::now_rfc3339());
+        let summary = record.summary();
+        let mut event = AuditEvent::named("renew", &summary.name, "ok");
+        event.secret_id = Some(summary.id.clone());
+        event.detail = Some(format!("renewed by the vault, version {}", summary.version));
         let status = self.commit(event)?;
         Ok((summary, status))
     }
@@ -527,7 +684,7 @@ impl Vault {
     pub fn status(&self) -> OpenedStatus {
         let doc = &self.doc;
         let mut by_kind = Vec::new();
-        for kind in [Kind::ApiKey, Kind::Login, Kind::TwoFactor] {
+        for kind in Kind::ALL {
             by_kind.push((kind, doc.records.iter().filter(|r| r.kind == kind).count()));
         }
         let log = &self.paths.audit_log;
@@ -546,7 +703,8 @@ impl Vault {
                     .filter(|l| {
                         matches!(
                             l.event.event.as_str(),
-                            "add" | "delete" | "rename" | "restore" | "confirm-kit" | "init" | "reset" | "migrate"
+                            "add" | "replace" | "import-plan" | "renew" | "delete" | "rename" | "restore" | "confirm-kit" | "init"
+                                | "reset" | "migrate"
                         )
                     })
                     .take(5)
@@ -569,10 +727,19 @@ impl Vault {
             secrets: doc.records.len(),
             by_kind,
             last_backup: doc.last_backup.clone(),
+            intake_recipient: doc.intake_identity.as_ref().and_then(crate::intake::public_of).map(|(public, _)| public),
             audit_lines,
             audit_problem,
             recent_changes,
         }
+    }
+}
+
+/// How the audit log describes a stored secret: its kind and rule, or its kind and site.
+fn describe(record: &Record) -> String {
+    match &record.rule {
+        Some(rule) => format!("{}; rule {}", record.kind.label(), rule.describe()),
+        None => format!("{} for {}", record.kind.label(), record.site),
     }
 }
 
@@ -598,6 +765,7 @@ pub(crate) fn same_records(a: &[Record], b: &[Record]) -> bool {
                     && x.rule == y.rule
                     && x.username == y.username
                     && x.totp == y.totp
+                    && x.expires_at == y.expires_at
                     && x.value.same_as(&y.value)
             })
         })
@@ -676,6 +844,9 @@ pub fn restore(
         kit_path: None,
         mirror_dir,
         check_identity: check_secret,
+        // Backups don't carry the intake key: a restored vault gets a new one, which the app
+        // learns from `vault status --json` as it does for a new vault.
+        intake_identity: Some(backup::new_identity().0),
         audit_head: audit::GENESIS.into(),
         generation: 1,
         last_backup: None,

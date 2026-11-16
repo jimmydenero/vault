@@ -32,6 +32,9 @@ serde_json = "1"
 sha1 = "0.10"
 sha2 = "0.10"
 time = { version = "0.3", features = ["formatting", "parsing"] }
+# The streaming proxy (`stream`): an async HTTPS client, so a call can time out when idle and stop
+# when its caller hangs up. reqwest already runs on tokio; these are the parts the vault drives.
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
 url = "2"
 zeroize = "1"
 
@@ -43,6 +46,13 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 
 [target.'cfg(target_os = "linux")'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+
+[features]
+# For local evidence only, never in a release (scripts/release.sh doesn't enable it): with it, the
+# daemon sends the kinds' upstream hosts (api.anthropic.com) to 127.0.0.1 at VAULT_TEST_UPSTREAM_PORT
+# and also trusts the CA in VAULT_TEST_CA, so a streamed reply can be shown from a local test
+# server with the real TLS path. The daemon logs a warning at start when it is on.
+test-upstream = []
 
 [profile.dev]
 panic = "abort"

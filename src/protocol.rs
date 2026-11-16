@@ -19,6 +19,30 @@
 //!   {"op":"totp","name":"github-2fa"}                  (or "id":"<32 hex digits>")
 //!   {"op":"proxy","name":"openai","method":"GET","path":"/v1/models",
 //!    "headers":{"accept":"application/json"},"body":"..."}            (or "body_base64")
+//!   {"op":"stream","name":"main","method":"POST","path":"/v1/messages?beta=true",
+//!    "headers":[["anthropic-version","2023-06-01"]],"body_len":1234}  then 1234 body bytes
+//!   {"op":"health"}
+//!
+//! For the host daemon and Volgenic's app (R40, R41):
+//!   {"op":"add_sealed","name":"main","kind":"claude_plan","sealed_base64":"...","replace":true}
+//!   {"op":"import_plan","plans":[{"name":"main","value":"sk-ant-oat01-..."}]}
+//!
+//! **`stream`** (R39) sends one request with a credential whose kind (`kinds`) or rule (an API key)
+//! decides the host, the methods, the paths and the headers the vault sets, and streams the reply
+//! back as it arrives. Its body follows the request line as raw bytes, exactly `body_len` of them
+//! (at most `stream::MAX_BODY`). The reply is a head line, the body in chunks, and a trailer line:
+//!
+//! ```text
+//! {"ok":true,"status":200,"headers":[["content-type","text/event-stream"],...],"protocol":2,...}
+//! <length in decimal>\n<that many bytes>          (repeated, as the upstream sends them)
+//! 0\n
+//! {"ok":true,"end":"complete","bytes":123456,"protocol":2,...}
+//! ```
+//!
+//! A refusal before anything is sent upstream, or an upstream failure before its reply's head,
+//! is one error line, as for every op. A trailer with `"ok":false` ends a reply that was cut short:
+//! `end` is `idle_timeout`, `upstream_failed` or `echo_blocked`. A caller that hangs up cancels the
+//! call; the vault closes the upstream connection.
 //!
 //! For the command-line tool (R13: only the daemon changes the vault; R26):
 //!   status, audit, add, delete, rename, confirm-kit, reset, restore,
@@ -44,6 +68,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditLine;
 use crate::error::VaultError;
+use crate::kinds::HealthState;
 use crate::model::{self, BackupStatus, Kind, MirrorState, SecretRef, SecretSummary, secret_bytes};
 use crate::secret::SecretValue;
 
@@ -165,6 +190,28 @@ pub enum Request {
         body: Option<String>,
         body_base64: Option<String>,
     },
+    Stream {
+        secret: SecretRef,
+        /// One of the kind's hosts; the first when not given. An API key's is its rule's.
+        host: Option<String>,
+        method: String,
+        path: String,
+        /// In the caller's order; a name may repeat.
+        headers: Vec<(String, String)>,
+        /// How many raw body bytes follow the request line.
+        body_len: usize,
+        idle_timeout_secs: Option<u64>,
+    },
+    Health,
+    AddSealed {
+        name: String,
+        kind: Kind,
+        sealed_base64: String,
+        replace: bool,
+    },
+    ImportPlan {
+        plans: Vec<(String, SecretValue)>,
+    },
     Status,
     Audit {
         all: bool,
@@ -252,6 +299,54 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
         body: Option<String>,
         #[serde(default)]
         body_base64: Option<String>,
+    }
+
+    /// Headers as `[[name, value], ...]` (order kept, names may repeat) or as an object.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum HeadersWire {
+        List(Vec<(String, String)>),
+        Map(BTreeMap<String, String>),
+    }
+
+    #[derive(Deserialize)]
+    struct StreamWire {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        host: Option<String>,
+        method: String,
+        path: String,
+        #[serde(default)]
+        headers: Option<HeadersWire>,
+        #[serde(default)]
+        body_len: usize,
+        #[serde(default)]
+        idle_timeout_secs: Option<u64>,
+    }
+
+    #[derive(Deserialize)]
+    struct AddSealedWire {
+        name: String,
+        kind: Kind,
+        sealed_base64: String,
+        #[serde(default)]
+        replace: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct PlanWire {
+        name: String,
+        /// A JSON string or an array of bytes, read straight into a wiping buffer (R1).
+        #[serde(deserialize_with = "secret_bytes::deserialize")]
+        value: SecretValue,
+    }
+
+    #[derive(Deserialize)]
+    struct ImportWire {
+        plans: Vec<PlanWire>,
     }
 
     #[derive(Deserialize)]
@@ -351,6 +446,32 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
                 body_base64: w.body_base64,
             }
         }
+        "stream" => {
+            let w: StreamWire = serde_json::from_slice(line)?;
+            let headers = match w.headers {
+                None => Vec::new(),
+                Some(HeadersWire::List(list)) => list,
+                Some(HeadersWire::Map(map)) => map.into_iter().collect(),
+            };
+            Request::Stream {
+                secret: secret_ref(w.name, w.id)?,
+                host: w.host,
+                method: w.method,
+                path: w.path,
+                headers,
+                body_len: w.body_len,
+                idle_timeout_secs: w.idle_timeout_secs,
+            }
+        }
+        "health" => Request::Health,
+        "add_sealed" => {
+            let w: AddSealedWire = serde_json::from_slice(line)?;
+            Request::AddSealed { name: w.name, kind: w.kind, sealed_base64: w.sealed_base64, replace: w.replace }
+        }
+        "import_plan" => {
+            let w: ImportWire = serde_json::from_slice(line)?;
+            Request::ImportPlan { plans: w.plans.into_iter().map(|plan| (plan.name, plan.value)).collect() }
+        }
         "audit" => Request::Audit { all: serde_json::from_slice::<AuditWire>(line)?.all },
         "add" => {
             let w: AddWire = serde_json::from_slice(line)?;
@@ -449,6 +570,84 @@ pub struct ProxyReplyOut {
     pub body_base64: Option<String>,
 }
 
+/// The head of a streamed reply: the upstream's status and headers (hop-by-hop ones left out).
+#[derive(Serialize)]
+pub struct StreamHead {
+    pub ok: bool,
+    pub status: u16,
+    pub headers: Vec<[String; 2]>,
+}
+
+/// The line after a streamed reply's last chunk.
+#[derive(Serialize)]
+pub struct StreamTrailer {
+    pub ok: bool,
+    /// `complete`, or why it was cut short: `idle_timeout`, `upstream_failed`, `echo_blocked`.
+    pub end: &'static str,
+    /// Body bytes sent to the caller.
+    pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// One credential's health, by name only (R4): whether its token works, has expired or was
+/// refused, so the host can tell the person to sign in again.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CredentialHealth {
+    pub id: String,
+    pub name: String,
+    pub kind: Kind,
+    pub version: u64,
+    pub state: HealthState,
+    /// When the state was last seen (RFC 3339), null for `unknown`.
+    pub checked_at: Option<String>,
+    /// The upstream status that said so.
+    pub status: Option<u16>,
+    /// `never`: the vault doesn't renew this kind (a Claude plan's token lasts a year; a new
+    /// sign-in replaces it). `by_vault`: the vault renews it before it expires.
+    pub refresh: String,
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct HealthReply {
+    pub ok: bool,
+    pub credentials: Vec<CredentialHealth>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AddSealedReply {
+    pub ok: bool,
+    pub secret: SecretSummary,
+    /// It replaced the value of a secret already stored under the name.
+    pub replaced: bool,
+    pub backup: BackupStatus,
+}
+
+/// One plan of an `import_plan`, by name only.
+#[derive(Serialize, Deserialize)]
+pub struct ImportedPlan {
+    pub name: String,
+    /// `done` (added, or a different value replaced), `unchanged` (already there with this
+    /// value) or `failed`.
+    pub result: String,
+    /// The version the plan has now (for done and unchanged).
+    pub version: Option<u64>,
+    /// For failed: the error code and message.
+    pub error: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ImportReply {
+    pub ok: bool,
+    pub plans: Vec<ImportedPlan>,
+    /// The backup of the change, or null when nothing changed.
+    pub backup: Option<BackupStatus>,
+}
+
 /// What `vault status` shows from the daemon's side. Information only; no values.
 #[derive(Serialize, Deserialize)]
 pub struct StatusReply {
@@ -485,6 +684,9 @@ pub struct OpenedStatus {
     pub secrets: usize,
     pub by_kind: Vec<(Kind, usize)>,
     pub last_backup: Option<BackupStatus>,
+    /// The intake public key (an age X25519 recipient), for sealing values to this vault (R40).
+    #[serde(default)]
+    pub intake_recipient: Option<String>,
     /// The audit log's line count when its chain is intact, or what is wrong with it.
     pub audit_lines: Option<usize>,
     pub audit_problem: Option<String>,

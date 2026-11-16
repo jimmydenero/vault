@@ -65,6 +65,8 @@ pub struct Paths {
     pub restore_point: PathBuf,
     pub restore_point_info: PathBuf,
     pub mirror_state: PathBuf,
+    /// What upstream replies said about each credential (`health`): ids, states and times only.
+    pub health_state: PathBuf,
     pub local_backups: PathBuf,
     pub socket_dir: PathBuf,
     pub socket: PathBuf,
@@ -113,6 +115,7 @@ impl Paths {
             restore_point: dir.join("restore-point.age"),
             restore_point_info: dir.join("restore-point.json"),
             mirror_state: dir.join("mirror.json"),
+            health_state: dir.join("health.json"),
             local_backups: base.join("vault-backups"),
             socket: socket_dir.join("vault.sock"),
             daemon_log: log_dir.join("vault.log"),
