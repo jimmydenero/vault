@@ -140,9 +140,33 @@ pub struct DiskJson {
 }
 
 /// How `vault status` rates what leaves the vault open to a stolen disk or a stolen Mac: an
-/// unconfirmed Recovery Kit, FileVault off, automatic login (#7689). The vault keeps working;
-/// `healthy` is false until they are dealt with.
-const STOLEN_DISK_SEVERITY: &str = "error";
+/// unconfirmed Recovery Kit, FileVault off, automatic login (#7689). Warnings, not errors: an
+/// error makes the host report the vault missing to agents, and the vault keeps working. They are
+/// said loudly instead (`stolen_disk_banner`, in `vault install` and `vault status`).
+const STOLEN_DISK_SEVERITY: &str = "warning";
+
+/// The problems `stolen_disk_banner` shows.
+pub const STOLEN_DISK_CODES: [&str; 3] = ["recovery_kit_pending", "filevault_off", "auto_login_on"];
+
+/// The loud block `vault install` and `vault status` end with while a stolen disk or a stolen Mac
+/// could still open the vault; empty when nothing does.
+pub fn stolen_disk_banner(problems: &[Problem]) -> String {
+    let found: Vec<&Problem> = problems.iter().filter(|p| STOLEN_DISK_CODES.contains(&p.code)).collect();
+    if found.is_empty() {
+        return String::new();
+    }
+    let mut text = format!(
+        "\n!!! WARNING: a stolen disk or {} can open this vault until you deal with this:\n",
+        crate::platform::MACHINE
+    );
+    for problem in found {
+        text.push_str(&format!("!!!   - {}\n", problem.sentence));
+        if let Some(how) = &problem.how {
+            text.push_str(&format!("!!!     run: {how}\n"));
+        }
+    }
+    text
+}
 
 #[derive(Serialize, Clone, Debug)]
 pub struct KitJson {

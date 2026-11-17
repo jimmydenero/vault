@@ -129,6 +129,9 @@ pub fn install(for_restore: bool, json: bool) -> Result<(), VaultError> {
         }
         let text = serde_json::to_string_pretty(&out).map_err(|_| VaultError::Io("JSON encoding".into()))?;
         println!("{text}");
+    } else if result.is_ok() {
+        // The Recovery Kit, FileVault and automatic login, loudly (#7689).
+        print!("{}", report::stolen_disk_banner(&report::gather_status(&Paths::current()).problems));
     }
     result
 }
@@ -209,12 +212,6 @@ fn install_steps(for_restore: bool, json: bool, out: &mut InstallJson) -> Result
             kit_written: Some(report.kit_path.display().to_string()),
         });
         out.key_note = Some(report.key_protection.clone());
-    }
-
-    // What leaves a powered-off stolen Mac able to open the vault (#7689): said here, an error in
-    // `vault status`.
-    for (_, sentence) in crate::platform::disk_protection_problems(&crate::platform::disk_protection()) {
-        say!(json, "warning:  {sentence}");
     }
 
     let mut service_out = InstallServiceJson {
