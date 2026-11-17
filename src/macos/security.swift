@@ -27,8 +27,11 @@ private let failed: Int32 = 2
 private let declined: Int32 = 3
 private let badInput: Int32 = 4
 
-/// What the wrapped file starts with, and what the key derivation and the seal are bound to.
-private let magic = Data("VSE1".utf8)
+/// What a wrapped file starts with: `VSE2` now, `VSE1` before the seal was bound to its vault.
+/// The seal's associated data is the caller's (`VSE2` and the vault's id; `VSE1` alone for a
+/// legacy file), so a wrapped key moved to another vault doesn't open.
+private let magic = Data("VSE2".utf8)
+private let legacyMagic = Data("VSE1".utf8)
 private let info = Data("volgenic-vault.key enclave v1".utf8)
 
 private func wipe(_ data: inout Data) {
@@ -47,15 +50,16 @@ private func sealingKey(_ shared: SharedSecret, _ ephemeral: Data, _ enclave: Da
     shared.hkdfDerivedSymmetricKey(using: SHA256.self, salt: ephemeral + enclave, sharedInfo: info, outputByteCount: 32)
 }
 
-/// Makes a new Enclave key and wraps `key` (32 bytes) with it, into `out`:
-/// "VSE1", the Enclave blob's length (2 bytes, big-endian), the blob, the one-time public key
+/// Makes a new Enclave key and wraps `key` (32 bytes) with it, bound to `aad`, into `out`:
+/// "VSE2", the Enclave blob's length (2 bytes, big-endian), the blob, the one-time public key
 /// (65 bytes, X9.63) and AES-GCM's nonce, ciphertext and tag (60 bytes).
 @_cdecl("vault_se_wrap")
 public func vaultSeWrap(
-    _ key: UnsafePointer<UInt8>, _ keyLen: Int, _ out: UnsafeMutablePointer<UInt8>, _ outCap: Int,
-    _ outLen: UnsafeMutablePointer<Int>
+    _ key: UnsafePointer<UInt8>, _ keyLen: Int, _ aad: UnsafePointer<UInt8>, _ aadLen: Int,
+    _ out: UnsafeMutablePointer<UInt8>, _ outCap: Int, _ outLen: UnsafeMutablePointer<Int>
 ) -> Int32 {
-    guard keyLen == 32 else { return badInput }
+    guard keyLen == 32, aadLen > 0 else { return badInput }
+    let bound = Data(bytes: aad, count: aadLen)
     guard SecureEnclave.isAvailable else { return unavailable }
     // Usable after the first unlock since boot, on this Mac only, with no user presence: the
     // daemon can come back while the screen is locked, and a backup can't carry it elsewhere.
@@ -70,7 +74,7 @@ public func vaultSeWrap(
         let sealing = sealingKey(shared, ephemeralPublic, enclave.publicKey.x963Representation)
         var plain = Data(bytes: key, count: keyLen)
         defer { wipe(&plain) }
-        let box = try AES.GCM.seal(plain, using: sealing, authenticating: magic)
+        let box = try AES.GCM.seal(plain, using: sealing, authenticating: bound)
         guard let combined = box.combined else { return failed }
         let blob = enclave.dataRepresentation
         guard blob.count <= 0xFFFF else { return failed }
@@ -89,11 +93,16 @@ public func vaultSeWrap(
     }
 }
 
-/// Unwraps a file `vault_se_wrap` wrote, with this Mac's Enclave, into `out` (32 bytes).
+/// Unwraps a file `vault_se_wrap` wrote, bound to `aad`, with this Mac's Enclave, into `out`
+/// (32 bytes).
 @_cdecl("vault_se_unwrap")
-public func vaultSeUnwrap(_ wrapped: UnsafePointer<UInt8>, _ wrappedLen: Int, _ out: UnsafeMutablePointer<UInt8>) -> Int32 {
+public func vaultSeUnwrap(
+    _ wrapped: UnsafePointer<UInt8>, _ wrappedLen: Int, _ aad: UnsafePointer<UInt8>, _ aadLen: Int,
+    _ out: UnsafeMutablePointer<UInt8>
+) -> Int32 {
     let file = Data(bytes: wrapped, count: wrappedLen)
-    guard file.count > 6, file.prefix(4) == magic else { return badInput }
+    guard aadLen > 0, file.count > 6, file.prefix(4) == magic || file.prefix(4) == legacyMagic else { return badInput }
+    let bound = Data(bytes: aad, count: aadLen)
     let blobLen = Int(file[4]) << 8 | Int(file[5])
     let ephemeralAt = 6 + blobLen
     let boxAt = ephemeralAt + 65
@@ -106,7 +115,7 @@ public func vaultSeUnwrap(_ wrapped: UnsafePointer<UInt8>, _ wrappedLen: Int, _ 
         let shared = try enclave.sharedSecretFromKeyAgreement(with: ephemeral)
         let sealing = sealingKey(shared, ephemeralPublic, enclave.publicKey.x963Representation)
         let box = try AES.GCM.SealedBox(combined: file.subdata(in: boxAt..<file.count))
-        var plain = try AES.GCM.open(box, using: sealing, authenticating: magic)
+        var plain = try AES.GCM.open(box, using: sealing, authenticating: bound)
         defer { wipe(&plain) }
         guard plain.count == 32 else { return failed }
         plain.copyBytes(to: out, count: 32)

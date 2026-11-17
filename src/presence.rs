@@ -18,6 +18,7 @@
 use std::sync::Mutex;
 
 use crate::error::VaultError;
+use crate::platform::Peer;
 
 /// How long the person has to answer.
 const ANSWER_SECONDS: i32 = 60;
@@ -34,10 +35,34 @@ pub fn reason_text(reason: &str) -> String {
     reason.chars().filter(|c| !c.is_control()).take(MAX_REASON_CHARS).collect()
 }
 
-/// Asks the person at this Mac to confirm `reason` (e.g. "show the password of the saved login
-/// \"acme-shop\" (acme.com)"), and waits for them, at most a minute. `Ok` only when they did.
-pub fn confirm(reason: &str) -> Result<(), VaultError> {
-    let reason = reason_text(reason);
+/// Who asked, for the reason: the caller's program (its file name, a hint as in R23) and pid.
+pub fn caller_text(peer: &Peer) -> String {
+    let program = peer
+        .program
+        .as_deref()
+        .map(|path| path.rsplit('/').next().unwrap_or(path).to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "an unknown program".into());
+    match peer.pid {
+        Some(pid) => format!("{program} (pid {pid})"),
+        None => program,
+    }
+}
+
+/// The whole reason: the act, then who asked, so the person sees both (e.g. "show the password
+/// of the saved login \"acme-shop\" (acme.com), asked by Volgenic (pid 4242)").
+pub fn reason_for(act: &str, peer: &Peer) -> String {
+    format!("{act}, asked by {}", caller_text(peer))
+}
+
+/// Asks the person at this Mac to confirm `act` (e.g. "show the password of the saved login
+/// \"acme-shop\" (acme.com)"), naming the caller `peer` too, and waits for them, at most a
+/// minute. `Ok` only when they did.
+pub fn confirm(act: &str, peer: &Peer) -> Result<(), VaultError> {
+    if act.trim().is_empty() {
+        return Err(VaultError::BadRequest("a confirmation needs a reason".into()));
+    }
+    let reason = reason_text(&reason_for(act, peer));
     if reason.is_empty() {
         return Err(VaultError::BadRequest("a confirmation needs a reason".into()));
     }

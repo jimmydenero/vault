@@ -143,6 +143,13 @@ fn install_steps(for_restore: bool, json: bool, out: &mut InstallJson) -> Result
     for dir in [&paths.base, &paths.bin_dir, &paths.dir, &paths.local_backups, &paths.log_dir] {
         ensure_dir(dir)?;
     }
+    // `vault/` (the vault file, its key, the audit log) stays out of Time Machine (#7689): it can't
+    // be opened on another Mac anyway, and a plain key file (a Mac with no Secure Enclave) would
+    // otherwise go into every backup. The vault's own backups (`vault-backups/`, its mirror) are
+    // what a restore uses, with the recovery key, and stay in.
+    if let Err(why) = crate::platform::exclude_from_backups(&paths.dir) {
+        say!(json, "warning:  {} couldn't be kept out of Time Machine: {why}", paths.dir.display());
+    }
     // On Linux the socket's folder under /run/user is systemd's to make (RuntimeDirectory).
     if paths.socket_dir.starts_with(&paths.base) {
         ensure_dir(&paths.socket_dir)?;
@@ -173,7 +180,7 @@ fn install_steps(for_restore: bool, json: bool, out: &mut InstallJson) -> Result
             recovery_fingerprint: None,
             kit_written: None,
         });
-        let note = reseal_if_possible(&paths);
+        let note = vault::reseal(&paths);
         say!(json, "key:      {note}");
         out.key_note = Some(note);
     } else if for_restore || keyprotect::key_exists(&paths.dir) {
@@ -202,6 +209,12 @@ fn install_steps(for_restore: bool, json: bool, out: &mut InstallJson) -> Result
             kit_written: Some(report.kit_path.display().to_string()),
         });
         out.key_note = Some(report.key_protection.clone());
+    }
+
+    // What leaves a powered-off stolen Mac able to open the vault (#7689): said here, an error in
+    // `vault status`.
+    for (_, sentence) in crate::platform::disk_protection_problems(&crate::platform::disk_protection()) {
+        say!(json, "warning:  {sentence}");
     }
 
     let mut service_out = InstallServiceJson {
@@ -250,20 +263,6 @@ enum Started {
     /// Not started, and why (the service manager isn't there). Linux only.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     No(String),
-}
-
-/// An existing vault whose key is still the plain file (made before sealing existed, on a
-/// machine that got a TPM, or just restored): seal it now if this machine can, to the TPM or the
-/// Secure Enclave. Says how the key is kept now.
-fn reseal_if_possible(paths: &Paths) -> String {
-    let plain = paths.dir.join(keyprotect::KEY_FILE);
-    if fs::symlink_metadata(&plain).is_err() {
-        return keyprotect::describe(&paths.dir);
-    }
-    match keyprotect::load(&paths.dir) {
-        Ok(key) => keyprotect::protect(&paths.dir, &key),
-        Err(error) => format!("can't read the key file to seal it: {error}"),
-    }
 }
 
 /// The LaunchAgent in the owner's login (macOS).
