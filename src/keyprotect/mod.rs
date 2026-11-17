@@ -415,7 +415,10 @@ pub fn load<T>(
                 return Ok((key, value, source));
             }
             Err(VaultError::VaultFileCorrupt) => {
-                first_error.get_or_insert(VaultError::SealedKey(format!("{} doesn't open the vault file", source.file())));
+                first_error.get_or_insert(match source {
+                    Source::Plain => VaultError::KeyProtection,
+                    _ => VaultError::SealedKey(format!("{} doesn't open the vault file", source.file())),
+                });
             }
             Err(error) => return Err(error),
         }

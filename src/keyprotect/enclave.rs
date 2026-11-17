@@ -79,7 +79,7 @@ fn result(code: i32) -> Result<(), String> {
         0 => Ok(()),
         1 => Err("this Mac has no Secure Enclave".into()),
         4 => Err("the wrapped key file isn't one the vault wrote".into()),
-        _ => Err("the Secure Enclave refused it (a key made on another Mac, or the Enclave was reset)".into()),
+        _ => Err("the Secure Enclave refused it (a key made on another Mac or for another vault, or the Enclave was reset)".into()),
     }
 }
 
@@ -160,7 +160,7 @@ impl Enclave for Stub {
         let plain = Zeroizing::new(
             cipher
                 .decrypt(&nonce.into(), Payload { msg: &wrapped[28..], aad })
-                .map_err(|_| "the Secure Enclave refused it (a key made on another Mac, or the Enclave was reset)".to_string())?,
+                .map_err(|_| "the Secure Enclave refused it (a key made on another Mac or for another vault, or the Enclave was reset)".to_string())?,
         );
         Ok(SecretValue::from_vec(plain.to_vec()))
     }
