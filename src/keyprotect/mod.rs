@@ -1,8 +1,18 @@
-//! Key protection, kept simple on purpose: the vault key is 32 random bytes in a mode-0600 file
-//! next to the vault file, in the owner's own folder. No Secure Enclave and no Keychain, so
-//! nothing the vault does can ever raise a dialog. The bar is "better than plaintext secrets on
-//! a server": the vault file is encrypted, and only the owner's account can read either file.
-//! This module is the only code that touches where the key is kept.
+//! Key protection: the vault key is 32 random bytes, made as a mode-0600 file next to the vault
+//! file, in the owner's own folder, and then sealed to this machine's hardware when it has the
+//! hardware: the Secure Enclave on a Mac, the TPM on Linux. Sealing checks the round trip before
+//! it wipes the plain file, and the daemon unseals at every start with no prompt, so agents keep
+//! working unattended. What it adds on both systems: a copy of the disk (a stolen drive, a Time
+//! Machine or home-folder backup) can't open the vault on any other machine. What it doesn't:
+//! anything running as the owner on this machine can have it unsealed, as it could read the plain
+//! file. This module is the only code that touches where the key is kept.
+//!
+//! **On a Mac, wrapped by the Secure Enclave (#7689).** `seal` makes a P-256 key in this Mac's
+//! Secure Enclave and wraps the vault key with it (`enclave`), into `vault.key.se`. The Enclave
+//! key never leaves the Enclave: the file holds only the Enclave's encrypted handle to it, usable
+//! by this Mac's Enclave alone, after the first unlock since boot, and never asks for a fingerprint
+//! or a password. No Keychain item is made. On a Mac without a Secure Enclave (an Intel Mac without
+//! a T2 chip) the key stays the 0600 file, and `vault status` says so.
 //!
 //! **On Linux, sealed to the TPM when there is one.** `seal` hands the key file to
 //! `systemd-creds --user encrypt --with-key=host+tpm2` (systemd 256 or later, a TPM 2.0), which
@@ -16,7 +26,7 @@
 //! the disk (a stolen drive, a backup of the home folder) can't open the vault anywhere else.
 //! What it doesn't: anything running as the owner on this machine can ask `systemd-creds` to
 //! unseal it, just as it could read the plain file. Without `systemd-creds --user` or a TPM, the
-//! key stays the 0600 file, as on a Mac.
+//! key stays the 0600 file.
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -32,64 +42,89 @@ pub const KEY_FILE: &str = "vault.key";
 /// The vault key sealed to the TPM by `systemd-creds` (Linux).
 pub const SEALED_FILE: &str = "vault.key.cred";
 
+/// The vault key wrapped by the Secure Enclave (macOS).
+pub const ENCLAVE_FILE: &str = "vault.key.se";
+
+#[cfg(target_os = "macos")]
+mod enclave;
+
+/// This system's sealed key file.
+#[cfg(target_os = "macos")]
+const SEALED: &str = ENCLAVE_FILE;
+#[cfg(not(target_os = "macos"))]
+const SEALED: &str = SEALED_FILE;
+
+/// What sealed it, in `vault status`'s words.
+#[cfg(target_os = "macos")]
+const SEALED_BY: &str = "wrapped by this Mac's Secure Enclave";
+#[cfg(not(target_os = "macos"))]
+const SEALED_BY: &str = "sealed to this machine's TPM 2.0 by systemd-creds";
+
+/// Why this machine can't seal the key, or nothing when it can.
+fn seal_ready() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    return sealed::ready().map(|_| ());
+    #[cfg(target_os = "macos")]
+    return enclave::ready();
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    Err("this system has nothing to seal the key to".into())
+}
+
+fn exists(dir: &Path, name: &str) -> bool {
+    fs::symlink_metadata(dir.join(name)).is_ok()
+}
+
 /// Where the vault key is kept, for `vault status`.
 pub fn describe(dir: &Path) -> String {
-    let plain = fs::symlink_metadata(dir.join(KEY_FILE)).is_ok();
-    let sealed = fs::symlink_metadata(dir.join(SEALED_FILE)).is_ok();
-    match (sealed, plain) {
-        (true, false) => format!(
-            "sealed to this machine's TPM 2.0 by systemd-creds ({SEALED_FILE}); no plain copy"
-        ),
+    match (exists(dir, SEALED), exists(dir, KEY_FILE)) {
+        (true, false) => format!("{SEALED_BY} ({SEALED}); no plain copy"),
         (true, true) => format!(
-            "sealed to the TPM ({SEALED_FILE}), and a plain {KEY_FILE} is still there (an interrupted seal; `vault install` finishes it)"
+            "{SEALED_BY} ({SEALED}), and a plain {KEY_FILE} is still there (an interrupted seal; `vault install` finishes it)"
         ),
-        _ => "vault key in a mode-600 file next to the vault file (no Secure Enclave, no Keychain)".into(),
+        _ => "vault key in a mode-600 file next to the vault file, not sealed to this machine".into(),
     }
 }
 
 /// Where the vault key is kept, as plain values for `vault status --json`. Information only.
 pub struct KeyState {
-    /// `tpm2` (sealed by systemd-creds, Linux), `file` (the 0600 key file) or `none` (no key).
+    /// `tpm2` (sealed by systemd-creds, Linux), `secure_enclave` (wrapped by the Secure Enclave,
+    /// macOS), `file` (the 0600 key file) or `none` (no key).
     pub kind: &'static str,
-    /// For `file`: why it isn't sealed (no TPM, no systemd-creds, or "macOS keeps it as a file").
+    /// For `file`: why it isn't sealed (no TPM, no systemd-creds, no Secure Enclave).
     pub reason: Option<String>,
     /// A sealed key and a plain copy are both there (an interrupted seal).
     pub plain_copy_left: bool,
-    /// For `file` on Linux: this machine could seal it now (`vault install` would).
+    /// For `file`: this machine could seal it now (`vault install` would).
     pub sealable: bool,
     /// `describe`, the sentence `vault status` prints.
     pub detail: String,
 }
 
 pub fn state(dir: &Path) -> KeyState {
-    let plain = fs::symlink_metadata(dir.join(KEY_FILE)).is_ok();
-    let sealed = fs::symlink_metadata(dir.join(SEALED_FILE)).is_ok();
+    let plain = exists(dir, KEY_FILE);
     let detail = describe(dir);
-    if sealed {
-        return KeyState { kind: "tpm2", reason: None, plain_copy_left: plain, sealable: false, detail };
+    if exists(dir, SEALED) {
+        let kind = if cfg!(target_os = "macos") { "secure_enclave" } else { "tpm2" };
+        return KeyState { kind, reason: None, plain_copy_left: plain, sealable: false, detail };
     }
     if !plain {
         return KeyState { kind: "none", reason: None, plain_copy_left: false, sealable: false, detail: "no vault key".into() };
     }
-    #[cfg(target_os = "linux")]
-    let (reason, sealable) = match sealed::ready() {
-        Ok(_) => ("not sealed yet, though this machine can seal it: `vault install` seals it".to_string(), true),
+    let (reason, sealable) = match seal_ready() {
+        Ok(()) => ("not sealed yet, though this machine can seal it: `vault install` seals it".to_string(), true),
         Err(why) => (why, false),
     };
-    #[cfg(not(target_os = "linux"))]
-    let (reason, sealable) =
-        ("macOS keeps the vault key in a mode-600 file by design (no Keychain, no Secure Enclave)".to_string(), false);
     KeyState { kind: "file", reason: Some(reason), plain_copy_left: false, sealable, detail }
 }
 
 pub fn key_exists(dir: &Path) -> bool {
-    fs::symlink_metadata(dir.join(KEY_FILE)).is_ok() || fs::symlink_metadata(dir.join(SEALED_FILE)).is_ok()
+    exists(dir, KEY_FILE) || exists(dir, SEALED_FILE) || exists(dir, ENCLAVE_FILE)
 }
 
 /// Writes a new vault key, mode 0600. Fails if one is already stored. The key-file call site
 /// of `expose` in R1.
 pub fn store_new(dir: &Path, key: &SecretValue) -> Result<(), VaultError> {
-    if fs::symlink_metadata(dir.join(SEALED_FILE)).is_ok() {
+    if exists(dir, SEALED) {
         return Err(VaultError::AlreadyInitialized);
     }
     let mut file = OpenOptions::new()
@@ -123,12 +158,16 @@ fn load_file(dir: &Path) -> Result<SecretValue, VaultError> {
     Ok(SecretValue::from_vec(buf.to_vec()))
 }
 
-/// Reads the vault key: unsealed from the TPM when it is sealed (Linux), else from the key file,
-/// which must be the owner's and 0600.
+/// Reads the vault key: unsealed from the TPM (Linux) or the Secure Enclave (macOS) when it is
+/// sealed, else from the key file, which must be the owner's and 0600.
 pub fn load(dir: &Path) -> Result<SecretValue, VaultError> {
-    #[cfg(target_os = "linux")]
-    if fs::symlink_metadata(dir.join(SEALED_FILE)).is_ok() {
-        match sealed::unseal(dir) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if exists(dir, SEALED) {
+        #[cfg(target_os = "linux")]
+        let unsealed = sealed::unseal(dir);
+        #[cfg(target_os = "macos")]
+        let unsealed = enclave::unseal(dir);
+        match unsealed {
             Ok(key) => return Ok(key),
             // Both files exist only when a seal was interrupted before the plain file was wiped;
             // both then hold the same key.
@@ -139,28 +178,50 @@ pub fn load(dir: &Path) -> Result<SecretValue, VaultError> {
     load_file(dir)
 }
 
-/// Protects a vault key just stored with `store_new` as well as this machine allows, and says
-/// how: on Linux, sealed to the TPM when `systemd-creds --user` and a TPM 2.0 are there (the
-/// plain file is wiped once the round trip checks out), else left as the 0600 file. On macOS the
-/// file is the protection.
+/// Protects a vault key stored with `store_new` as well as this machine allows, and says how:
+/// sealed to the TPM when `systemd-creds --user` and a TPM 2.0 are there (Linux), or wrapped by
+/// the Secure Enclave when the Mac has one, the plain file wiped once the round trip checks out;
+/// else left as the 0600 file.
 pub fn protect(dir: &Path, key: &SecretValue) -> String {
     #[cfg(target_os = "linux")]
-    {
-        match sealed::seal(dir, key) {
-            Ok(()) => "sealed to this machine's TPM 2.0 (systemd-creds); the plain key file is wiped".into(),
-            Err(why) => format!("mode-600 file ({why})"),
-        }
+    let sealed = sealed::seal(dir, key);
+    #[cfg(target_os = "macos")]
+    let sealed = enclave::seal(dir, key);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let sealed: Result<(), String> = {
+        let _ = key;
+        seal_ready()
+    };
+    match sealed {
+        Ok(()) => format!("{SEALED_BY} ({SEALED}); the plain key file is wiped"),
+        Err(why) => format!("mode-600 file ({why})"),
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (dir, key);
-        "mode-600 file".into()
+}
+
+/// The last steps of a seal, the same on both systems: `temp` holds the sealed key, already
+/// decrypted again and compared. Puts it in place as `sealed`, then overwrites and deletes the
+/// plain key (best effort on an SSD, as with the kit). Any failure before the rename removes
+/// `temp` and leaves the plain file as it was.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn replace_plain(dir: &Path, temp: &Path, sealed: &str) -> Result<(), String> {
+    if let Err(error) = fs::rename(temp, dir.join(sealed)) {
+        let _ = fs::remove_file(temp);
+        return Err(error.to_string());
     }
+    if let Ok(folder) = fs::File::open(dir) {
+        let _ = folder.sync_all();
+    }
+    let plain = dir.join(KEY_FILE);
+    if let Ok(mut file) = OpenOptions::new().write(true).open(&plain) {
+        let _ = file.write_all(&[0u8; 32]);
+        let _ = file.sync_all();
+    }
+    fs::remove_file(&plain).map_err(|e| format!("sealed, but the plain key file wasn't removed: {e}"))
 }
 
 /// Removes the vault key, plain and sealed (only `vault reset`, after the recovery key is proven).
 pub fn remove(dir: &Path) -> Result<(), VaultError> {
-    for name in [SEALED_FILE, KEY_FILE] {
+    for name in [SEALED_FILE, ENCLAVE_FILE, KEY_FILE] {
         match fs::remove_file(dir.join(name)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -174,14 +235,14 @@ pub fn remove(dir: &Path) -> Result<(), VaultError> {
 #[cfg(target_os = "linux")]
 mod sealed {
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
 
     use zeroize::Zeroizing;
 
-    use super::{KEY_FILE, SEALED_FILE, check_own_file};
+    use super::{KEY_FILE, SEALED_FILE, check_own_file, replace_plain};
     use crate::error::VaultError;
     use crate::secret::SecretValue;
 
@@ -262,7 +323,6 @@ mod sealed {
     /// sealed file in place, then wipe the plain one. Any failure leaves the plain file as it was.
     pub fn seal(dir: &Path, key: &SecretValue) -> Result<(), String> {
         let plain = dir.join(KEY_FILE);
-        let sealed = dir.join(SEALED_FILE);
         if fs::symlink_metadata(&plain).is_err() {
             return Err("no plain key file to seal".into());
         }
@@ -293,16 +353,6 @@ mod sealed {
             Ok(_) => return Err(fail("the sealed key didn't decrypt to the same key".into())),
             Err(error) => return Err(fail(error.to_string())),
         }
-        fs::rename(&temp, &sealed).map_err(|e| fail(e.to_string()))?;
-        if let Ok(folder) = fs::File::open(dir) {
-            let _ = folder.sync_all();
-        }
-        // Overwrite, then delete, the plain key (best effort on an SSD, as with the kit).
-        if let Ok(mut file) = fs::OpenOptions::new().write(true).open(&plain) {
-            let _ = file.write_all(&[0u8; 32]);
-            let _ = file.sync_all();
-        }
-        fs::remove_file(&plain).map_err(|e| format!("sealed, but the plain key file wasn't removed: {e}"))?;
-        Ok(())
+        replace_plain(dir, &temp, SEALED_FILE)
     }
 }

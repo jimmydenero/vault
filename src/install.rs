@@ -12,7 +12,10 @@
 //!   program, the files and the daemon stay the owner's, exactly as on a Mac, so the same
 //!   threat model and caller check apply, and `vault install` updates it without sudo. A
 //!   dedicated account is the separate-user design the owner retired in pull request #4.
-//!   The vault key is sealed to the TPM when there is one (`keyprotect::protect`).
+//!
+//! On both, the vault key is sealed to the machine (`keyprotect::protect`): to the Secure Enclave
+//! on a Mac that has one, to the TPM on Linux when there is one. Running `vault install` again
+//! seals a key that is still a plain file.
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, Write};
@@ -170,12 +173,9 @@ fn install_steps(for_restore: bool, json: bool, out: &mut InstallJson) -> Result
             recovery_fingerprint: None,
             kit_written: None,
         });
-        #[cfg(target_os = "linux")]
-        {
-            let note = reseal_if_possible(&paths);
-            say!(json, "key:      {note}");
-            out.key_note = Some(note);
-        }
+        let note = reseal_if_possible(&paths);
+        say!(json, "key:      {note}");
+        out.key_note = Some(note);
     } else if for_restore || keyprotect::key_exists(&paths.dir) {
         say!(json, "vault:    none (restore one with `vault restore FILE`)");
         out.vault = Some(InstallVaultJson {
@@ -253,9 +253,8 @@ enum Started {
 }
 
 /// An existing vault whose key is still the plain file (made before sealing existed, on a
-/// machine that got a TPM, or just restored): seal it now if this machine can. Says how the key
-/// is kept now.
-#[cfg(target_os = "linux")]
+/// machine that got a TPM, or just restored): seal it now if this machine can, to the TPM or the
+/// Secure Enclave. Says how the key is kept now.
 fn reseal_if_possible(paths: &Paths) -> String {
     let plain = paths.dir.join(keyprotect::KEY_FILE);
     if fs::symlink_metadata(&plain).is_err() {

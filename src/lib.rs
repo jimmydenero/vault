@@ -29,6 +29,7 @@ pub mod logins;
 pub mod mirror;
 pub mod model;
 pub mod platform;
+pub mod presence;
 pub mod protocol;
 pub mod proxy;
 pub mod report;

@@ -137,6 +137,9 @@ pub fn run() -> Result<(), VaultError> {
     let listener = UnixListener::bind(&paths.socket)?;
     // Only the owner can reach it: the folder is 0700, and every caller is checked (R22).
     log(&format!("vault key: {}", keyprotect::describe(&paths.dir)));
+    if cfg!(feature = "test-stubs") {
+        log("WARNING: a test-stubs build: a stand-in Secure Enclave and Touch ID (VAULT_TEST_ENCLAVE_KEY, VAULT_TEST_PRESENCE); never a release");
+    }
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
 
     let snapshot = match &opened {
@@ -928,6 +931,9 @@ impl Server {
     ) -> std::io::Result<()> {
         let [engine, tab, on_behalf_of] = notes;
         let result = (|| -> Result<WipingBuf, VaultError> {
+            if fill::needs_signed_app(engine.as_deref()) {
+                platform::peer_is_volgenic_app(out.as_raw_fd()).map_err(VaultError::NotVolgenicApp)?;
+            }
             let fields = fill::parse_fields(fields)?;
             let doc = self.snapshot()?;
             let record = doc.find_ref(secret);

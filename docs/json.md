@@ -91,11 +91,11 @@ A list of `{code, severity, sentence, how}`, errors first:
     "restore_point": false
   },                                   // all but "initialized" are null when the daemon is down
   "key_protection": {
-    "kind": "file",                    // "tpm2" | "file" | "none"
-    "reason": "systemd-creds isn't installed",   // for "file": why not sealed; on macOS, "macOS keeps ..."
-    "plain_copy_left": false,          // "tpm2" with a plain copy still on disk
-    "sealable": false,                 // "file" on Linux that `vault install` would seal now
-    "detail": "vault key in a mode-600 file next to the vault file (no Secure Enclave, no Keychain)"
+    "kind": "file",                    // "tpm2" (Linux) | "secure_enclave" (macOS) | "file" | "none"
+    "reason": "systemd-creds isn't installed",   // for "file": why not sealed; on a Mac without one, "this Mac has no Secure Enclave"
+    "plain_copy_left": false,          // "tpm2" or "secure_enclave" with a plain copy still on disk
+    "sealable": false,                 // "file" that `vault install` would seal now
+    "detail": "vault key in a mode-600 file next to the vault file, not sealed to this machine"
   },
   "recovery_kit": {
     "state": "pending",                // "pending" | "confirmed" | "none" (no vault) | "unknown" (daemon down)

@@ -104,12 +104,12 @@ pub struct VaultJson {
 
 #[derive(Serialize, Clone, Debug)]
 pub struct KeyJson {
-    /// `tpm2`, `file` or `none`.
+    /// `tpm2`, `secure_enclave`, `file` or `none`.
     pub kind: &'static str,
-    /// For `file`: why it isn't sealed to a TPM.
+    /// For `file`: why it isn't sealed to the TPM or the Secure Enclave.
     pub reason: Option<String>,
     pub plain_copy_left: bool,
-    /// For `file` on Linux: this machine could seal it now (`vault install` would).
+    /// For `file`: this machine could seal it now (`vault install` would).
     pub sealable: bool,
     pub detail: String,
 }
@@ -357,14 +357,18 @@ pub fn diagnose(status: &StatusJson, uid: u32) -> Vec<Problem> {
         add(
             "key_plain_copy_left",
             "warning",
-            "The vault key is sealed to the TPM, but a plain copy of it is still on disk (an interrupted seal).".into(),
+            format!("The vault key is sealed to this {}, but a plain copy of it is still on disk (an interrupted seal).", crate::platform::MACHINE),
             Some(install_cmd.clone()),
         );
     } else if key.kind == "file" && key.sealable {
         add(
             "key_not_sealed",
             "warning",
-            "The vault key is a plain file although this machine's TPM could seal it.".into(),
+            if !linux {
+                "The vault key is a plain file although this Mac's Secure Enclave could wrap it.".into()
+            } else {
+                "The vault key is a plain file although this machine's TPM could seal it.".into()
+            },
             Some(install_cmd.clone()),
         );
     }
