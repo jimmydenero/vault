@@ -17,10 +17,12 @@ use crate::totp::TotpParams;
 /// caller with a credential of their own (a Claude plan today) are described in `kinds`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// Used only by the proxy, in the auth header its rule names.
+    /// Used only by the proxy, in the auth header its rule names; given back only by `reveal`,
+    /// for a reason, audited first (#7666).
     #[serde(rename = "api-key")]
     ApiKey,
-    /// Stored and listed only, in this item.
+    /// A website login: stored and listed with its username; its password is given back only by
+    /// `reveal`, for a reason, audited first, and replaced by `set_password` (#7666).
     #[serde(rename = "login")]
     Login,
     /// A 2FA (TOTP) seed: used only to make the current code.
@@ -103,7 +105,8 @@ pub struct SecretSummary {
     pub name: String,
     pub kind: Kind,
     pub site: String,
-    /// 1 when added, plus one for every change to this secret (a rename, today).
+    /// 1 when added, plus one for every change to this secret (a rename, a replaced value or a new
+    /// password).
     #[serde(default)]
     pub version: u64,
     /// A login only: the username `add --username` stored (#7666). Never its password.
