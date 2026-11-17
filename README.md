@@ -276,7 +276,8 @@ echo '{"op":"proxy","name":"openai","method":"GET","path":"/v1/models"}' | nc -U
   (`{"v":1,"name":"shop-npm","kind":"app_secret","app":"shop","leasable":true,"value":"npm_..."}`);
   only an `app_secret` may carry either, and it too is added under a new name only.
 - **`fill`** and **`generate_login`** are for the browser engines that type a saved login into a
-  page, and make sign-up passwords ("Logins in the browser" below).
+  page, and make sign-up passwords; **`update_login`** edits a login's username or site, for
+  Volgenic for Mac's Passwords screen ("Logins in the browser" below).
 - **`lease`** seals app secrets to a build's own key (host only; "App secrets and leases" below).
 - **`sign`** signs one token payment from a wallet, within its caps, on Ethereum with a ladder of
   fee bumps, or on Ethereum with `"cancel":true` a 0-ETH cancel at a payment's nonce (the host's
@@ -336,6 +337,17 @@ Neither the host daemon (for an app tab), Volgenic's server nor the agent holds 
   already in the vault is `name_taken`; a site with no registrable domain, `invalid_secret`. Then
   `fill` types it into the sign-up form (and into a "confirm password" field, with
   `"fields":["password"]`).
+- **`update_login`** changes a saved login's username or site, never its password (#7696), for
+  Volgenic for Mac's Passwords screen: `{"op":"update_login","name":"acme-shop","username":"new@example.com","site":"acme.com"}`
+  (or `"id"`; `username`, `site` or both). It keeps the id and the password, raises the version,
+  backs up and audits (`update-login`: "username changed", and for a site the old and new site
+  and registrable domain), and answers
+  `{"ok":true,"secret":{"id","name","kind":"login","site","version"},"changed":["username","site"],"backup":{...}}`.
+  A request that changes nothing answers `"changed":[]` with no `backup` and writes nothing. A new
+  site is stored as the host it names and needs a registrable domain (`invalid_secret`), as
+  `generate_login`'s; a name that isn't a login is `no_such_login`; neither field is
+  `bad_request`. There is no sealed form: a login's site moves only by this socket request, which
+  nothing relays from the hub (R47).
 
 **Only Volgenic's signed app fills as the app (#7689).** A `fill` with `"engine":"app"` is
 answered only when the process on the other end of the socket is Volgenic for Mac

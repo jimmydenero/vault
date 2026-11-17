@@ -34,7 +34,7 @@ use crate::protocol::{
     self, AddReply, AddSealedReply, AuditReply, BackupReply, ClaimReply, ConfirmKitReply, Envelope, ErrorReply, Framed,
     HealthReply, ImportLoginReply, ImportReply, ImportedLogin, ImportedPlan, ListReply, MirrorPlanReply, OkReply,
     CancelReply, LeaseReply, LeasedSecret, ProxyReplyOut, ReadBackupReply, RenameReply, Request, ResetReply, RestoreReply, SignReply,
-    SignedTx, StatusReply, TotpReply, VerifyBackupReply, WalletReply,
+    SignedTx, StatusReply, TotpReply, UpdateLoginReply, VerifyBackupReply, WalletReply,
 };
 use crate::proxy::{self, ProxyRequest};
 use crate::rules;
@@ -703,6 +703,12 @@ impl Server {
             Request::Fill { secret, origin, fields, engine, tab, on_behalf_of } => {
                 let notes = [fill::note(engine), fill::note(tab), fill::note(on_behalf_of)];
                 self.fill(stream, peer, &secret, &origin, &fields, &notes)
+            }
+            Request::UpdateLogin { secret, username, site } => {
+                let result = self
+                    .with_vault(|vault| vault.update_login(&secret, username.as_deref(), site.as_deref()))
+                    .map(|(secret, changed, backup)| UpdateLoginReply { ok: true, secret, changed, backup });
+                self.finish(stream, peer, "update-login", Some(&secret.label()), result)
             }
             Request::GenerateLogin { name, site, username, length } => {
                 let result = self

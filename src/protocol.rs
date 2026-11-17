@@ -11,7 +11,7 @@
 //! on the way out. A request for a newer protocol than the daemon's is refused with
 //! `unsupported_protocol`.
 //!
-//! **Naming a secret.** `totp`, `proxy`, `delete` and `rename` take `"name"` or `"id"` (the
+//! **Naming a secret.** `totp`, `proxy`, `delete`, `rename` and `update_login` take `"name"` or `"id"` (the
 //! secret's stable id from `list`), exactly one of them.
 //!
 //! For agents:
@@ -56,6 +56,15 @@
 //! after its audit line is on disk: `{"ok":true,"name","id","site","site_matched","values":
 //! {"username"?,"password"?}}` (`fill`). **`generate_login`** stores a login with a password the
 //! vault makes, and answers `{"ok":true,"secret":{...},"backup":{...}}`, never the password.
+//!
+//! For Volgenic for Mac's Passwords screen (#7696, R47):
+//!   {"op":"update_login","name":"acme-shop","username":"new@example.com","site":"acme.com"}
+//!                                       (or "id"; username, site or both)
+//!
+//! **`update_login`** changes a login's username or site, never its password: it keeps the id and
+//! value, raises the version, and answers `{"ok":true,"secret":{...},"changed":["username","site"],
+//! "backup":{...}}`. A request that changes nothing answers `"changed":[]` with no `backup` and
+//! writes nothing. It has no sealed form: `add_sealed` can't replace a stored login (R40).
 //!
 //! For the host daemon's payment relay (#7440, #7490), and the command line for the two that need
 //! the recovery key:
@@ -331,6 +340,12 @@ pub enum Request {
         tab: Option<String>,
         on_behalf_of: Option<String>,
     },
+    /// A login's new username or site, never its password (#7696).
+    UpdateLogin {
+        secret: SecretRef,
+        username: Option<String>,
+        site: Option<String>,
+    },
     /// A new login with a password the vault makes (#7663).
     GenerateLogin {
         name: String,
@@ -549,6 +564,18 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
         tab: Option<String>,
         #[serde(default)]
         on_behalf_of: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct UpdateLoginWire {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        site: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -779,6 +806,10 @@ pub fn parse_request(line: &[u8]) -> Result<Request, serde_json::Error> {
                 tab: w.tab,
                 on_behalf_of: w.on_behalf_of,
             }
+        }
+        "update_login" => {
+            let w: UpdateLoginWire = serde_json::from_slice(line)?;
+            Request::UpdateLogin { secret: secret_ref(w.name, w.id)?, username: w.username, site: w.site }
         }
         "generate_login" => {
             let w: GenerateLoginWire = serde_json::from_slice(line)?;
@@ -1324,6 +1355,16 @@ pub struct RenameReply {
     pub ok: bool,
     pub secret: SecretSummary,
     pub backup: BackupStatus,
+}
+
+/// `update_login`'s answer: the login as it is now and what changed. No backup when nothing did.
+#[derive(Serialize, Deserialize)]
+pub struct UpdateLoginReply {
+    pub ok: bool,
+    pub secret: SecretSummary,
+    pub changed: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<BackupStatus>,
 }
 
 #[derive(Serialize, Deserialize)]

@@ -1188,6 +1188,71 @@ impl Vault {
         Ok((summary, status))
     }
 
+    /// Changes a login's username or site, never its password (`update_login`, R47, #7696). Its id
+    /// and value stay; its version goes up by one. A new site is stored as the host it names and
+    /// must have a registrable domain, as `generate_login`'s, so the login can still be filled; the
+    /// audit line names the old and new registrable domain. Nothing given is `bad_request`; nothing
+    /// different writes nothing and answers no backup.
+    pub fn update_login(
+        &mut self,
+        secret: &SecretRef,
+        username: Option<&str>,
+        site: Option<&str>,
+    ) -> Result<(SecretSummary, Vec<String>, Option<BackupStatus>), VaultError> {
+        self.reload()?;
+        if username.is_none() && site.is_none() {
+            return Err(VaultError::BadRequest("give username, site or both".into()));
+        }
+        if let Some(username) = username {
+            model::validate_username(username)?;
+        }
+        let site = site.map(crate::sites::normalize_new_site).transpose()?;
+        let index = self
+            .doc
+            .find_ref(secret)
+            .filter(|record| record.kind == Kind::Login)
+            .and_then(|found| self.doc.records.iter().position(|record| record.id == found.id))
+            .ok_or_else(|| VaultError::NoSuchLogin(secret.label()))?;
+        let record = &self.doc.records[index];
+        let new_username = username.filter(|username| record.username.as_deref() != Some(*username));
+        let new_site = site.filter(|site| *site != record.site);
+        let mut changed = Vec::new();
+        if new_username.is_some() {
+            changed.push("username".to_string());
+        }
+        if new_site.is_some() {
+            changed.push("site".to_string());
+        }
+        if changed.is_empty() {
+            return Ok((record.summary(), changed, None));
+        }
+        self.ready_for_change()?;
+        let record = &mut self.doc.records[index];
+        let mut detail = Vec::new();
+        if let Some(username) = new_username {
+            record.username = Some(username.to_string());
+            detail.push("username changed".to_string());
+        }
+        if let Some(site) = new_site {
+            let domain = |site: &str| crate::sites::login_domain(site).unwrap_or_else(|_| "none".into());
+            detail.push(format!(
+                "site {:?} to {site:?}, registrable domain {} to {}",
+                record.site,
+                domain(&record.site),
+                domain(&site)
+            ));
+            record.site = site;
+        }
+        record.version += 1;
+        record.updated_at = Some(crate::now_rfc3339());
+        let summary = record.summary();
+        let mut event = AuditEvent::named("update-login", &summary.name, "ok");
+        event.secret_id = Some(summary.id.clone());
+        event.detail = Some(format!("{}; version {}", detail.join("; "), summary.version));
+        let status = self.commit(event)?;
+        Ok((summary, changed, Some(status)))
+    }
+
     /// Decrypts the newest local backup with the check key and compares it with the vault (R19).
     pub fn check_newest(&self) -> Result<BackupCheck, VaultError> {
         backup::check_newest(&self.doc, &self.paths.local_backups)
