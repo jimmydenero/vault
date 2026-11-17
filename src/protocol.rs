@@ -120,15 +120,16 @@
 //!
 //! `restore` with a file sends the file's bytes right after its request line, as they are.
 //!
-//! `add`, `set_password`, `confirm-kit`, `reset` and `restore` carry a typed value or the recovery key. The
-//! command-line tool sends them only after checking that the socket and the process behind it
-//! are its own user's (R22, R27).
+//! `add`, `set_password`, `confirm-kit`, `reset` and `restore` carry a typed value or the
+//! recovery key. The command-line tool sends them only after checking that the socket and the
+//! process behind it are its own user's (R22, R27).
 //!
 //! No reply type has a field that could carry a secret value (R4): `SecretValue` doesn't
 //! implement `Serialize`, so it can't appear in any of them. Two exceptions: `lease` answers app
 //! secrets sealed to the job's own key (`lease::seal`), which only that key opens; and `reveal`
 //! (`reveal::RevealReply`) answers a login's password or an API key's value in plain text, with a
-//! reason, audited first (#7666). A wallet's key is in no reply at all, sealed or not; `sign` answers signatures.
+//! reason, audited first (#7666). A wallet's key is in no reply at all, sealed or not; `sign`
+//! answers signatures.
 
 use std::collections::BTreeMap;
 
