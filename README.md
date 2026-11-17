@@ -338,8 +338,14 @@ Neither the host daemon (for an app tab), Volgenic's server nor the agent holds 
   `fill` types it into the sign-up form (and into a "confirm password" field, with
   `"fields":["password"]`).
 - **`update_login`** changes a saved login's username or site, never its password (#7696), for
-  Volgenic for Mac's Passwords screen: `{"op":"update_login","name":"acme-shop","username":"new@example.com","site":"acme.com"}`
-  (or `"id"`; `username`, `site` or both). It keeps the id and the password, raises the version,
+  Volgenic for Mac's Passwords screen: `{"op":"update_login","id":"<id from list>","username":"new@example.com","site":"acme.com"}`
+  (`username`, `site` or both). The login is named by its `id` only (a `name` is `bad_request`),
+  so a `rename` can't point the edit at another login. A **site** change moves where the
+  password is filled, so the person confirms it first, with Touch ID or their login password,
+  asked by the vault itself ("change the site of the saved login "bank" from bank.com to
+  attacker.example", and the caller; R46): declined or unanswered is `not_confirmed` and changes
+  nothing, and a site that changed while they were asked is refused too. A username-only change
+  asks nothing. On Linux there is no one to ask, so a site change is refused there. It keeps the id and the password, raises the version,
   backs up and audits (`update-login`: "username changed", and for a site the old and new site
   and registrable domain), and answers
   `{"ok":true,"secret":{"id","name","kind":"login","site","version"},"changed":["username","site"],"backup":{...}}`.

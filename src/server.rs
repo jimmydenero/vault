@@ -36,6 +36,7 @@ use crate::protocol::{
     CancelReply, LeaseReply, LeasedSecret, ProxyReplyOut, ReadBackupReply, RenameReply, Request, ResetReply, RestoreReply, SignReply,
     SignedTx, StatusReply, TotpReply, UpdateLoginReply, VerifyBackupReply, WalletReply,
 };
+use crate::presence;
 use crate::proxy::{self, ProxyRequest};
 use crate::rules;
 use crate::store::{self, OwnerPaths, Paths};
@@ -705,9 +706,26 @@ impl Server {
                 self.fill(stream, peer, &secret, &origin, &fields, &notes)
             }
             Request::UpdateLogin { secret, username, site } => {
-                let result = self
-                    .with_vault(|vault| vault.update_login(&secret, username.as_deref(), site.as_deref()))
-                    .map(|(secret, changed, backup)| UpdateLoginReply { ok: true, secret, changed, backup });
+                let result = (|| {
+                    // By id only: a `rename` (which the hub can relay) can't point the edit at
+                    // another login.
+                    if matches!(secret, SecretRef::Name(_)) {
+                        return Err(VaultError::BadRequest(
+                            "update_login names the login by its \"id\" (from `list`), never by its name".into(),
+                        ));
+                    }
+                    // A site change moves where the password is filled: the person confirms it
+                    // with Touch ID or their login password, asked with the vault unlocked (R46, R47).
+                    let change = match site.as_deref() {
+                        Some(site) => vault::site_change(&*self.snapshot()?, &secret, site)?,
+                        None => None,
+                    };
+                    if let Some(change) = &change {
+                        presence::confirm(&change.act(), &peer.peer)?;
+                    }
+                    self.with_vault(|vault| vault.update_login(&secret, username.as_deref(), site.as_deref(), change.as_ref()))
+                })()
+                .map(|(secret, changed, backup)| UpdateLoginReply { ok: true, secret, changed, backup });
                 self.finish(stream, peer, "update-login", Some(&secret.label()), result)
             }
             Request::GenerateLogin { name, site, username, length } => {

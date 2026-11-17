@@ -234,6 +234,52 @@ pub fn wipe_file(path: &Path) -> Result<(), VaultError> {
     Ok(())
 }
 
+/// A login's site change, as the person is asked to confirm it (`update_login`, R46, R47).
+pub struct SiteChange {
+    pub id: String,
+    pub name: String,
+    pub old_site: String,
+    pub new_site: String,
+    pub old_domain: String,
+    pub new_domain: String,
+}
+
+impl SiteChange {
+    /// What Touch ID says the vault is trying to do: the login and both registrable domains (the
+    /// sites themselves when the domain stays the same).
+    pub fn act(&self) -> String {
+        let (from, to) = if self.old_domain == self.new_domain {
+            (&self.old_site, &self.new_site)
+        } else {
+            (&self.old_domain, &self.new_domain)
+        };
+        format!("change the site of the saved login {:?} from {from} to {to}, so its password is filled there", self.name)
+    }
+}
+
+/// The site change `update_login` would make to the login `secret` names, from a snapshot of the
+/// vault, or nothing when `site` is the login's site already. Read before asking the person, so
+/// the vault isn't held while they answer; `update_login` checks it still holds.
+pub(crate) fn site_change(doc: &VaultDoc, secret: &SecretRef, site: &str) -> Result<Option<SiteChange>, VaultError> {
+    let new_site = crate::sites::normalize_new_site(site)?;
+    let record = doc
+        .find_ref(secret)
+        .filter(|record| record.kind == Kind::Login)
+        .ok_or_else(|| VaultError::NoSuchLogin(secret.label()))?;
+    if record.site == new_site {
+        return Ok(None);
+    }
+    let domain = |site: &str| crate::sites::login_domain(site).unwrap_or_else(|_| "none".into());
+    Ok(Some(SiteChange {
+        id: record.id.clone(),
+        name: record.name.clone(),
+        old_domain: domain(&record.site),
+        new_domain: domain(&new_site),
+        old_site: record.site.clone(),
+        new_site,
+    }))
+}
+
 /// `vault install`, with the daemon stopped: an existing vault whose key is (or was) a plain file
 /// gets a new key, sealed to this machine, so the old key, which sits in every backup and
 /// snapshot made while it was a file, no longer opens it (#7689). The steps, each safe to stop
@@ -1193,11 +1239,16 @@ impl Vault {
     /// must have a registrable domain, as `generate_login`'s, so the login can still be filled; the
     /// audit line names the old and new registrable domain. Nothing given is `bad_request`; nothing
     /// different writes nothing and answers no backup.
+    ///
+    /// A site change moves where the login's password may be filled, so it is made only as the
+    /// person confirmed it (`confirmed`, from `site_change` and `presence::confirm`, R46): the
+    /// login's site must still be the one they saw, and the new one the one they agreed to.
     pub fn update_login(
         &mut self,
         secret: &SecretRef,
         username: Option<&str>,
         site: Option<&str>,
+        confirmed: Option<&SiteChange>,
     ) -> Result<(SecretSummary, Vec<String>, Option<BackupStatus>), VaultError> {
         self.reload()?;
         if username.is_none() && site.is_none() {
@@ -1225,6 +1276,16 @@ impl Vault {
         }
         if changed.is_empty() {
             return Ok((record.summary(), changed, None));
+        }
+        if let Some(site) = &new_site {
+            let agreed = confirmed.is_some_and(|change| {
+                change.id == record.id && change.old_site == record.site && &change.new_site == site
+            });
+            if !agreed {
+                return Err(VaultError::NotConfirmed(
+                    "the login's site changed while you were confirming, or the change wasn't confirmed".into(),
+                ));
+            }
         }
         self.ready_for_change()?;
         let record = &mut self.doc.records[index];

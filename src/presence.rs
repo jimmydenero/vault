@@ -5,7 +5,8 @@
 //! Only these acts ask, never an agent's path:
 //! - showing a saved login's password to the person (`reveal`, R45);
 //! - an export of secrets in clear;
-//! - using a saved card (#7690).
+//! - using a saved card (#7690);
+//! - changing a saved login's site (`update_login`, R47), which moves where its password is filled.
 //!
 //! `fill` to a matching site, `lease`, `stream`, `proxy`, `totp` and `sign` never ask: agents use
 //! them unattended. No process can press Touch ID for the person, so a caller that isn't the

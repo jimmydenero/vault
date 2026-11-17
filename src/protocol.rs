@@ -11,8 +11,8 @@
 //! on the way out. A request for a newer protocol than the daemon's is refused with
 //! `unsupported_protocol`.
 //!
-//! **Naming a secret.** `totp`, `proxy`, `delete`, `rename` and `update_login` take `"name"` or `"id"` (the
-//! secret's stable id from `list`), exactly one of them.
+//! **Naming a secret.** `totp`, `proxy`, `delete` and `rename` take `"name"` or `"id"` (the
+//! secret's stable id from `list`), exactly one of them; `update_login` takes `"id"` only.
 //!
 //! For agents:
 //!   {"op":"list"}
@@ -58,11 +58,12 @@
 //! vault makes, and answers `{"ok":true,"secret":{...},"backup":{...}}`, never the password.
 //!
 //! For Volgenic for Mac's Passwords screen (#7696, R47):
-//!   {"op":"update_login","name":"acme-shop","username":"new@example.com","site":"acme.com"}
-//!                                       (or "id"; username, site or both)
+//!   {"op":"update_login","id":"<id>","username":"new@example.com","site":"acme.com"}
+//!                                       (username, site or both; the id only, never the name)
 //!
-//! **`update_login`** changes a login's username or site, never its password: it keeps the id and
-//! value, raises the version, and answers `{"ok":true,"secret":{...},"changed":["username","site"],
+//! **`update_login`** changes a login's username or site, never its password; a site change only
+//! after the person confirms it with Touch ID or their login password (R46, `not_confirmed` when
+//! they don't). It keeps the id and value, raises the version, and answers `{"ok":true,"secret":{...},"changed":["username","site"],
 //! "backup":{...}}`. A request that changes nothing answers `"changed":[]` with no `backup` and
 //! writes nothing. It has no sealed form: `add_sealed` can't replace a stored login (R40).
 //!
